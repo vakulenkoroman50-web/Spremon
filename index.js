@@ -151,7 +151,7 @@ app.get('/api/all', async (req, res) => {
   }
 });
 
-// Главная страница с ПРАВИЛЬНЫМ расположением как в первом варианте
+// Главная страница с ЛЕВЫМ верхним углом
 app.get('/', (req, res) => {
   const symbol = (req.query.symbol || 'BTC').toUpperCase();
   
@@ -172,16 +172,17 @@ app.get('/', (req, res) => {
       color: #ffffff;
     }
     
-    /* Контейнер в правом верхнем углу - КАК В ПЕРВОМ ВАРИАНТЕ */
+    /* Контейнер в левом верхнем углу БЕЗ ОТСТУПОВ */
     #container {
       position: fixed;
-      top: 5px;
-      right: 5px;
+      top: 0;
+      left: 0;
       white-space: pre;
-      text-align: right;
+      margin: 0;
+      padding: 0;
     }
     
-    /* Поле ввода и кнопка - КАК В ПЕРВОМ ВАРИАНТЕ, но кнопка справа от поля */
+    /* Поле ввода и кнопка - кнопка справа от поля */
     #symbolInput, #startBtn {
       margin-top: 3px;
       font-family: monospace;
@@ -219,37 +220,37 @@ app.get('/', (req, res) => {
       color: #ff4444;
     }
     
-    /* Выходные данные - начинаются с правого верхнего угла */
+    /* Выходные данные - начинаются с левого верхнего угла */
     #output {
       line-height: 1.1;
-      text-align: right;
     }
     
-    /* Анимация мигающей точки для индикатора активности */
-    .blink-dot {
-      animation: blink 1s infinite;
-    }
-    
+    /* Анимация мигающей точки */
     @keyframes blink {
       0%, 100% { opacity: 1; }
       50% { opacity: 0; }
     }
     
+    .blink-dot {
+      animation: blink 1s infinite;
+      display: inline-block;
+    }
+    
     /* Стиль для лучшей биржи */
-    .best-exchange {
+    .best {
       color: #ffff00;
     }
     </style>
     </head>
     <body>
-    <!-- КОНТЕЙНЕР КАК В ПЕРВОМ ВАРИАНТЕ -->
+    <!-- КОНТЕЙНЕР в левом верхнем углу -->
     <div id="container">
       <div id="output"></div>
-      <div style="text-align: right; margin-top: 10px;">
+      <div>
         <input id="symbolInput" placeholder="BTC" value="${symbol}" autocomplete="off"/>
         <button id="startBtn">СТАРТ</button>
       </div>
-      <div id="status" style="text-align: right;">Ожидание…</div>
+      <div id="status">Ожидание…</div>
     </div>
 
     <script>
@@ -294,7 +295,7 @@ app.get('/', (req, res) => {
         }
       });
 
-      let dot = blink ? "●" : "○";
+      let dot = blink ? '<span class="blink-dot">●</span>' : '○';
       let lines=[];
 
       exchanges.forEach(ex=>{
@@ -302,14 +303,14 @@ app.get('/', (req, res) => {
         if(p<=0) return;
         let diff=((p-mexc)/mexc*100).toFixed(2);
         let sign=diff>0?"+":"";
-        let mark=(ex===best)?"◆":"◇";
+        let mark=(ex===best)?'<span class="best">◆</span>':"◇";
         let name=ex;
         while(name.length<8) name+=" ";
         lines.push(\`\${mark} \${name}: \${formatPrice(p)} (\${sign}\${diff}%)\`);
       });
 
-      // Выводим сначала MEXC, потом все биржи - всё начинается с правого края
-      output.textContent = \`\${dot} \${symbol} MEXC: \${formatPrice(mexc)}\\n\` + lines.join("\\n");
+      // Выводим данные в левом верхнем углу
+      output.innerHTML = \`\${dot} \${symbol} MEXC: \${formatPrice(mexc)}<br>\` + lines.join("<br>");
       statusEl.textContent="OK "+new Date().toLocaleTimeString();
       statusEl.className="";
      }catch(e){
@@ -338,6 +339,16 @@ app.get('/', (req, res) => {
 
     update();
     timer=setInterval(update,500); // Обновление каждые 0.5 секунды
+    
+    // Останавливаем обновление при скрытии вкладки
+    document.addEventListener('visibilitychange', () => {
+      if(document.hidden){
+        if(timer) clearInterval(timer);
+      }else{
+        if(timer) clearInterval(timer);
+        timer=setInterval(update,500);
+      }
+    });
     </script>
     </body>
     </html>
