@@ -380,8 +380,10 @@ app.get('/api/dex', checkToken, async (req, res) => {
 
 // Главная страница
 app.get('/', checkToken, (req, res) => {
-  const input = req.query.symbol || 'BTC';
+  const input = req.query.symbol || '';
   const token = req.query.token;
+  const chain = req.query.chain;
+  const addr = req.query.addr;
   
   res.send(`
     <!DOCTYPE html>
@@ -475,23 +477,6 @@ app.get('/', checkToken, (req, res) => {
       color: #ffff00;
     }
     
-    @keyframes blink {
-      0%, 100% { opacity: 1; }
-      50% { opacity: 0; }
-    }
-    
-    .blink-dot {
-      animation: blink 1s infinite;
-      display: inline-block;
-    }
-    
-    .cache-indicator {
-      font-size: 14px;
-      color: #0f0;
-      margin-left: 5px;
-      opacity: 0.7;
-    }
-    
     .dex-price {
       color: #0f0;
       font-weight: bold;
@@ -500,27 +485,29 @@ app.get('/', checkToken, (req, res) => {
     </head>
     <body>
     <div id="container">
-      <div id="output">Загрузка...</div>
+      <div id="output">Θ</div>
       
       <div class="control-row">
         <input id="inputField" placeholder="BTC или dexscreener.com/solana/..." value="${input}" autocomplete="off"/>
         <button id="startBtn">СТАРТ</button>
       </div>
       
-      <div id="status">Введите символ или ссылку DexScreener</div>
+      <div id="status">Θ</div>
       <div id="dexInfo"></div>
     </div>
 
     <script>
     const exchanges=["Binance","Kucoin","BingX","Bybit","Bitget","OKX","Gate"];
-    let timer=null, dexTimer=null, blink=false;
+    let timer=null, dexTimer=null;
     let currentMode='CEX';
-    let currentSymbol='BTC';
+    let currentSymbol='';
     let currentChain=null, currentAddr=null, currentDexData=null;
     
     const urlParams = new URLSearchParams(window.location.search);
-    let input = urlParams.get('symbol') || 'BTC';
+    let input = urlParams.get('symbol') || '';
     const token = urlParams.get('token');
+    const chain = urlParams.get('chain');
+    const addr = urlParams.get('addr');
 
     const output=document.getElementById("output");
     const inputField=document.getElementById("inputField");
@@ -569,11 +556,10 @@ app.get('/', checkToken, (req, res) => {
       };
     }
 
-    // Форматирование цены с фиксированной длиной (как было раньше)
+    // Форматирование цены с фиксированной длиной
     function formatPrice(p){
       if(!p || p == 0) return "0";
       let s = parseFloat(p).toFixed(8);
-      // Убираем лишние нули в конце
       s = s.replace(/(\\.\\d*?)0+$/, "$1");
       s = s.replace(/\\.$/, "");
       return s;
@@ -615,6 +601,11 @@ app.get('/', checkToken, (req, res) => {
         // Обновляем заголовок страницы
         document.title = \`\${data.tokenSymbol} $\${formatDexPrice(data.priceUsd)} - Spread Monitor\`;
         
+        // Если токен найден, запускаем мониторинг CEX для этого токена
+        if (data.tokenSymbol && data.tokenSymbol !== 'UNKNOWN') {
+          startCexMonitoring(data.tokenSymbol);
+        }
+        
         const time = new Date().toLocaleTimeString([], { 
           hour: '2-digit', 
           minute: '2-digit', 
@@ -634,22 +625,38 @@ app.get('/', checkToken, (req, res) => {
       }
     }
 
+    // Запуск CEX мониторинга
+    function startCexMonitoring(symbol) {
+      currentSymbol = symbol;
+      currentMode = 'CEX';
+      
+      // Обновляем поле ввода
+      inputField.value = symbol;
+      
+      // Обновляем URL
+      const url = new URL(window.location);
+      url.searchParams.set('symbol', symbol);
+      url.searchParams.delete('chain');
+      url.searchParams.delete('addr');
+      window.history.replaceState({}, '', url);
+      
+      // Запускаем обновление
+      if (timer) clearInterval(timer);
+      updateCEX();
+      timer = setInterval(updateCEX, 500);
+    }
+
     // Основное обновление (CEX)
-    async function update(){
+    async function updateCEX(){
       if(!currentSymbol) return;
       
-      blink = !blink;
-      statusEl.textContent = "Загрузка...";
-      statusEl.className = "";
-
       try {
         const url = \`/api/all?symbol=\${currentSymbol}\${token ? '&token=' + token : ''}\`;
         const response = await fetch(url, {cache: "no-store"});
         
         if (response.status === 401 || response.status === 403) {
           output.textContent = "Доступ запрещён. Проверьте токен.";
-          statusEl.textContent = "Ошибка авторизации";
-          statusEl.className = "err";
+          statusEl.textContent = "Θ Дост. запрещен";
           clearInterval(timer);
           return;
         }
@@ -657,8 +664,7 @@ app.get('/', checkToken, (req, res) => {
         const data = await response.json();
         
         if(!data.ok) {
-          statusEl.textContent = "Ошибка данных";
-          statusEl.className = "err";
+          statusEl.textContent = "Θ Ошибка данных";
           return;
         }
 
@@ -678,30 +684,25 @@ app.get('/', checkToken, (req, res) => {
           }
         });
 
-        let dot = blink ? '<span class="blink-dot">●</span>' : '○';
         let lines = [];
         
         // Форматируем MEXC цену с фиксированной длиной
         let mexcFormatted = formatPrice(mexc);
-        let cacheIndicator = data.fromCache ? '<span class="cache-indicator">[C]</span>' : '';
-        lines.push(\`\${dot} MEXC:    \${mexcFormatted.padStart(15)}\${cacheIndicator}\`);
+        let cacheIndicator = data.fromCache ? '[C]' : '';
+        lines.push(\`MEXC:    \${mexcFormatted.padStart(15)} \${cacheIndicator}\`);
         
         if (activeExchanges.length === 0) {
-          lines.push(\`<span class="inactive">Нет активных бирж для \${currentSymbol}</span>\`);
+          lines.push(\`Нет активных бирж для \${currentSymbol}\`);
         } else {
           activeExchanges.forEach(ex => {
             let p = prices[ex];
             let diff = ((p - mexc) / mexc * 100).toFixed(2);
             let sign = diff > 0 ? "+" : "";
-            let mark = (ex === best) ? '<span class="best">◆</span>' : "◇";
-            
-            // Форматируем название биржи до 8 символов
+            let mark = (ex === best) ? '◆' : "◇";
             let name = ex;
             while(name.length < 8) name += " ";
             
-            // Форматируем цену с фиксированной длиной
             let priceFormatted = formatPrice(p);
-            
             lines.push(\`\${mark} \${name}: \${priceFormatted.padStart(15)} (\${sign}\${diff}%)\`);
           });
         }
@@ -715,11 +716,11 @@ app.get('/', checkToken, (req, res) => {
           hour12: false 
         });
         
-        statusEl.textContent = \`✓ \${time} | Бирж: \${activeExchanges.length}\`;
+        statusEl.textContent = \`Θ \${time} | Бирж: \${activeExchanges.length}\`;
         statusEl.className = "success";
         
       } catch(e) {
-        statusEl.textContent = "Сетевая ошибка";
+        statusEl.textContent = "Θ Сетевая ошибка";
         statusEl.className = "err";
       }
     }
@@ -742,17 +743,23 @@ app.get('/', checkToken, (req, res) => {
         updateDexPrice();
         dexTimer = setInterval(updateDexPrice, 2000);
         
-        // Определяем символ токена из DEX данных
-        currentSymbol = 'TOKEN';
-        statusEl.textContent = \`Загрузка DEX: \${parsed.chain}/\${parsed.address.substring(0, 8)}...\`;
+        // Останавливаем CEX таймер
+        if (timer) clearInterval(timer);
+        timer = null;
+        
+        // Обновляем URL
+        const url = new URL(window.location);
+        url.searchParams.set('symbol', input);
+        url.searchParams.set('chain', currentChain);
+        url.searchParams.set('addr', currentAddr);
+        window.history.replaceState({}, '', url);
+        
+        dexInfoEl.textContent = "Загрузка DEX данных...";
+        output.textContent = "Θ";
         
       } else {
         // Режим CEX
-        currentMode = 'CEX';
-        currentSymbol = parsed.symbol;
-        currentChain = null;
-        currentAddr = null;
-        currentDexData = null;
+        startCexMonitoring(parsed.symbol);
         
         // Останавливаем DEX таймер если был
         if (dexTimer) clearInterval(dexTimer);
@@ -760,16 +767,6 @@ app.get('/', checkToken, (req, res) => {
         dexInfoEl.innerHTML = '';
         document.title = 'Crypto Spread Monitor';
       }
-      
-      // Обновляем URL
-      const url = new URL(window.location);
-      url.searchParams.set('symbol', input);
-      window.history.replaceState({}, '', url);
-      
-      // Запускаем обновление
-      if (timer) clearInterval(timer);
-      update();
-      timer = setInterval(update, 500);
     }
 
     startBtn.onclick = startMonitoring;
@@ -785,9 +782,27 @@ app.get('/', checkToken, (req, res) => {
       inputField.focus();
       inputField.select();
       
-      // Если в URL есть данные, запускаем мониторинг
-      if (input) {
-        startMonitoring();
+      // Если в URL есть chain и addr, запускаем DEX мониторинг
+      if (chain && addr) {
+        currentMode = 'DEX';
+        currentChain = chain;
+        currentAddr = addr;
+        
+        // Заполняем поле ввода
+        inputField.value = \`\${chain}/\${addr}\`;
+        
+        // Запускаем DEX мониторинг
+        updateDexPrice();
+        dexTimer = setInterval(updateDexPrice, 2000);
+        
+        dexInfoEl.textContent = "Загрузка DEX данных...";
+        output.textContent = "Θ";
+      } else if (input) {
+        // Если есть symbol, запускаем CEX мониторинг
+        const parsed = parseInput(input);
+        if (parsed.type === 'SYMBOL' && parsed.symbol) {
+          startCexMonitoring(parsed.symbol);
+        }
       }
     }, 100);
     
@@ -796,18 +811,18 @@ app.get('/', checkToken, (req, res) => {
       if(document.hidden) {
         if(timer) clearInterval(timer);
         if(dexTimer) clearInterval(dexTimer);
-        statusEl.textContent = "⏸ Приостановлено";
+        statusEl.textContent = "Θ Приостановлено";
       } else {
         if(timer) clearInterval(timer);
         if(dexTimer) clearInterval(dexTimer);
         
-        if (currentMode === 'DEX') {
+        if (currentMode === 'DEX' && currentChain && currentAddr) {
           updateDexPrice();
           dexTimer = setInterval(updateDexPrice, 2000);
+        } else if (currentMode === 'CEX' && currentSymbol) {
+          updateCEX();
+          timer = setInterval(updateCEX, 500);
         }
-        
-        update();
-        timer = setInterval(update, 500);
       }
     });
     
