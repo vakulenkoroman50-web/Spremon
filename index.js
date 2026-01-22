@@ -49,34 +49,27 @@ async function getExchangePrice(exchange, symbol) {
         // FUTURES
         url = `https://fapi.binance.com/fapi/v1/ticker/price?symbol=${pair}`;
         break;
-
       case 'Kucoin':
         const kucoinSymbol = symbol === 'BTC' ? 'XBT' : symbol;
         url = `https://api-futures.kucoin.com/api/v1/ticker?symbol=${kucoinSymbol}USDTM`;
         break;
-
       case 'BingX':
         url = `https://open-api.bingx.com/openApi/swap/v2/quote/ticker?symbol=${symbol}-USDT`;
         break;
-
       case 'Bybit':
         // FUTURES (linear)
         url = `https://api.bybit.com/v5/market/tickers?category=linear&symbol=${pair}`;
         break;
-
       case 'Bitget':
         url = `https://api.bitget.com/api/v2/mix/market/ticker?symbol=${pair}&productType=USDT-FUTURES`;
         break;
-
       case 'OKX':
         // FUTURES (SWAP)
         url = `https://www.okx.com/api/v5/market/ticker?instId=${symbol}-USDT-SWAP`;
         break;
-
       case 'Gate':
         url = `https://api.gateio.ws/api/v4/futures/usdt/tickers?contract=${symbol}_USDT`;
         break;
-
       default:
         return 0;
     }
@@ -133,6 +126,7 @@ async function getAllPricesWithCache(symbol) {
   const now = Date.now();
   const cacheKey = symbol;
   
+  // Проверяем кэш
   if (priceCache.has(cacheKey)) {
     const cached = priceCache.get(cacheKey);
     if (now - cached.timestamp < CACHE_TTL) {
@@ -144,14 +138,17 @@ async function getAllPricesWithCache(symbol) {
   console.log(`[CACHE MISS] ${symbol} - запрос к биржам`);
   
   try {
+    // Получаем цену MEXC
     const mexcPrice = await getMexcPrice(symbol);
     
+    // Получаем цены всех бирж параллельно
     const pricePromises = exchanges.map(ex => 
       getExchangePrice(ex, symbol).catch(() => 0)
     );
     
     const prices = await Promise.all(pricePromises);
     
+    // Формируем результат
     const result = {
       ok: true,
       mexc: mexcPrice,
@@ -165,6 +162,7 @@ async function getAllPricesWithCache(symbol) {
       result.prices[ex] = prices[i];
     });
     
+    // Сохраняем в кэш
     priceCache.set(cacheKey, {
       data: result,
       timestamp: now
@@ -215,7 +213,7 @@ function checkToken(req, res, next) {
   next();
 }
 
-// API endpoint
+// API endpoint для получения всех цен (с проверкой токена)
 app.get('/api/all', checkToken, async (req, res) => {
   const symbol = (req.query.symbol || 'BTC').toUpperCase();
   
@@ -231,10 +229,295 @@ app.get('/api/all', checkToken, async (req, res) => {
   }
 });
 
+// Статус сервера
+app.get('/api/status', (req, res) => {
+  res.json({
+    status: 'online',
+    server: 'Northflank EU',
+    region: process.env.NF_REGION || 'EU',
+    timestamp: Date.now(),
+    exchanges: exchanges,
+    cacheSize: priceCache.size,
+    cacheHits: Object.values(cacheStats).reduce((a, b) => a + b, 0)
+  });
+});
+
+// Главная страница с проверкой токена
+app.get('/', checkToken, (req, res) => {
+  const symbol = (req.query.symbol || 'BTC').toUpperCase();
+  
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+    <meta charset="UTF-8">
+    <title>Crypto Spread Monitor</title>
+    <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+    
+    body {
+      background: #000000;
+      font-family: monospace;
+      font-size: 28px;
+      color: #ffffff;
+      overflow: hidden;
+    }
+    
+    #container {
+      position: fixed;
+      top: 0;
+      left: 0;
+      white-space: pre;
+      line-height: 1.1;
+    }
+    
+    .control-row {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      margin-top: 2px;
+    }
+    
+    #symbolInput {
+      font-family: monospace;
+      font-size: 28px;
+      width: 100px;
+      background: #000;
+      color: #fff;
+      border: 1px solid #444;
+      padding: 1px 3px;
+    }
+    
+    #startBtn {
+      font-family: monospace;
+      font-size: 28px;
+      background: #000;
+      color: #fff;
+      border: 1px solid #444;
+      padding: 1px 10px;
+      cursor: pointer;
+    }
+    
+    #startBtn:hover {
+      background: #222;
+    }
+    
+    #startBtn:active {
+      background: #444;
+    }
+    
+    #status {
+      margin-top: 2px;
+    }
+    
+    .err {
+      color: #ff4444;
+    }
+    
+    #output {
+      line-height: 1.1;
+    }
+    
+    @keyframes blink {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0; }
+    }
+    
+    .blink-dot {
+      animation: blink 1s infinite;
+      display: inline-block;
+    }
+    
+    .best {
+      color: #ffff00;
+    }
+    
+    .inactive {
+      color: #888;
+    }
+    
+    .cache-indicator {
+      font-size: 14px;
+      color: #0f0;
+      margin-left: 5px;
+      opacity: 0.7;
+    }
+    </style>
+    </head>
+    <body>
+    <div id="container">
+      <div id="output">Загрузка...</div>
+      
+      <div class="control-row">
+        <input id="symbolInput" placeholder="BTC" value="${symbol}" autocomplete="off"/>
+        <button id="startBtn">СТАРТ</button>
+      </div>
+      
+      <div id="status">Ожидание...</div>
+    </div>
+
+    <script>
+    const exchanges=["Binance","Kucoin","BingX","Bybit","Bitget","OKX","Gate"];
+    let timer=null, blink=false;
+    
+    const urlParams = new URLSearchParams(window.location.search);
+    let symbol = (urlParams.get('symbol') || 'BTC').toUpperCase();
+    const token = urlParams.get('token');
+
+    const output=document.getElementById("output");
+    const input=document.getElementById("symbolInput");
+    const statusEl=document.getElementById("status");
+    const startBtn=document.getElementById("startBtn");
+
+    input.value = symbol;
+
+    function formatPrice(p){
+      if(!p || p == 0) return "0";
+      let s = parseFloat(p).toFixed(8);
+      return s.replace(/\\.?0+$/, "");
+    }
+
+    async function update(){
+      if(!symbol) return;
+      
+      blink = !blink;
+      statusEl.textContent = "Загрузка...";
+      statusEl.className = "";
+
+      try {
+        const url = \`/api/all?symbol=\${symbol}\${token ? '&token=' + token : ''}\`;
+        const response = await fetch(url, {cache: "no-store"});
+        
+        if (response.status === 401 || response.status === 403) {
+          output.textContent = "Доступ запрещён. Проверьте токен.";
+          statusEl.textContent = "Ошибка авторизации";
+          statusEl.className = "err";
+          clearInterval(timer);
+          return;
+        }
+        
+        const data = await response.json();
+        
+        if(!data.ok) {
+          statusEl.textContent = "Ошибка данных";
+          statusEl.className = "err";
+          return;
+        }
+
+        const mexc = data.mexc;
+        const prices = data.prices;
+
+        let best = null, bestSp = 0;
+        exchanges.forEach(ex => {
+          let p = prices[ex];
+          if(p > 0) {
+            let sp = Math.abs((p - mexc) / mexc * 100);
+            if(sp > bestSp) {
+              bestSp = sp;
+              best = ex;
+            }
+          }
+        });
+
+        let dot = blink ? '<span class="blink-dot">●</span>' : '○';
+        let lines = [];
+        
+        let cacheIndicator = data.fromCache ? '<span class="cache-indicator">[C]</span>' : '';
+        lines.push(\`\${dot} \${symbol} MEXC: \${formatPrice(mexc)}\${cacheIndicator}\`);
+        
+        exchanges.forEach(ex => {
+          let p = prices[ex];
+          if(p <= 0) {
+            let name = ex;
+            while(name.length < 8) name += " ";
+            lines.push(\`<span class="inactive">◇ \${name}: --- (---%)</span>\`);
+            return;
+          }
+          
+          let diff = ((p - mexc) / mexc * 100).toFixed(2);
+          let sign = diff > 0 ? "+" : "";
+          let mark = (ex === best) ? '<span class="best">◆</span>' : "◇";
+          let name = ex;
+          while(name.length < 8) name += " ";
+          
+          lines.push(\`\${mark} \${name}: \${formatPrice(p)} (\${sign}\${diff}%)\`);
+        });
+
+        output.innerHTML = lines.join("<br>");
+        
+        let time = new Date().toLocaleTimeString([], { 
+          hour: '2-digit', 
+          minute: '2-digit', 
+          second: '2-digit',
+          hour12: false 
+        });
+        
+        statusEl.textContent = \`✓ \${time}\`;
+        statusEl.className = "";
+        
+      } catch(e) {
+        statusEl.textContent = "Сетевая ошибка";
+        statusEl.className = "err";
+        console.error("Update error:", e);
+      }
+    }
+
+    startBtn.onclick = () => {
+      const newSymbol = input.value.trim().toUpperCase();
+      if(!newSymbol) return;
+      
+      symbol = newSymbol;
+      
+      const url = new URL(window.location);
+      url.searchParams.set('symbol', symbol);
+      window.history.replaceState({}, '', url);
+      
+      if(timer) clearInterval(timer);
+      update();
+      timer = setInterval(update, 500);
+    };
+
+    input.addEventListener('keypress', (e) => {
+      if(e.key === 'Enter') {
+        startBtn.click();
+      }
+    });
+
+    input.focus();
+    input.select();
+
+    update();
+    timer = setInterval(update, 500);
+    
+    document.addEventListener('visibilitychange', () => {
+      if(document.hidden) {
+        if(timer) clearInterval(timer);
+        statusEl.textContent = "⏸ Приостановлено";
+      } else {
+        if(timer) clearInterval(timer);
+        update();
+        timer = setInterval(update, 500);
+      }
+    });
+    
+    document.addEventListener('click', () => {
+      input.focus();
+    });
+    </script>
+    </body>
+    </html>
+  `);
+});
+
 // Запуск сервера
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`🔒 Secret token: ${SECRET_TOKEN}`);
+  console.log(`🌍 Region: ${process.env.NF_REGION || 'EU'}`);
   console.log(`📊 API: http://localhost:${PORT}/api/all?token=${SECRET_TOKEN}&symbol=BTC`);
   console.log(`💾 Cache TTL: ${CACHE_TTL}ms`);
 });
