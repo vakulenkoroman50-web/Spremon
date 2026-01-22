@@ -8,22 +8,23 @@ app.use(express.json());
 
 // Конфигурация
 const PORT = process.env.PORT || 3000;
-const SECRET_TOKEN = process.env.SECRET_TOKEN || 'default-token-123';
+const SECRET_TOKEN = process.env.SECRET_TOKEN || 'default-token-123'; // Токен по умолчанию
 const exchanges = ["Binance", "Kucoin", "BingX", "Bybit", "Bitget", "OKX", "Gate"];
 
-// Кэш для цен CEX
+// Кэш для цен CEX (символ -> {data, timestamp})
 const priceCache = new Map();
-const CACHE_TTL = 500;
+const CACHE_TTL = 500; // 500ms кэш
 
-// Кэш для DEX цен
+// Кэш для DEX цен (chain+addr -> {data, timestamp})
 const dexPriceCache = new Map();
-const DEX_CACHE_TTL = 2000;
+const DEX_CACHE_TTL = 2000; // 2 секунды для DEX кэша
 
 // Функция для получения цены с DexScreener
 async function getDexPrice(chain, address) {
   const cacheKey = `${chain}:${address}`;
   const now = Date.now();
   
+  // Проверяем кэш
   if (dexPriceCache.has(cacheKey)) {
     const cached = dexPriceCache.get(cacheKey);
     if (now - cached.timestamp < DEX_CACHE_TTL) {
@@ -32,7 +33,7 @@ async function getDexPrice(chain, address) {
     }
   }
   
-  console.log(`[DEX CACHE MISS] ${chain}/${address}`);
+  console.log(`[DEX CACHE MISS] ${chain}/${address} - запрос к DexScreener`);
   
   try {
     const fetch = (await import('node-fetch')).default;
@@ -52,6 +53,7 @@ async function getDexPrice(chain, address) {
     
     const data = await response.json();
     
+    // Парсим данные из ответа API
     let tokenName = 'Unknown Token';
     let tokenSymbol = 'UNKNOWN';
     let priceUsd = 0;
@@ -78,6 +80,7 @@ async function getDexPrice(chain, address) {
       fromCache: false
     };
     
+    // Сохраняем в кэш
     dexPriceCache.set(cacheKey, {
       data: result,
       timestamp: now
@@ -96,46 +99,38 @@ async function getDexPrice(chain, address) {
   }
 }
 
-// Функция парсинга ввода: определяет, это символ или ссылка DexScreener
-function parseInput(input) {
-  const trimmed = input.trim().toUpperCase();
-  
-  // Проверяем, является ли ввод ссылкой DexScreener
-  if (input.includes('dexscreener.com') || input.includes('/solana/') || 
-      (input.includes('/') && input.length > 20)) {
+// Функция для парсинга ссылки DexScreener
+function parseDexScreenerUrl(url) {
+  try {
+    // Убираем пробелы и лишние символы
+    const cleanUrl = url.trim();
     
-    try {
-      let path = '';
-      
-      if (input.startsWith('http')) {
-        const urlObj = new URL(input);
-        path = urlObj.pathname;
-      } else {
-        path = input.startsWith('/') ? input : `/${input}`;
-      }
-      
-      const parts = path.split('/').filter(p => p.length > 0);
-      
-      if (parts.length >= 2) {
-        return {
-          type: 'DEX',
-          chain: parts[0],
-          address: parts[1],
-          rawInput: input
-        };
-      }
-    } catch (error) {
-      // Если не удалось распарсить как ссылку, считаем символом
+    // Проверяем, это полная ссылка или только путь
+    let path = '';
+    
+    if (cleanUrl.startsWith('http')) {
+      // Полная ссылка
+      const urlObj = new URL(cleanUrl);
+      path = urlObj.pathname;
+    } else {
+      // Только путь
+      path = cleanUrl.startsWith('/') ? cleanUrl : `/${cleanUrl}`;
     }
+    
+    // Парсим путь: /solana/DbyK8gEiXwNeh2zFW2Lo1svUQ1WkHAeQyNDsRaKQ6BHf
+    const parts = path.split('/').filter(p => p.length > 0);
+    
+    if (parts.length >= 2) {
+      const chain = parts[0];
+      const address = parts[1];
+      return { chain, address, success: true };
+    }
+    
+    return { success: false, error: 'Неверный формат ссылки' };
+    
+  } catch (error) {
+    return { success: false, error: error.message };
   }
-  
-  // Если не ссылка, считаем символом токена (очищаем от лишних символов)
-  const symbol = trimmed.replace(/[^A-Z0-9]/g, '');
-  return {
-    type: 'SYMBOL',
-    symbol: symbol,
-    rawInput: input
-  };
 }
 
 // Функция для получения цены MEXC
@@ -169,6 +164,7 @@ async function getExchangePrice(exchange, symbol) {
     
     switch(exchange) {
       case 'Binance':
+        // FUTURES
         url = `https://fapi.binance.com/fapi/v1/ticker/price?symbol=${pair}`;
         break;
       case 'Kucoin':
@@ -179,12 +175,14 @@ async function getExchangePrice(exchange, symbol) {
         url = `https://open-api.bingx.com/openApi/swap/v2/quote/ticker?symbol=${symbol}-USDT`;
         break;
       case 'Bybit':
+        // FUTURES (linear)
         url = `https://api.bybit.com/v5/market/tickers?category=linear&symbol=${pair}`;
         break;
       case 'Bitget':
         url = `https://api.bitget.com/api/v2/mix/market/ticker?symbol=${pair}&productType=USDT-FUTURES`;
         break;
       case 'OKX':
+        // FUTURES (SWAP)
         url = `https://www.okx.com/api/v5/market/ticker?instId=${symbol}-USDT-SWAP`;
         break;
       case 'Gate':
@@ -203,11 +201,13 @@ async function getExchangePrice(exchange, symbol) {
     });
     
     if (!response.ok) {
-      return 0; // Не показываем ошибку, просто возвращаем 0
+      console.error(`${exchange} API Error: ${response.status}`);
+      return 0;
     }
     
     const data = await response.json();
     
+    // Парсинг ответа
     switch(exchange) {
       case 'Binance':
         price = data.price;
@@ -234,6 +234,7 @@ async function getExchangePrice(exchange, symbol) {
     
     return parseFloat(price) || 0;
   } catch (error) {
+    console.error(`${exchange} Error:`, error.message);
     return 0;
   }
 }
@@ -243,6 +244,7 @@ async function getAllPricesWithCache(symbol) {
   const now = Date.now();
   const cacheKey = symbol;
   
+  // Проверяем кэш
   if (priceCache.has(cacheKey)) {
     const cached = priceCache.get(cacheKey);
     if (now - cached.timestamp < CACHE_TTL) {
@@ -251,38 +253,34 @@ async function getAllPricesWithCache(symbol) {
     }
   }
   
-  console.log(`[CEX CACHE MISS] ${symbol}`);
+  console.log(`[CEX CACHE MISS] ${symbol} - запрос к биржам`);
   
   try {
+    // Получаем цену MEXC
     const mexcPrice = await getMexcPrice(symbol);
     
+    // Получаем цены всех бирж параллельно
     const pricePromises = exchanges.map(ex => 
       getExchangePrice(ex, symbol).catch(() => 0)
     );
     
     const prices = await Promise.all(pricePromises);
     
-    // Фильтруем биржи, где цена > 0
-    const activeExchanges = [];
-    const activePrices = {};
-    
-    exchanges.forEach((ex, i) => {
-      if (prices[i] > 0) {
-        activeExchanges.push(ex);
-        activePrices[ex] = prices[i];
-      }
-    });
-    
+    // Формируем результат
     const result = {
       ok: true,
       mexc: mexcPrice,
-      prices: activePrices,
-      exchanges: activeExchanges,
+      prices: {},
       timestamp: now,
       symbol: symbol,
       fromCache: false
     };
     
+    exchanges.forEach((ex, i) => {
+      result.prices[ex] = prices[i];
+    });
+    
+    // Сохраняем в кэш
     priceCache.set(cacheKey, {
       data: result,
       timestamp: now
@@ -311,6 +309,7 @@ function checkToken(req, res, next) {
       <body style="background:#000;color:#fff;font-family:monospace;padding:20px;">
         <h1>🔒 Access Denied</h1>
         <p>Token is required. Use: /?token=YOUR_TOKEN&symbol=BTC</p>
+        <p>Or set SECRET_TOKEN in environment variables.</p>
       </body>
       </html>
     `);
@@ -332,24 +331,22 @@ function checkToken(req, res, next) {
   next();
 }
 
-// API endpoint для получения всех цен
+// API endpoint для получения всех цен (с проверкой токена)
 app.get('/api/all', checkToken, async (req, res) => {
-  const input = req.query.symbol || 'BTC';
-  const parsed = parseInput(input);
+  const symbol = (req.query.symbol || 'BTC').toUpperCase();
+  const chain = req.query.chain;
+  const addr = req.query.addr;
   
   try {
-    if (parsed.type === 'SYMBOL') {
-      const result = await getAllPricesWithCache(parsed.symbol);
-      res.json(result);
-    } else {
-      // Для DEX ссылки пока возвращаем только информацию о парсинге
-      res.json({
-        ok: true,
-        type: 'DEX_LINK',
-        parsed: parsed,
-        message: 'Use /api/dex endpoint for DEX data'
-      });
+    const result = await getAllPricesWithCache(symbol);
+    
+    // Добавляем DEX данные, если указаны chain и addr
+    if (chain && addr) {
+      const dexData = await getDexPrice(chain, addr);
+      result.dex = dexData;
     }
+    
+    res.json(result);
   } catch (error) {
     res.status(500).json({
       ok: false,
@@ -359,7 +356,7 @@ app.get('/api/all', checkToken, async (req, res) => {
   }
 });
 
-// API endpoint для DEX данных
+// API endpoint для получения только DEX цены
 app.get('/api/dex', checkToken, async (req, res) => {
   const chain = req.query.chain;
   const addr = req.query.addr;
@@ -383,10 +380,25 @@ app.get('/api/dex', checkToken, async (req, res) => {
   }
 });
 
-// Главная страница
+// Статус сервера
+app.get('/api/status', (req, res) => {
+  res.json({
+    status: 'online',
+    server: 'Northflank EU',
+    region: process.env.NF_REGION || 'EU',
+    timestamp: Date.now(),
+    exchanges: exchanges,
+    cacheSize: priceCache.size,
+    dexCacheSize: dexPriceCache.size,
+    cacheHits: Object.values(cacheStats).reduce((a, b) => a + b, 0)
+  });
+});
+
+// Главная страница с проверкой токена
 app.get('/', checkToken, (req, res) => {
-  const input = req.query.symbol || 'BTC';
-  const token = req.query.token;
+  const symbol = (req.query.symbol || 'BTC').toUpperCase();
+  const chain = req.query.chain;
+  const addr = req.query.addr;
   
   res.send(`
     <!DOCTYPE html>
@@ -407,33 +419,42 @@ app.get('/', checkToken, (req, res) => {
       font-size: 28px;
       color: #ffffff;
       overflow: hidden;
-      padding: 0;
     }
     
     #container {
-      padding: 2px;
-      line-height: 1;
-    }
-    
-    #output {
-      min-height: 200px;
+      position: fixed;
+      top: 0;
+      left: 0;
+      white-space: pre;
+      line-height: 1.1;
     }
     
     .control-row {
       display: flex;
       align-items: center;
       gap: 5px;
-      margin: 2px 0;
+      margin-top: 2px;
     }
     
-    #inputField {
+    #symbolInput {
       font-family: monospace;
       font-size: 28px;
-      width: 600px;
+      width: 100px;
+      background: #000;
+      color: #fff;
+      border: 1px solid #444;
+      padding: 1px 3px;
+    }
+    
+    #dexUrlInput {
+      font-family: monospace;
+      font-size: 20px;
+      width: 500px;
       background: #000;
       color: #0f0;
       border: 1px solid #444;
       padding: 1px 3px;
+      margin-top: 5px;
     }
     
     #startBtn {
@@ -446,37 +467,57 @@ app.get('/', checkToken, (req, res) => {
       cursor: pointer;
     }
     
+    #loadDexBtn {
+      font-family: monospace;
+      font-size: 20px;
+      background: #000;
+      color: #0f0;
+      border: 1px solid #444;
+      padding: 1px 10px;
+      cursor: pointer;
+      margin-top: 5px;
+    }
+    
     #startBtn:hover {
       background: #222;
     }
     
-    #status {
-      margin: 2px 0;
-      font-size: 20px;
-      height: 24px;
+    #startBtn:active {
+      background: #444;
     }
     
-    #dexInfo {
-      margin: 2px 0;
+    #loadDexBtn:hover {
+      background: #222;
+    }
+    
+    #loadDexBtn:active {
+      background: #444;
+    }
+    
+    #status {
+      margin-top: 2px;
+    }
+    
+    #dexStatus {
+      margin-top: 5px;
       font-size: 20px;
       color: #0f0;
-      min-height: 60px;
     }
     
     .err {
       color: #ff4444;
     }
     
-    .success {
+    .dex-err {
+      color: #ff4444;
+    }
+    
+    .dex-success {
       color: #0f0;
     }
     
-    .inactive {
-      color: #888;
-    }
-    
-    .best {
-      color: #ffff00;
+    #output {
+      line-height: 1.1;
     }
     
     @keyframes blink {
@@ -489,6 +530,14 @@ app.get('/', checkToken, (req, res) => {
       display: inline-block;
     }
     
+    .best {
+      color: #ffff00;
+    }
+    
+    .inactive {
+      color: #888;
+    }
+    
     .cache-indicator {
       font-size: 14px;
       color: #0f0;
@@ -496,15 +545,13 @@ app.get('/', checkToken, (req, res) => {
       opacity: 0.7;
     }
     
-    .dex-price {
+    .dex-price-display {
+      font-size: 16px;
       color: #0f0;
-      font-weight: bold;
-    }
-    
-    .help-text {
-      font-size: 14px;
-      color: #666;
-      margin-top: 2px;
+      margin-top: 10px;
+      padding: 5px;
+      border: 1px solid #333;
+      background: #111;
     }
     </style>
     </head>
@@ -513,70 +560,49 @@ app.get('/', checkToken, (req, res) => {
       <div id="output">Загрузка...</div>
       
       <div class="control-row">
-        <input id="inputField" placeholder="BTC или dexscreener.com/solana/..." value="${input}" autocomplete="off"/>
+        <input id="symbolInput" placeholder="BTC" value="${symbol}" autocomplete="off"/>
         <button id="startBtn">СТАРТ</button>
       </div>
       
-      <div id="status">Введите символ или ссылку DexScreener</div>
-      <div id="dexInfo"></div>
+      <div style="margin-top: 15px; font-size: 20px; color: #0f0;">
+        DEX монитор:
+      </div>
+      
+      <div style="margin-top: 5px;">
+        <input id="dexUrlInput" placeholder="https://dexscreener.com/solana/DbyK8gEiXwNeh2zFW2Lo1svUQ1WkHAeQyNDsRaKQ6BHf" autocomplete="off"/>
+        <button id="loadDexBtn">ЗАГРУЗИТЬ DEX</button>
+      </div>
+      
+      <div id="status">Ожидание...</div>
+      <div id="dexStatus"></div>
     </div>
 
     <script>
     const exchanges=["Binance","Kucoin","BingX","Bybit","Bitget","OKX","Gate"];
     let timer=null, dexTimer=null, blink=false;
-    let currentMode='CEX'; // 'CEX' или 'DEX'
-    let currentSymbol='BTC';
     let currentChain=null, currentAddr=null, currentDexData=null;
     
     const urlParams = new URLSearchParams(window.location.search);
-    let input = urlParams.get('symbol') || 'BTC';
+    let symbol = (urlParams.get('symbol') || 'BTC').toUpperCase();
     const token = urlParams.get('token');
+    const chain = urlParams.get('chain');
+    const addr = urlParams.get('addr');
 
     const output=document.getElementById("output");
-    const inputField=document.getElementById("inputField");
+    const input=document.getElementById("symbolInput");
+    const dexUrlInput=document.getElementById("dexUrlInput");
     const statusEl=document.getElementById("status");
-    const dexInfoEl=document.getElementById("dexInfo");
+    const dexStatusEl=document.getElementById("dexStatus");
     const startBtn=document.getElementById("startBtn");
+    const loadDexBtn=document.getElementById("loadDexBtn");
 
-    inputField.value = input;
-
-    // Парсинг ввода
-    function parseInput(input) {
-      const trimmed = input.trim().toUpperCase();
-      
-      if (input.includes('dexscreener.com') || input.includes('/solana/') || 
-          (input.includes('/') && input.length > 20)) {
-        try {
-          let path = '';
-          
-          if (input.startsWith('http')) {
-            const urlObj = new URL(input);
-            path = urlObj.pathname;
-          } else {
-            path = input.startsWith('/') ? input : '/' + input;
-          }
-          
-          const parts = path.split('/').filter(p => p.length > 0);
-          
-          if (parts.length >= 2) {
-            return {
-              type: 'DEX',
-              chain: parts[0],
-              address: parts[1],
-              rawInput: input
-            };
-          }
-        } catch (e) {
-          // Если ошибка, считаем символом
-        }
-      }
-      
-      const symbol = trimmed.replace(/[^A-Z0-9]/g, '');
-      return {
-        type: 'SYMBOL',
-        symbol: symbol,
-        rawInput: input
-      };
+    input.value = symbol;
+    
+    // Если в URL уже есть chain и addr, заполняем поле
+    if (chain && addr) {
+      dexUrlInput.value = \`https://dexscreener.com/\${chain}/\${addr}\`;
+      currentChain = chain;
+      currentAddr = addr;
     }
 
     function formatPrice(p){
@@ -593,7 +619,37 @@ app.get('/', checkToken, (req, res) => {
       return parseFloat(p).toFixed(2);
     }
 
-    // Обновление DEX цены
+    // Функция для парсинга DexScreener ссылки
+    function parseDexUrl(url) {
+      try {
+        const cleanUrl = url.trim();
+        let path = '';
+        
+        if (cleanUrl.startsWith('http')) {
+          const urlObj = new URL(cleanUrl);
+          path = urlObj.pathname;
+        } else {
+          path = cleanUrl.startsWith('/') ? cleanUrl : \`/\${cleanUrl}\`;
+        }
+        
+        const parts = path.split('/').filter(p => p.length > 0);
+        
+        if (parts.length >= 2) {
+          return {
+            chain: parts[0],
+            addr: parts[1],
+            success: true
+          };
+        }
+        
+        return { success: false, error: 'Неверный формат ссылки' };
+        
+      } catch (error) {
+        return { success: false, error: error.message };
+      }
+    }
+    
+    // Функция для обновления DEX цены
     async function updateDexPrice() {
       if (!currentChain || !currentAddr) return;
       
@@ -602,8 +658,8 @@ app.get('/', checkToken, (req, res) => {
         const response = await fetch(url, {cache: "no-store"});
         
         if (response.status === 401 || response.status === 403) {
-          dexInfoEl.textContent = "Доступ запрещён";
-          dexInfoEl.className = "err";
+          dexStatusEl.textContent = "Доступ запрещён. Проверьте токен.";
+          dexStatusEl.className = "dex-err";
           clearInterval(dexTimer);
           return;
         }
@@ -611,16 +667,17 @@ app.get('/', checkToken, (req, res) => {
         const data = await response.json();
         
         if (!data.success) {
-          dexInfoEl.textContent = \`DEX Ошибка: \${data.error}\`;
-          dexInfoEl.className = "err";
+          dexStatusEl.textContent = \`DEX Ошибка: \${data.error || 'Неизвестная ошибка'}\`;
+          dexStatusEl.className = "dex-err";
           return;
         }
         
         currentDexData = data;
         
-        // Обновляем заголовок страницы
-        document.title = \`\${data.tokenSymbol} $\${formatDexPrice(data.priceUsd)} - Spread Monitor\`;
+        // Обновляем заголовок страницы с ценой токена
+        document.title = \`\${data.tokenSymbol} $\${formatDexPrice(data.priceUsd)} - Crypto Spread Monitor\`;
         
+        // Обновляем статус DEX
         const time = new Date().toLocaleTimeString([], { 
           hour: '2-digit', 
           minute: '2-digit', 
@@ -628,28 +685,65 @@ app.get('/', checkToken, (req, res) => {
           hour12: false 
         });
         
-        dexInfoEl.innerHTML = \`
-          <span class="dex-price">\${data.tokenSymbol}: $\${formatDexPrice(data.priceUsd)}</span>
-          | \${data.chain} | \${time} \${data.fromCache ? '[C]' : ''}
+        dexStatusEl.innerHTML = \`
+          <div class="dex-price-display">
+            <strong>\${data.tokenName} (\${data.tokenSymbol})</strong><br>
+            Цена: <strong>$\${formatDexPrice(data.priceUsd)}</strong><br>
+            Сеть: \${data.chain} | Адрес: \${data.address.substring(0, 8)}...<br>
+            Обновлено: \${time} \${data.fromCache ? '[CACHE]' : ''}
+          </div>
         \`;
-        dexInfoEl.className = "success";
+        dexStatusEl.className = "dex-success";
         
       } catch (error) {
-        dexInfoEl.textContent = \`DEX ошибка: \${error.message}\`;
-        dexInfoEl.className = "err";
+        dexStatusEl.textContent = \`Сетевая ошибка DEX: \${error.message}\`;
+        dexStatusEl.className = "dex-err";
       }
     }
+    
+    // Функция для загрузки DEX по ссылке
+    function loadDexFromUrl() {
+      const url = dexUrlInput.value.trim();
+      if (!url) {
+        dexStatusEl.textContent = "Введите ссылку DexScreener";
+        dexStatusEl.className = "dex-err";
+        return;
+      }
+      
+      const parsed = parseDexUrl(url);
+      if (!parsed.success) {
+        dexStatusEl.textContent = \`Ошибка парсинга: \${parsed.error}\`;
+        dexStatusEl.className = "dex-err";
+        return;
+      }
+      
+      currentChain = parsed.chain;
+      currentAddr = parsed.addr;
+      
+      // Обновляем URL в браузере
+      const urlObj = new URL(window.location);
+      urlObj.searchParams.set('chain', currentChain);
+      urlObj.searchParams.set('addr', currentAddr);
+      window.history.replaceState({}, '', urlObj);
+      
+      // Запускаем обновление DEX цены
+      if (dexTimer) clearInterval(dexTimer);
+      updateDexPrice();
+      dexTimer = setInterval(updateDexPrice, 2000);
+      
+      dexStatusEl.textContent = "Загрузка DEX данных...";
+      dexStatusEl.className = "";
+    }
 
-    // Основное обновление (CEX)
     async function update(){
-      if(!currentSymbol) return;
+      if(!symbol) return;
       
       blink = !blink;
       statusEl.textContent = "Загрузка...";
       statusEl.className = "";
 
       try {
-        const url = \`/api/all?symbol=\${currentSymbol}\${token ? '&token=' + token : ''}\`;
+        const url = \`/api/all?symbol=\${symbol}\${token ? '&token=' + token : ''}\`;
         const response = await fetch(url, {cache: "no-store"});
         
         if (response.status === 401 || response.status === 403) {
@@ -670,10 +764,9 @@ app.get('/', checkToken, (req, res) => {
 
         const mexc = data.mexc;
         const prices = data.prices;
-        const activeExchanges = data.exchanges || [];
 
         let best = null, bestSp = 0;
-        activeExchanges.forEach(ex => {
+        exchanges.forEach(ex => {
           let p = prices[ex];
           if(p > 0) {
             let sp = Math.abs((p - mexc) / mexc * 100);
@@ -688,22 +781,25 @@ app.get('/', checkToken, (req, res) => {
         let lines = [];
         
         let cacheIndicator = data.fromCache ? '<span class="cache-indicator">[C]</span>' : '';
-        lines.push(\`\${dot} \${currentSymbol} MEXC: \${formatPrice(mexc)}\${cacheIndicator}\`);
+        lines.push(\`\${dot} \${symbol} MEXC: \${formatPrice(mexc)}\${cacheIndicator}\`);
         
-        if (activeExchanges.length === 0) {
-          lines.push(\`<span class="inactive">Нет активных бирж для \${currentSymbol}</span>\`);
-        } else {
-          activeExchanges.forEach(ex => {
-            let p = prices[ex];
-            let diff = ((p - mexc) / mexc * 100).toFixed(2);
-            let sign = diff > 0 ? "+" : "";
-            let mark = (ex === best) ? '<span class="best">◆</span>' : "◇";
+        exchanges.forEach(ex => {
+          let p = prices[ex];
+          if(p <= 0) {
             let name = ex;
             while(name.length < 8) name += " ";
-            
-            lines.push(\`\${mark} \${name}: \${formatPrice(p)} (\${sign}\${diff}%)\`);
-          });
-        }
+            lines.push(\`<span class="inactive">◇ \${name}: --- (---%)</span>\`);
+            return;
+          }
+          
+          let diff = ((p - mexc) / mexc * 100).toFixed(2);
+          let sign = diff > 0 ? "+" : "";
+          let mark = (ex === best) ? '<span class="best">◆</span>' : "◇";
+          let name = ex;
+          while(name.length < 8) name += " ";
+          
+          lines.push(\`\${mark} \${name}: \${formatPrice(p)} (\${sign}\${diff}%)\`);
+        });
 
         output.innerHTML = lines.join("<br>");
         
@@ -714,106 +810,81 @@ app.get('/', checkToken, (req, res) => {
           hour12: false 
         });
         
-        statusEl.textContent = \`✓ \${time} | Бирж: \${activeExchanges.length}\`;
-        statusEl.className = "success";
+        statusEl.textContent = \`✓ \${time}\`;
+        statusEl.className = "";
         
       } catch(e) {
         statusEl.textContent = "Сетевая ошибка";
         statusEl.className = "err";
+        console.error("Update error:", e);
       }
     }
 
-    // Запуск мониторинга
-    function startMonitoring() {
-      const input = inputField.value.trim();
-      if (!input) return;
+    startBtn.onclick = () => {
+      const newSymbol = input.value.trim().toUpperCase();
+      if(!newSymbol) return;
       
-      const parsed = parseInput(input);
+      symbol = newSymbol;
       
-      if (parsed.type === 'DEX') {
-        // Режим DEX
-        currentMode = 'DEX';
-        currentChain = parsed.chain;
-        currentAddr = parsed.address;
-        
-        // Запускаем обновление DEX
-        if (dexTimer) clearInterval(dexTimer);
-        updateDexPrice();
-        dexTimer = setInterval(updateDexPrice, 2000);
-        
-        // Определяем символ токена из DEX данных (будет установлен после первого запроса)
-        // Пока ставим заглушку
-        currentSymbol = 'TOKEN';
-        statusEl.textContent = \`Загрузка DEX: \${parsed.chain}/\${parsed.address.substring(0, 8)}...\`;
-        
-      } else {
-        // Режим CEX
-        currentMode = 'CEX';
-        currentSymbol = parsed.symbol;
-        currentChain = null;
-        currentAddr = null;
-        currentDexData = null;
-        
-        // Останавливаем DEX таймер если был
-        if (dexTimer) clearInterval(dexTimer);
-        dexTimer = null;
-        dexInfoEl.innerHTML = '';
-        document.title = 'Crypto Spread Monitor';
-      }
-      
-      // Обновляем URL
       const url = new URL(window.location);
-      url.searchParams.set('symbol', input);
+      url.searchParams.set('symbol', symbol);
       window.history.replaceState({}, '', url);
       
-      // Запускаем обновление
-      if (timer) clearInterval(timer);
+      if(timer) clearInterval(timer);
       update();
       timer = setInterval(update, 500);
-    }
+    };
+    
+    loadDexBtn.onclick = loadDexFromUrl;
 
-    startBtn.onclick = startMonitoring;
-
-    inputField.addEventListener('keypress', (e) => {
+    input.addEventListener('keypress', (e) => {
       if(e.key === 'Enter') {
-        startMonitoring();
+        startBtn.click();
+      }
+    });
+    
+    dexUrlInput.addEventListener('keypress', (e) => {
+      if(e.key === 'Enter') {
+        loadDexFromUrl();
       }
     });
 
-    // Автофокус и выбор текста
-    setTimeout(() => {
-      inputField.focus();
-      inputField.select();
-      
-      // Если в URL есть данные, запускаем мониторинг
-      if (input) {
-        startMonitoring();
-      }
-    }, 100);
+    input.focus();
+    input.select();
+
+    // Инициализация
+    update();
+    timer = setInterval(update, 500);
     
-    // Управление таймерами при скрытии страницы
+    // Если в URL уже есть chain и addr, загружаем DEX данные
+    if (chain && addr) {
+      setTimeout(() => {
+        loadDexFromUrl();
+      }, 1000);
+    }
+    
     document.addEventListener('visibilitychange', () => {
       if(document.hidden) {
         if(timer) clearInterval(timer);
         if(dexTimer) clearInterval(dexTimer);
         statusEl.textContent = "⏸ Приостановлено";
+        if (dexStatusEl.className !== "dex-err") {
+          dexStatusEl.textContent = "⏸ DEX приостановлен";
+        }
       } else {
         if(timer) clearInterval(timer);
         if(dexTimer) clearInterval(dexTimer);
-        
-        if (currentMode === 'DEX') {
+        update();
+        timer = setInterval(update, 500);
+        if (currentChain && currentAddr) {
           updateDexPrice();
           dexTimer = setInterval(updateDexPrice, 1000);
         }
-        
-        update();
-        timer = setInterval(update, 500);
       }
     });
     
-    // Клик в любое место для фокуса на поле ввода
     document.addEventListener('click', () => {
-      inputField.focus();
+      input.focus();
     });
     </script>
     </body>
@@ -828,4 +899,6 @@ app.listen(PORT, () => {
   console.log(`🌍 Region: ${process.env.NF_REGION || 'EU'}`);
   console.log(`📊 CEX API: http://localhost:${PORT}/api/all?token=${SECRET_TOKEN}&symbol=BTC`);
   console.log(`🌐 DEX API: http://localhost:${PORT}/api/dex?token=${SECRET_TOKEN}&chain=solana&addr=DbyK8gEiXwNeh2zFW2Lo1svUQ1WkHAeQyNDsRaKQ6BHf`);
+  console.log(`💾 CEX Cache TTL: ${CACHE_TTL}ms`);
+  console.log(`💾 DEX Cache TTL: ${DEX_CACHE_TTL}ms`);
 });
