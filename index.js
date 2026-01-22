@@ -878,7 +878,7 @@ app.get('/', checkToken, (req, res) => {
         timer = setInterval(update, 500);
         if (currentChain && currentAddr) {
           updateDexPrice();
-          dexTimer = setInterval(updateDexPrice, 1000);
+          dexTimer = setInterval(updateDexPrice, 2000);
         }
       }
     });
