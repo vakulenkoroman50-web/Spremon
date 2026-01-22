@@ -7,15 +7,15 @@ app.use(cors());
 app.use(express.json());
 
 // --- КОНФИГУРАЦИЯ ---
+// Обязательно добавь свои ключи в переменные окружения на Northflank
 const PORT = process.env.PORT || 3000;
 const SECRET_TOKEN = process.env.SECRET_TOKEN || '777'; 
-const MEXC_API_KEY = process.env.MEXC_API_KEY || 'ТВОЙ_KEY';
-const MEXC_API_SECRET = process.env.MEXC_API_SECRET || 'ТВОЙ_SECRET';
+const MEXC_API_KEY = process.env.MEXC_API_KEY || '';
+const MEXC_API_SECRET = process.env.MEXC_API_SECRET || '';
 
 const exchanges = ["Binance", "Kucoin", "BingX", "Bybit", "Bitget", "OKX", "Gate"];
-const priceCache = new Map();
 
-// Подпись как в Python (HMAC SHA256)
+// Подпись для MEXC (HMAC SHA256)
 function signMexc(params) {
     const queryString = Object.keys(params).sort().map(k => `${k}=${params[k]}`).join('&');
     return crypto.createHmac('sha256', MEXC_API_SECRET).update(queryString).digest('hex');
@@ -23,7 +23,7 @@ function signMexc(params) {
 
 // Запрос к приватному API MEXC
 async function mexcPrivateGet(path, params = {}) {
-    if (!MEXC_API_KEY || MEXC_API_KEY === 'ТВОЙ_KEY') return null;
+    if (!MEXC_API_KEY || !MEXC_API_SECRET) return null;
     try {
         const fetch = (await import('node-fetch')).default;
         params.timestamp = Date.now();
@@ -36,7 +36,7 @@ async function mexcPrivateGet(path, params = {}) {
     } catch (e) { return null; }
 }
 
-// Эндпоинт для поиска контракта и сети (аналог Python логики)
+// Поиск лучшей пары на DEX через контракт из MEXC
 app.get('/api/resolve', async (req, res) => {
     const symbol = (req.query.symbol || '').toUpperCase();
     const data = await mexcPrivateGet("/api/v3/capital/config/getall");
@@ -70,7 +70,6 @@ app.get('/api/resolve', async (req, res) => {
     }
 });
 
-// Цены MEXC (Фьючерсы)
 async function getMexcPrice(symbol) {
     try {
         const fetch = (await import('node-fetch')).default;
@@ -80,7 +79,6 @@ async function getMexcPrice(symbol) {
     } catch (e) { return 0; }
 }
 
-// Цены других бирж
 async function getExPrice(ex, symbol) {
     const pair = symbol + 'USDT';
     try {
@@ -164,7 +162,6 @@ app.get('/', (req, res) => {
         blink = !blink;
         let dexPrice = 0;
 
-        // Получаем цену DEX
         if (chain && addr) {
             try {
                 const r = await fetch(\`https://api.dexscreener.com/latest/dex/pairs/\${chain}/\${addr}\`);
@@ -184,17 +181,13 @@ app.get('/', (req, res) => {
 
             let dot = blink ? '<span class="blink-dot">●</span>' : '○';
             let lines = [];
-            
-            // 1. MEXC База
             lines.push(\`\${dot} \${symbol} MEXC: \${data.mexc}\`);
 
-            // 2. DEX (Если есть) - ПЕРВЫМ И ЗЕЛЕНЫМ
             if (dexPrice > 0) {
                 let diff = ((dexPrice - data.mexc) / data.mexc * 100).toFixed(2);
                 lines.push(\`<span class="dex-row">◆ DEX     : \${dexPrice} (\${diff > 0 ? "+" : ""}\${diff}%)</span>\`);
             }
 
-            // 3. Остальные биржи (Только те, где цена > 0)
             let bestEx = null, maxSp = 0;
             Object.entries(data.prices).forEach(([ex, p]) => {
                 if (p > 0) {
@@ -220,16 +213,17 @@ app.get('/', (req, res) => {
         symbol = input.value.trim().toUpperCase();
         statusEl.textContent = "Поиск контракта...";
         
-        const res = await fetch(\`/api/resolve?symbol=\${symbol}\`);
-        const d = await res.json();
-        
-        if (d.ok) {
-            chain = d.chain;
-            addr = d.addr;
-            dexLink.value = d.url;
-        } else {
-            chain = null; addr = null; dexLink.value = "";
-        }
+        try {
+            const res = await fetch(\`/api/resolve?symbol=\${symbol}&token=\${token}\`);
+            const d = await res.json();
+            if (d.ok) {
+                chain = d.chain;
+                addr = d.addr;
+                dexLink.value = d.url;
+            } else {
+                chain = null; addr = null; dexLink.value = "";
+            }
+        } catch(e) { statusEl.textContent = "Ошибка поиска"; }
 
         const url = new URL(window.location);
         url.searchParams.set('symbol', symbol);
@@ -244,7 +238,6 @@ app.get('/', (req, res) => {
 
     document.getElementById("startBtn").onclick = start;
     
-    // Автозапуск если есть символ в URL
     if (new URLSearchParams(window.location.search).get('symbol')) {
         start();
     } else {
@@ -257,4 +250,4 @@ app.get('/', (req, res) => {
     `);
 });
 
-app.listen(PORT, () => console.log(\`Server on \${PORT}\`));
+app.listen(PORT, () => console.log(`Server on ${PORT}`));
