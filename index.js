@@ -151,18 +151,7 @@ app.get('/api/all', async (req, res) => {
   }
 });
 
-// Статус сервера
-app.get('/api/status', (req, res) => {
-  res.json({
-    status: 'online',
-    server: 'Northflank EU',
-    region: process.env.NF_REGION || 'EU',
-    timestamp: Date.now(),
-    exchanges: exchanges
-  });
-});
-
-// Главная страница с обновленным интерфейсом
+// Главная страница с ПРАВИЛЬНЫМ расположением как в первом варианте
 app.get('/', (req, res) => {
   const symbol = (req.query.symbol || 'BTC').toUpperCase();
   
@@ -181,53 +170,36 @@ app.get('/', (req, res) => {
       font-family: monospace;
       font-size: 24.2px; /* увеличен на 10% от 22px */
       color: #ffffff;
-      overflow: hidden;
     }
     
-    /* Контейнер в правом верхнем углу без отступов */
+    /* Контейнер в правом верхнем углу - КАК В ПЕРВОМ ВАРИАНТЕ */
     #container {
       position: fixed;
-      top: 0;
-      right: 0;
+      top: 5px;
+      right: 5px;
       white-space: pre;
       text-align: right;
-      margin: 0;
-      padding: 0;
     }
     
-    /* Контейнер для управления (ввод и кнопка) */
-    #controlContainer {
-      position: fixed;
-      top: 0;
-      left: 0;
-      margin: 0;
-      padding: 0;
-      display: flex;
-      align-items: center;
-      gap: 5px;
-    }
-    
-    /* Поле ввода и кнопка в одной строке */
-    #symbolInput {
+    /* Поле ввода и кнопка - КАК В ПЕРВОМ ВАРИАНТЕ, но кнопка справа от поля */
+    #symbolInput, #startBtn {
+      margin-top: 3px;
       font-family: monospace;
       font-size: 24.2px;
-      width: 90px;
       background: #000;
       color: #fff;
       border: 1px solid #444;
+    }
+    
+    #symbolInput {
+      width: 90px;
       padding: 2px 5px;
-      margin: 0;
     }
     
     #startBtn {
-      font-family: monospace;
-      font-size: 24.2px;
-      background: #000;
-      color: #fff;
-      border: 1px solid #444;
       padding: 2px 10px;
-      margin: 0;
       cursor: pointer;
+      margin-left: 5px;
     }
     
     #startBtn:hover {
@@ -240,49 +212,44 @@ app.get('/', (req, res) => {
     
     /* Статус */
     #status {
-      margin: 0;
-      padding: 0;
+      margin-top: 3px;
     }
     
     .err {
       color: #ff4444;
     }
     
-    /* Выходные данные */
+    /* Выходные данные - начинаются с правого верхнего угла */
     #output {
-      margin: 0;
-      padding: 0;
       line-height: 1.1;
+      text-align: right;
     }
     
-    /* Подсветка лучшей биржи */
-    .best {
-      color: #ffff00;
+    /* Анимация мигающей точки для индикатора активности */
+    .blink-dot {
+      animation: blink 1s infinite;
     }
     
-    /* Анимация мигающей точки */
     @keyframes blink {
       0%, 100% { opacity: 1; }
       50% { opacity: 0; }
     }
     
-    .blink-dot {
-      display: inline-block;
-      animation: blink 1s infinite;
+    /* Стиль для лучшей биржи */
+    .best-exchange {
+      color: #ffff00;
     }
     </style>
     </head>
     <body>
-    <!-- Контейнер управления слева сверху -->
-    <div id="controlContainer">
-      <input id="symbolInput" placeholder="BTC" value="${symbol}" autocomplete="off"/>
-      <button id="startBtn">СТАРТ</button>
-      <div id="status">🔄</div>
-    </div>
-    
-    <!-- Контейнер вывода данных справа сверху -->
+    <!-- КОНТЕЙНЕР КАК В ПЕРВОМ ВАРИАНТЕ -->
     <div id="container">
       <div id="output"></div>
+      <div style="text-align: right; margin-top: 10px;">
+        <input id="symbolInput" placeholder="BTC" value="${symbol}" autocomplete="off"/>
+        <button id="startBtn">СТАРТ</button>
+      </div>
+      <div id="status" style="text-align: right;">Ожидание…</div>
     </div>
 
     <script>
@@ -297,91 +264,66 @@ app.get('/', (req, res) => {
     const statusEl=document.getElementById("status");
     const startBtn=document.getElementById("startBtn");
 
-    // Функция для форматирования цены
+    input.value=symbol;
+
     function formatPrice(p){
      if(!p||p==0) return "0";
      let s=parseFloat(p).toFixed(8);
      return s.replace(/\\.?0+$/,"");
     }
 
-    // Основная функция обновления данных
     async function update(){
      if(!symbol) return;
      blink=!blink;
-     statusEl.textContent = blink ? "⚡" : "🔄";
+     statusEl.textContent="Загрузка…";
 
      try{
       const r=await fetch(\`/api/all?symbol=\${symbol}\`,{cache:"no-store"});
       const d=await r.json();
-      
-      if(!d.ok){
-        statusEl.textContent="❌";
-        statusEl.className="err";
-        return;
-      }
+      if(!d.ok){statusEl.textContent="Ошибка MEXC";statusEl.className="err";return;}
 
       const mexc=d.mexc;
       const prices=d.prices;
 
-      // Находим биржу с наибольшим спредом
       let best=null, bestSp=0;
       exchanges.forEach(ex=>{
         let p=prices[ex];
         if(p>0){
           let sp=Math.abs((p-mexc)/mexc*100);
-          if(sp>bestSp){
-            bestSp=sp;
-            best=ex;
-          }
+          if(sp>bestSp){bestSp=sp;best=ex;}
         }
       });
 
-      // Формируем строку с MEXC ценой
-      let dot = '<span class="blink-dot">●</span>';
+      let dot = blink ? "●" : "○";
       let lines=[];
-      lines.push(\`\${dot} \${symbol} MEXC: \${formatPrice(mexc)}\`);
 
-      // Добавляем данные по всем биржам
       exchanges.forEach(ex=>{
         let p=prices[ex];
         if(p<=0) return;
-        
         let diff=((p-mexc)/mexc*100).toFixed(2);
         let sign=diff>0?"+":"";
-        let mark=(ex===best)?"<span class='best'>◆</span>":"◇";
-        
-        // Выравнивание имен бирж до 8 символов
+        let mark=(ex===best)?"◆":"◇";
         let name=ex;
         while(name.length<8) name+=" ";
-        
         lines.push(\`\${mark} \${name}: \${formatPrice(p)} (\${sign}\${diff}%)\`);
       });
 
-      // Обновляем вывод
-      output.innerHTML = lines.join("<br>");
-      
-      // Обновляем статус
-      let time = new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit', second:'2-digit'});
-      statusEl.textContent = "✓ " + time;
-      statusEl.className = "";
-      
+      // Выводим сначала MEXC, потом все биржи - всё начинается с правого края
+      output.textContent = \`\${dot} \${symbol} MEXC: \${formatPrice(mexc)}\\n\` + lines.join("\\n");
+      statusEl.textContent="OK "+new Date().toLocaleTimeString();
+      statusEl.className="";
      }catch(e){
-      statusEl.textContent="❌";
+      statusEl.textContent="Сетевая ошибка";
       statusEl.className="err";
      }
     }
 
-    // Обработчик клика по кнопке СТАРТ
     startBtn.onclick=()=>{
      symbol=input.value.trim().toUpperCase();
      if(!symbol) return;
-     
-     // Обновляем URL
      const url=new URL(location);
      url.searchParams.set("symbol",symbol);
      history.replaceState(null,"",url);
-     
-     // Перезапускаем таймер
      if(timer) clearInterval(timer);
      update();
      timer=setInterval(update,500); // Обновление каждые 0.5 секунды
@@ -394,21 +336,8 @@ app.get('/', (req, res) => {
       }
     });
 
-    // Запускаем начальное обновление
     update();
-    
-    // Устанавливаем интервал обновления 500ms (0.5 секунды)
-    timer=setInterval(update,500);
-    
-    // Обработчик видимости страницы (оптимизация)
-    document.addEventListener('visibilitychange', () => {
-      if(document.hidden){
-        if(timer) clearInterval(timer);
-      }else{
-        if(timer) clearInterval(timer);
-        timer=setInterval(update,500);
-      }
-    });
+    timer=setInterval(update,500); // Обновление каждые 0.5 секунды
     </script>
     </body>
     </html>
@@ -420,5 +349,4 @@ app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`🌍 Region: ${process.env.NF_REGION || 'EU'}`);
   console.log(`📊 API: http://localhost:${PORT}/api/all?symbol=BTC`);
-  console.log(`📊 Status: http://localhost:${PORT}/api/status`);
 });
