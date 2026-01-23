@@ -166,6 +166,7 @@ app.get('/', (req, res) => {
 
         if (chain && addr) {
             try {
+                // Если chain и addr известны (из URL или после резолва), берем цену напрямую
                 const r = await fetch('https://api.dexscreener.com/latest/dex/pairs/' + chain + '/' + addr);
                 const d = await r.json();
                 if (d.pair) {
@@ -221,14 +222,14 @@ app.get('/', (req, res) => {
         
         if(timer) clearInterval(timer);
         output.innerHTML = "Обработка...";
-        dexLink.value = "";
         
         // 1. Проверяем, не ссылка ли это DexScreener
         if (val.includes("dexscreener.com")) {
+            dexLink.value = "";
             try {
                 const parts = val.split('/');
                 chain = parts[parts.length - 2];
-                addr = parts[parts.length - 1].split('?')[0]; // Убираем параметры если есть
+                addr = parts[parts.length - 1].split('?')[0]; 
                 
                 const dsRes = await fetch('https://api.dexscreener.com/latest/dex/pairs/' + chain + '/' + addr);
                 const dsData = await dsRes.json();
@@ -243,16 +244,29 @@ app.get('/', (req, res) => {
                 return;
             }
         } else {
-            // Если это просто тикер
-            symbol = val.toUpperCase();
-            chain = null; addr = null;
-            try {
-                const res = await fetch('/api/resolve?symbol=' + symbol + '&token=' + token);
-                const d = await res.json();
-                if (d.ok) {
-                    chain = d.chain; addr = d.addr; dexLink.value = d.url;
-                }
-            } catch(e) {}
+            // Это тикер
+            let valUpper = val.toUpperCase();
+            
+            // --- ИСПРАВЛЕНИЕ ---
+            // Если символ совпадает с текущим (из URL) И у нас уже есть chain/addr,
+            // то мы НЕ сбрасываем их и НЕ обращаемся к /api/resolve (экономим ключи MEXC).
+            if (valUpper === symbol && chain && addr) {
+                console.log("Using existing chain/addr from URL");
+                // Ничего не меняем, переменные chain и addr уже установлены
+            } else {
+                // Если это новый поиск или параметров не было
+                symbol = valUpper;
+                chain = null; addr = null;
+                dexLink.value = "";
+                
+                try {
+                    const res = await fetch('/api/resolve?symbol=' + symbol + '&token=' + token);
+                    const d = await res.json();
+                    if (d.ok) {
+                        chain = d.chain; addr = d.addr; dexLink.value = d.url;
+                    }
+                } catch(e) {}
+            }
         }
 
         const url = new URL(window.location);
@@ -268,6 +282,7 @@ app.get('/', (req, res) => {
     document.getElementById("startBtn").onclick = start;
     input.addEventListener("keypress", (e) => { if(e.key === "Enter") start(); });
 
+    // Запускаем при загрузке
     if (urlParams.get('symbol')) {
         start();
     } else {
