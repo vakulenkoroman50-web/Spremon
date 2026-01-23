@@ -12,7 +12,6 @@ const SECRET_TOKEN = process.env.SECRET_TOKEN || '777';
 const MEXC_API_KEY = process.env.MEXC_API_KEY || '';
 const MEXC_API_SECRET = process.env.MEXC_API_SECRET || '';
 
-// Строгий порядок бирж
 const exchangesOrder = ["Binance", "Bybit", "Gate", "Bitget", "BingX", "OKX", "Kucoin"];
 
 function signMexc(params) {
@@ -124,7 +123,7 @@ app.get('/', (req, res) => {
     body { background: #000; font-family: monospace; font-size: 28px; color: #fff; padding: 10px; overflow: hidden; }
     #output { white-space: pre; line-height: 1.1; height: 320px; }
     .control-row { display: flex; gap: 5px; margin-top: 10px; }
-    #symbolInput { font-family: monospace; font-size: 28px; width: 140px; background: #000; color: #fff; border: 1px solid #444; }
+    #symbolInput { font-family: monospace; font-size: 28px; width: 100%; max-width: 400px; background: #000; color: #fff; border: 1px solid #444; }
     #startBtn { font-family: monospace; font-size: 28px; background: #222; color: #fff; border: 1px solid #444; cursor: pointer; padding: 0 10px; }
     #dexLink { font-family: monospace; font-size: 16px; width: 100%; background: #111; color: #888; border: 1px solid #333; padding: 5px; cursor: pointer; margin-top: 5px; }
     .dex-row { color: #00ff00; }
@@ -134,9 +133,9 @@ app.get('/', (req, res) => {
     </style>
     </head>
     <body>
-      <div id="output">Загрузка...</div>
+      <div id="output">Готов к работе</div>
       <div class="control-row">
-        <input id="symbolInput" value="${initialSymbol}" autocomplete="off" />
+        <input id="symbolInput" value="${initialSymbol}" autocomplete="off" onfocus="this.select()" />
         <button id="startBtn">СТАРТ</button>
       </div>
       <input id="dexLink" readonly placeholder="DEX URL" onclick="this.select(); document.execCommand('copy');" />
@@ -184,17 +183,13 @@ app.get('/', (req, res) => {
 
             let dot = blink ? '<span class="blink-dot">●</span>' : '○';
             let lines = [];
-            
-            // MEXC
             lines.push(dot + ' ' + symbol + ' MEXC: ' + formatP(data.mexc));
 
-            // DEX
             if (dexPrice > 0) {
                 let diff = ((dexPrice - data.mexc) / data.mexc * 100).toFixed(2);
-                lines.push('<span class="dex-row">   DEX     : ' + formatP(dexPrice) + ' (' + (diff > 0 ? "+" : "") + diff + '%)</span>');
+                lines.push('<span class="dex-row">  DEX     : ' + formatP(dexPrice) + ' (' + (diff > 0 ? "+" : "") + diff + '%)</span>');
             }
 
-            // Поиск лучшего спреда среди CEX
             let bestEx = null, maxSp = 0;
             exchangesOrder.forEach(ex => {
                 let p = data.prices[ex];
@@ -204,7 +199,6 @@ app.get('/', (req, res) => {
                 }
             });
 
-            // Отрисовка CEX в строгом порядке
             exchangesOrder.forEach(ex => {
                 let p = data.prices[ex];
                 if (p > 0) {
@@ -222,24 +216,44 @@ app.get('/', (req, res) => {
     }
 
     async function start() {
-        const newSymbol = input.value.trim().toUpperCase();
-        if(!newSymbol) return;
+        let val = input.value.trim();
+        if(!val) return;
         
-        // Мгновенная очистка при смене токена
-        symbol = newSymbol;
-        output.innerHTML = "Поиск " + symbol + "...";
-        dexLink.value = "";
-        chain = null; addr = null;
-
         if(timer) clearInterval(timer);
-
-        try {
-            const res = await fetch('/api/resolve?symbol=' + symbol + '&token=' + token);
-            const d = await res.json();
-            if (d.ok) {
-                chain = d.chain; addr = d.addr; dexLink.value = d.url;
+        output.innerHTML = "Обработка...";
+        dexLink.value = "";
+        
+        // 1. Проверяем, не ссылка ли это DexScreener
+        if (val.includes("dexscreener.com")) {
+            try {
+                const parts = val.split('/');
+                chain = parts[parts.length - 2];
+                addr = parts[parts.length - 1].split('?')[0]; // Убираем параметры если есть
+                
+                const dsRes = await fetch('https://api.dexscreener.com/latest/dex/pairs/' + chain + '/' + addr);
+                const dsData = await dsRes.json();
+                
+                if (dsData.pair) {
+                    symbol = dsData.pair.baseToken.symbol.toUpperCase();
+                    input.value = symbol;
+                    dexLink.value = dsData.pair.url;
+                }
+            } catch(e) {
+                output.innerHTML = "Ошибка ссылки!";
+                return;
             }
-        } catch(e) {}
+        } else {
+            // Если это просто тикер
+            symbol = val.toUpperCase();
+            chain = null; addr = null;
+            try {
+                const res = await fetch('/api/resolve?symbol=' + symbol + '&token=' + token);
+                const d = await res.json();
+                if (d.ok) {
+                    chain = d.chain; addr = d.addr; dexLink.value = d.url;
+                }
+            } catch(e) {}
+        }
 
         const url = new URL(window.location);
         url.searchParams.set('symbol', symbol);
@@ -254,7 +268,6 @@ app.get('/', (req, res) => {
     document.getElementById("startBtn").onclick = start;
     input.addEventListener("keypress", (e) => { if(e.key === "Enter") start(); });
 
-    // Автостарт
     if (urlParams.get('symbol')) {
         start();
     } else {
