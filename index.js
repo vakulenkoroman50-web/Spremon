@@ -11,8 +11,37 @@ const PORT = process.env.PORT || 3000;
 const SECRET_TOKEN = process.env.SECRET_TOKEN || '777'; 
 const MEXC_API_KEY = process.env.MEXC_API_KEY || '';
 const MEXC_API_SECRET = process.env.MEXC_API_SECRET || '';
+const OKX_API_KEY = process.env.OKX_API_KEY || '';
+const OKX_API_SECRET = process.env.OKX_API_SECRET || '';
+const OKX_PASSPHRASE = process.env.OKX_PASSPHRASE || '';
 
 const exchangesOrder = ["Binance", "Bybit", "Gate", "Bitget", "BingX", "OKX", "Kucoin"];
+
+// Mapping для преобразования chainId DexScreener в chainIndex OKX
+const chainMapping = {
+    'ethereum': '1',
+    'bsc': '56',
+    'polygon': '137',
+    'arbitrum': '42161',
+    'optimism': '10',
+    'avalanche': '43114',
+    'fantom': '250',
+    'cronos': '25',
+    'base': '8453',
+    'celo': '42220',
+    'zksync': '324',
+    'linea': '59144',
+    'mantle': '5000',
+    'solana': '501',
+    'ton': '600',
+    'tron': '195',
+    'opbnb': '204',
+    'zkfair': '42766',
+    'merlin': '4200',
+    'blast': '81457',
+    'scroll': '534352',
+    'manta': '169'
+};
 
 function signMexc(params) {
     const queryString = Object.keys(params).sort().map(k => `${k}=${params[k]}`).join('&');
@@ -31,6 +60,91 @@ async function mexcPrivateGet(path, params = {}) {
         });
         return await res.json();
     } catch (e) { return null; }
+}
+
+// Функция для подписи OKX запросов
+function signOkx(timestamp, method, requestPath, body = '') {
+    const message = timestamp + method + requestPath + body;
+    return crypto.createHmac('sha256', OKX_API_SECRET).update(message).digest('base64');
+}
+
+// Функция для получения цены через OKX Web3 API
+async function getOkxDexPrice(chainIndex, tokenAddress) {
+    if (!OKX_API_KEY || !OKX_API_SECRET || !OKX_PASSPHRASE) {
+        return { ok: false, error: 'Ключи OKX API не настроены' };
+    }
+    
+    try {
+        const fetch = (await import('node-fetch')).default;
+        const method = 'POST';
+        const requestPath = '/api/v6/dex/market/price';
+        const timestamp = new Date().toISOString();
+        
+        const requestBody = JSON.stringify([{
+            "chainIndex": chainIndex,
+            "tokenContractAddress": tokenAddress
+        }]);
+        
+        const signature = signOkx(timestamp, method, requestPath, requestBody);
+        
+        const response = await fetch(`https://web3.okx.com${requestPath}`, {
+            method: method,
+            headers: {
+                'OK-ACCESS-KEY': OKX_API_KEY,
+                'OK-ACCESS-SIGN': signature,
+                'OK-ACCESS-TIMESTAMP': timestamp,
+                'OK-ACCESS-PASSPHRASE': OKX_PASSPHRASE,
+                'Content-Type': 'application/json'
+            },
+            body: requestBody
+        });
+        
+        const data = await response.json();
+        
+        if (data.code === '0' && data.data && data.data.length > 0) {
+            return {
+                ok: true,
+                price: parseFloat(data.data[0].price) || 0
+            };
+        } else {
+            let errorMsg = 'Неизвестная ошибка OKX';
+            if (data.code === '50100') errorMsg = 'Неверные ключи API';
+            if (data.code === '50016') errorMsg = 'Сеть не поддерживается';
+            if (data.code === '51002') errorMsg = 'Токен не найден';
+            return { ok: false, error: `OKX: ${errorMsg}` };
+        }
+    } catch (error) {
+        return { ok: false, error: 'OKX: Сетевая ошибка' };
+    }
+}
+
+// Функция для получения цены через DexScreener (fallback)
+async function getDexScreenerPrice(chainId, tokenAddress) {
+    try {
+        const fetch = (await import('node-fetch')).default;
+        const response = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${chainId}:${tokenAddress}`);
+        const data = await response.json();
+        
+        if (data.pairs && data.pairs.length > 0) {
+            // Находим пару с наибольшим объемом
+            let bestPair = data.pairs[0];
+            for (const pair of data.pairs) {
+                if (parseFloat(pair.volume?.h24 || 0) > parseFloat(bestPair.volume?.h24 || 0)) {
+                    bestPair = pair;
+                }
+            }
+            
+            return {
+                ok: true,
+                price: parseFloat(bestPair.priceUsd) || 0,
+                url: bestPair.url
+            };
+        } else {
+            return { ok: false, error: 'DexScreener: Токен не найден' };
+        }
+    } catch (error) {
+        return { ok: false, error: 'DexScreener: Ошибка сети' };
+    }
 }
 
 app.get('/api/resolve', async (req, res) => {
@@ -58,11 +172,64 @@ app.get('/api/resolve', async (req, res) => {
             }
         } catch (e) {}
     }
+    
     if (bestPair) {
-        res.json({ ok: true, chain: bestPair.chainId, addr: bestPair.pairAddress, url: bestPair.url });
+        const chainIndex = chainMapping[bestPair.chainId] || null;
+        res.json({ 
+            ok: true, 
+            chain: bestPair.chainId, 
+            addr: bestPair.pairAddress, 
+            url: bestPair.url,
+            chainIndex: chainIndex,
+            tokenAddress: bestPair.baseToken?.address || bestPair.pairAddress
+        });
     } else {
         res.json({ ok: false });
     }
+});
+
+// Новый endpoint для получения DEX цены
+app.get('/api/dex-price', async (req, res) => {
+    const { chain, addr, chainIndex, tokenAddress } = req.query;
+    
+    if (!chain || !addr) {
+        return res.json({ ok: false, error: 'Не указаны параметры сети или адреса' });
+    }
+    
+    const result = {
+        ok: false,
+        price: 0,
+        source: null,
+        error: null,
+        url: null
+    };
+    
+    // Пробуем сначала OKX Web3 API
+    if (chainIndex && tokenAddress) {
+        const okxResult = await getOkxDexPrice(chainIndex, tokenAddress);
+        if (okxResult.ok) {
+            result.ok = true;
+            result.price = okxResult.price;
+            result.source = 'okx';
+            res.json(result);
+            return;
+        } else {
+            result.error = okxResult.error;
+        }
+    }
+    
+    // Fallback на DexScreener
+    const dexResult = await getDexScreenerPrice(chain, addr);
+    if (dexResult.ok) {
+        result.ok = true;
+        result.price = dexResult.price;
+        result.source = 'dexscreener';
+        result.url = dexResult.url;
+    } else if (!result.error) {
+        result.error = dexResult.error;
+    }
+    
+    res.json(result);
 });
 
 async function getMexcPrice(symbol) {
@@ -126,7 +293,10 @@ app.get('/', (req, res) => {
     #symbolInput { font-family: monospace; font-size: 28px; width: 100%; max-width: 400px; background: #000; color: #fff; border: 1px solid #444; }
     #startBtn { font-family: monospace; font-size: 28px; background: #222; color: #fff; border: 1px solid #444; cursor: pointer; padding: 0 10px; }
     #dexLink { font-family: monospace; font-size: 16px; width: 100%; background: #111; color: #888; border: 1px solid #333; padding: 5px; cursor: pointer; margin-top: 5px; }
+    #errorDisplay { font-family: monospace; font-size: 16px; color: #ff4444; margin-top: 5px; min-height: 20px; }
     .dex-row { color: #00ff00; }
+    .dex-okx { color: #00ff00; }
+    .dex-dexscreener { color: #ff9900; }
     .best { color: #ffff00; }
     .blink-dot { animation: blink 1s infinite; display: inline-block; }
     @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
@@ -139,6 +309,7 @@ app.get('/', (req, res) => {
         <button id="startBtn">СТАРТ</button>
       </div>
       <input id="dexLink" readonly placeholder="DEX URL" onclick="this.select(); document.execCommand('copy');" />
+      <div id="errorDisplay"></div>
       <div id="status" style="font-size: 18px; margin-top: 5px; color: #444;"></div>
 
     <script>
@@ -153,6 +324,7 @@ app.get('/', (req, res) => {
     const output=document.getElementById("output");
     const input=document.getElementById("symbolInput");
     const dexLink=document.getElementById("dexLink");
+    const errorDisplay=document.getElementById("errorDisplay");
     const statusEl=document.getElementById("status");
 
     function formatP(p) { 
@@ -160,21 +332,26 @@ app.get('/', (req, res) => {
         return parseFloat(p).toString();
     }
 
+    async function getDexPrice() {
+        if (!chain || !addr) return { price: 0, source: null, error: null, url: null };
+        
+        try {
+            const res = await fetch('/api/dex-price?chain=' + chain + '&addr=' + addr);
+            const data = await res.json();
+            return data;
+        } catch(e) {
+            console.error('DEX price error:', e);
+            return { price: 0, source: null, error: 'Ошибка сети при запросе DEX цены', url: null };
+        }
+    }
+
     async function update() {
         blink = !blink;
-        let dexPrice = 0;
-
-        if (chain && addr) {
-            try {
-                const r = await fetch('https://api.dexscreener.com/latest/dex/pairs/' + chain + '/' + addr);
-                const d = await r.json();
-                if (d.pair) {
-                    dexPrice = parseFloat(d.pair.priceUsd);
-                    document.title = symbol + ': ' + d.pair.priceUsd;
-                    dexLink.value = d.pair.url;
-                }
-            } catch(e) {}
-        }
+        const dexResult = await getDexPrice();
+        let dexPrice = dexResult.price;
+        let dexSource = dexResult.source;
+        let dexError = dexResult.error;
+        let dexUrl = dexResult.url;
 
         try {
             const res = await fetch('/api/all?symbol=' + symbol + '&token=' + token);
@@ -187,7 +364,14 @@ app.get('/', (req, res) => {
 
             if (dexPrice > 0) {
                 let diff = ((dexPrice - data.mexc) / data.mexc * 100).toFixed(2);
-                lines.push('<span class="dex-row">  DEX     : ' + formatP(dexPrice) + ' (' + (diff > 0 ? "+" : "") + diff + '%)</span>');
+                let sourceLabel = dexSource === 'okx' ? '<span class="dex-okx">DEX OKX</span>' : 
+                                 dexSource === 'dexscreener' ? '<span class="dex-dexscreener">DEX</span>' : 'DEX';
+                lines.push('  ' + sourceLabel + '    : ' + formatP(dexPrice) + ' (' + (diff > 0 ? "+" : "") + diff + '%)');
+                
+                if (dexUrl) {
+                    dexLink.value = dexUrl;
+                    document.title = symbol + ': ' + dexPrice;
+                }
             }
 
             let bestEx = null, maxSp = 0;
@@ -212,6 +396,14 @@ app.get('/', (req, res) => {
 
             output.innerHTML = lines.join("<br>");
             statusEl.textContent = "Last: " + new Date().toLocaleTimeString();
+            
+            // Отображаем ошибки, если есть
+            if (dexError) {
+                errorDisplay.textContent = "⚠️ " + dexError;
+                errorDisplay.style.display = 'block';
+            } else {
+                errorDisplay.style.display = 'none';
+            }
         } catch(e) {}
     }
 
@@ -222,13 +414,15 @@ app.get('/', (req, res) => {
         if(timer) clearInterval(timer);
         output.innerHTML = "Обработка...";
         dexLink.value = "";
+        errorDisplay.textContent = "";
+        errorDisplay.style.display = 'none';
         
         // 1. Проверяем, не ссылка ли это DexScreener
         if (val.includes("dexscreener.com")) {
             try {
                 const parts = val.split('/');
                 chain = parts[parts.length - 2];
-                addr = parts[parts.length - 1].split('?')[0]; // Убираем параметры если есть
+                addr = parts[parts.length - 1].split('?')[0];
                 
                 const dsRes = await fetch('https://api.dexscreener.com/latest/dex/pairs/' + chain + '/' + addr);
                 const dsData = await dsRes.json();
@@ -250,7 +444,18 @@ app.get('/', (req, res) => {
                 const res = await fetch('/api/resolve?symbol=' + symbol + '&token=' + token);
                 const d = await res.json();
                 if (d.ok) {
-                    chain = d.chain; addr = d.addr; dexLink.value = d.url;
+                    chain = d.chain; 
+                    addr = d.addr; 
+                    dexLink.value = d.url;
+                    
+                    // Добавляем chainIndex и tokenAddress в URL для OKX API
+                    const url = new URL(window.location);
+                    url.searchParams.set('symbol', symbol);
+                    url.searchParams.set('chain', chain);
+                    url.searchParams.set('addr', addr);
+                    if (d.chainIndex) url.searchParams.set('chainIndex', d.chainIndex);
+                    if (d.tokenAddress) url.searchParams.set('tokenAddress', d.tokenAddress);
+                    window.history.replaceState({}, '', url);
                 }
             } catch(e) {}
         }
