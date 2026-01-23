@@ -7,21 +7,19 @@ app.use(cors());
 app.use(express.json());
 
 // --- КОНФИГУРАЦИЯ ---
-// Обязательно добавь свои ключи в переменные окружения на Northflank
 const PORT = process.env.PORT || 3000;
 const SECRET_TOKEN = process.env.SECRET_TOKEN || '777'; 
 const MEXC_API_KEY = process.env.MEXC_API_KEY || '';
 const MEXC_API_SECRET = process.env.MEXC_API_SECRET || '';
 
-const exchanges = ["Binance", "Kucoin", "BingX", "Bybit", "Bitget", "OKX", "Gate"];
+// Строгий порядок бирж
+const exchangesOrder = ["Binance", "Bybit", "Gate", "Bitget", "BingX", "OKX", "Kucoin"];
 
-// Подпись для MEXC (HMAC SHA256)
 function signMexc(params) {
     const queryString = Object.keys(params).sort().map(k => `${k}=${params[k]}`).join('&');
     return crypto.createHmac('sha256', MEXC_API_SECRET).update(queryString).digest('hex');
 }
 
-// Запрос к приватному API MEXC
 async function mexcPrivateGet(path, params = {}) {
     if (!MEXC_API_KEY || !MEXC_API_SECRET) return null;
     try {
@@ -36,7 +34,6 @@ async function mexcPrivateGet(path, params = {}) {
     } catch (e) { return null; }
 }
 
-// Поиск лучшей пары на DEX через контракт из MEXC
 app.get('/api/resolve', async (req, res) => {
     const symbol = (req.query.symbol || '').toUpperCase();
     const data = await mexcPrivateGet("/api/v3/capital/config/getall");
@@ -62,7 +59,6 @@ app.get('/api/resolve', async (req, res) => {
             }
         } catch (e) {}
     }
-
     if (bestPair) {
         res.json({ ok: true, chain: bestPair.chainId, addr: bestPair.pairAddress, url: bestPair.url });
     } else {
@@ -101,7 +97,7 @@ async function getExPrice(ex, symbol) {
         else if (ex==='Bybit') p=d.result?.list?.[0]?.lastPrice;
         else if (ex==='Bitget') p=d.data?.[0]?.lastPr;
         else if (ex==='OKX') p=d.data?.[0]?.last;
-        else if (ex==='Gate') p=d.last || d[0]?.last;
+        else if (ex==='Gate') p=d.last || (d[0] && d[0].last);
         return parseFloat(p) || 0;
     } catch(e) { return 0; }
 }
@@ -111,12 +107,12 @@ app.get('/api/all', async (req, res) => {
     const symbol = (req.query.symbol || 'BTC').toUpperCase();
     const mexc = await getMexcPrice(symbol);
     const prices = {};
-    await Promise.all(exchanges.map(async ex => { prices[ex] = await getExPrice(ex, symbol); }));
+    await Promise.all(exchangesOrder.map(async ex => { prices[ex] = await getExPrice(ex, symbol); }));
     res.json({ ok: true, mexc, prices });
 });
 
 app.get('/', (req, res) => {
-    const symbol = (req.query.symbol || 'BTC').toUpperCase();
+    const initialSymbol = (req.query.symbol || 'BTC').toUpperCase();
     res.send(`
     <!DOCTYPE html>
     <html>
@@ -125,12 +121,12 @@ app.get('/', (req, res) => {
     <title>Crypto Monitor</title>
     <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { background: #000; font-family: monospace; font-size: 28px; color: #fff; padding: 10px; }
-    #output { white-space: pre; line-height: 1.1; margin-bottom: 10px; }
-    .control-row { display: flex; gap: 5px; margin-bottom: 5px; }
-    #symbolInput { font-family: monospace; font-size: 28px; width: 120px; background: #000; color: #fff; border: 1px solid #444; }
+    body { background: #000; font-family: monospace; font-size: 28px; color: #fff; padding: 10px; overflow: hidden; }
+    #output { white-space: pre; line-height: 1.1; height: 320px; }
+    .control-row { display: flex; gap: 5px; margin-top: 10px; }
+    #symbolInput { font-family: monospace; font-size: 28px; width: 140px; background: #000; color: #fff; border: 1px solid #444; }
     #startBtn { font-family: monospace; font-size: 28px; background: #222; color: #fff; border: 1px solid #444; cursor: pointer; padding: 0 10px; }
-    #dexLink { font-family: monospace; font-size: 16px; width: 100%; background: #111; color: #888; border: 1px solid #333; padding: 5px; cursor: pointer; }
+    #dexLink { font-family: monospace; font-size: 16px; width: 100%; background: #111; color: #888; border: 1px solid #333; padding: 5px; cursor: pointer; margin-top: 5px; }
     .dex-row { color: #00ff00; }
     .best { color: #ffff00; }
     .blink-dot { animation: blink 1s infinite; display: inline-block; }
@@ -138,19 +134,21 @@ app.get('/', (req, res) => {
     </style>
     </head>
     <body>
-      <div id="output">Инициализация...</div>
+      <div id="output">Загрузка...</div>
       <div class="control-row">
-        <input id="symbolInput" value="\${symbol}" />
+        <input id="symbolInput" value="${initialSymbol}" autocomplete="off" />
         <button id="startBtn">СТАРТ</button>
       </div>
-      <input id="dexLink" readonly placeholder="Ссылка на DexScreener появится здесь" onclick="this.select(); document.execCommand('copy');" />
-      <div id="status" style="font-size: 18px; margin-top: 5px; color: #666;"></div>
+      <input id="dexLink" readonly placeholder="DEX URL" onclick="this.select(); document.execCommand('copy');" />
+      <div id="status" style="font-size: 18px; margin-top: 5px; color: #444;"></div>
 
     <script>
-    let symbol = new URLSearchParams(window.location.search).get('symbol')?.toUpperCase() || 'BTC';
-    let token = new URLSearchParams(window.location.search).get('token') || '777';
-    let chain = new URLSearchParams(window.location.search).get('chain');
-    let addr = new URLSearchParams(window.location.search).get('addr');
+    const exchangesOrder = ["Binance", "Bybit", "Gate", "Bitget", "BingX", "OKX", "Kucoin"];
+    let urlParams = new URLSearchParams(window.location.search);
+    let symbol = urlParams.get('symbol')?.toUpperCase() || 'BTC';
+    let token = urlParams.get('token') || '777';
+    let chain = urlParams.get('chain');
+    let addr = urlParams.get('addr');
     let timer=null, blink=false;
 
     const output=document.getElementById("output");
@@ -158,72 +156,90 @@ app.get('/', (req, res) => {
     const dexLink=document.getElementById("dexLink");
     const statusEl=document.getElementById("status");
 
+    function formatP(p) { 
+        if(!p || p == 0) return "0";
+        return parseFloat(p).toString();
+    }
+
     async function update() {
         blink = !blink;
         let dexPrice = 0;
 
         if (chain && addr) {
             try {
-                const r = await fetch(\`https://api.dexscreener.com/latest/dex/pairs/\${chain}/\${addr}\`);
+                const r = await fetch('https://api.dexscreener.com/latest/dex/pairs/' + chain + '/' + addr);
                 const d = await r.json();
                 if (d.pair) {
                     dexPrice = parseFloat(d.pair.priceUsd);
-                    document.title = \`\${symbol}: \${d.pair.priceUsd}\`;
+                    document.title = symbol + ': ' + d.pair.priceUsd;
                     dexLink.value = d.pair.url;
                 }
             } catch(e) {}
         }
 
         try {
-            const res = await fetch(\`/api/all?symbol=\${symbol}&token=\${token}\`);
+            const res = await fetch('/api/all?symbol=' + symbol + '&token=' + token);
             const data = await res.json();
             if(!data.ok) return;
 
             let dot = blink ? '<span class="blink-dot">●</span>' : '○';
             let lines = [];
-            lines.push(\`\${dot} \${symbol} MEXC: \${data.mexc}\`);
+            
+            // MEXC
+            lines.push(dot + ' ' + symbol + ' MEXC: ' + formatP(data.mexc));
 
+            // DEX
             if (dexPrice > 0) {
                 let diff = ((dexPrice - data.mexc) / data.mexc * 100).toFixed(2);
-                lines.push(\`<span class="dex-row">◆ DEX     : \${dexPrice} (\${diff > 0 ? "+" : ""}\${diff}%)</span>\`);
+                lines.push('<span class="dex-row">  DEX     : ' + formatP(dexPrice) + ' (' + (diff > 0 ? "+" : "") + diff + '%)</span>');
             }
 
+            // Поиск лучшего спреда среди CEX
             let bestEx = null, maxSp = 0;
-            Object.entries(data.prices).forEach(([ex, p]) => {
+            exchangesOrder.forEach(ex => {
+                let p = data.prices[ex];
                 if (p > 0) {
                     let sp = Math.abs((p - data.mexc) / data.mexc * 100);
                     if (sp > maxSp) { maxSp = sp; bestEx = ex; }
                 }
             });
 
-            Object.entries(data.prices).forEach(([ex, p]) => {
+            // Отрисовка CEX в строгом порядке
+            exchangesOrder.forEach(ex => {
+                let p = data.prices[ex];
                 if (p > 0) {
                     let diff = ((p - data.mexc) / data.mexc * 100).toFixed(2);
-                    let isBest = (ex === bestEx) ? 'class="best"' : '';
-                    lines.push(\`<span \${isBest}>◇ \${ex.padEnd(8, ' ')}: \${p} (\${diff > 0 ? "+" : ""}\${diff}%)</span>\`);
+                    let isBest = (ex === bestEx);
+                    let mark = isBest ? '◆' : '◇';
+                    let cls = isBest ? 'class="best"' : '';
+                    lines.push('<span ' + cls + '>' + mark + ' ' + ex.padEnd(8, ' ') + ': ' + formatP(p) + ' (' + (diff > 0 ? "+" : "") + diff + '%)</span>');
                 }
             });
 
             output.innerHTML = lines.join("<br>");
-            statusEl.textContent = "Обновлено: " + new Date().toLocaleTimeString();
+            statusEl.textContent = "Last: " + new Date().toLocaleTimeString();
         } catch(e) {}
     }
 
     async function start() {
-        symbol = input.value.trim().toUpperCase();
-        statusEl.textContent = "Поиск контракта...";
+        const newSymbol = input.value.trim().toUpperCase();
+        if(!newSymbol) return;
         
+        // Мгновенная очистка при смене токена
+        symbol = newSymbol;
+        output.innerHTML = "Поиск " + symbol + "...";
+        dexLink.value = "";
+        chain = null; addr = null;
+
+        if(timer) clearInterval(timer);
+
         try {
-            const res = await fetch(\`/api/resolve?symbol=\${symbol}&token=\${token}\`);
+            const res = await fetch('/api/resolve?symbol=' + symbol + '&token=' + token);
             const d = await res.json();
             if (d.ok) {
-                chain = d.chain;
-                addr = d.addr;
-                dexLink.value = d.url;
-            } else {
-                chain = null; addr = null; dexLink.value = "";
+                chain = d.chain; addr = d.addr; dexLink.value = d.url;
             }
-        } catch(e) { statusEl.textContent = "Ошибка поиска"; }
+        } catch(e) {}
 
         const url = new URL(window.location);
         url.searchParams.set('symbol', symbol);
@@ -231,14 +247,15 @@ app.get('/', (req, res) => {
         if(addr) url.searchParams.set('addr', addr);
         window.history.replaceState({}, '', url);
 
-        if(timer) clearInterval(timer);
         update();
         timer = setInterval(update, 1000);
     }
 
     document.getElementById("startBtn").onclick = start;
-    
-    if (new URLSearchParams(window.location.search).get('symbol')) {
+    input.addEventListener("keypress", (e) => { if(e.key === "Enter") start(); });
+
+    // Автостарт
+    if (urlParams.get('symbol')) {
         start();
     } else {
         update();
@@ -250,4 +267,4 @@ app.get('/', (req, res) => {
     `);
 });
 
-app.listen(PORT, () => console.log(`Server on ${PORT}`));
+app.listen(PORT, () => console.log(`Server running on ${PORT}`));
