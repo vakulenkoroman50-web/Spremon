@@ -14,6 +14,7 @@ const MEXC_API_SECRET = process.env.MEXC_API_SECRET || '';
 
 const exchangesOrder = ["Binance", "Bybit", "Gate", "Bitget", "BingX", "OKX", "Kucoin"];
 
+// --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 function signMexc(params) {
     const queryString = Object.keys(params).sort().map(k => `${k}=${params[k]}`).join('&');
     return crypto.createHmac('sha256', MEXC_API_SECRET).update(queryString).digest('hex');
@@ -33,8 +34,11 @@ async function mexcPrivateGet(path, params = {}) {
     } catch (e) { return null; }
 }
 
+// --- API: ПОИСК АДРЕСА КОНТРАКТА (RESOLVE) ---
 app.get('/api/resolve', async (req, res) => {
     const symbol = (req.query.symbol || '').toUpperCase();
+    
+    // 1. Получаем конфиг всех монет с MEXC
     const data = await mexcPrivateGet("/api/v3/capital/config/getall");
     if (!data || !Array.isArray(data)) return res.json({ ok: false });
 
@@ -44,6 +48,7 @@ app.get('/api/resolve', async (req, res) => {
     let bestPair = null;
     const fetch = (await import('node-fetch')).default;
 
+    // 2. Пробегаем по сетям и ищем лучшую пару на DexScreener
     for (const net of token.networkList) {
         if (!net.contract) continue;
         try {
@@ -51,6 +56,7 @@ app.get('/api/resolve', async (req, res) => {
             const dsData = await dsRes.json();
             if (dsData.pairs) {
                 dsData.pairs.forEach(pair => {
+                    // Выбираем пару с наибольшим объемом
                     if (!bestPair || (parseFloat(pair.volume?.h24 || 0) > parseFloat(bestPair.volume?.h24 || 0))) {
                         bestPair = pair;
                     }
@@ -58,6 +64,7 @@ app.get('/api/resolve', async (req, res) => {
             }
         } catch (e) {}
     }
+
     if (bestPair) {
         res.json({ ok: true, chain: bestPair.chainId, addr: bestPair.pairAddress, url: bestPair.url });
     } else {
@@ -65,6 +72,7 @@ app.get('/api/resolve', async (req, res) => {
     }
 });
 
+// --- ФУНКЦИИ ПОЛУЧЕНИЯ ЦЕН CEX ---
 async function getMexcPrice(symbol) {
     try {
         const fetch = (await import('node-fetch')).default;
@@ -101,6 +109,7 @@ async function getExPrice(ex, symbol) {
     } catch(e) { return 0; }
 }
 
+// --- API: ПОЛУЧЕНИЕ ВСЕХ ЦЕН CEX ---
 app.get('/api/all', async (req, res) => {
     if (req.query.token !== SECRET_TOKEN) return res.status(403).json({ok:false});
     const symbol = (req.query.symbol || 'BTC').toUpperCase();
@@ -110,6 +119,7 @@ app.get('/api/all', async (req, res) => {
     res.json({ ok: true, mexc, prices });
 });
 
+// --- ГЛАВНАЯ СТРАНИЦА (FRONTEND) ---
 app.get('/', (req, res) => {
     const initialSymbol = (req.query.symbol || 'BTC').toUpperCase();
     res.send(`
@@ -120,12 +130,16 @@ app.get('/', (req, res) => {
     <title>Crypto Monitor</title>
     <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { background: #000; font-family: monospace; font-size: 28px; color: #fff; padding: 10px; overflow: hidden; }
-    #output { white-space: pre; line-height: 1.1; height: 320px; }
-    .control-row { display: flex; gap: 5px; margin-top: 10px; }
+    body { background: #000; font-family: monospace; font-size: 28px; color: #fff; padding: 10px; overflow: hidden; display: flex; flex-direction: column; height: 100vh; }
+    #output { white-space: pre; line-height: 1.1; flex-grow: 1; overflow-y: auto; }
+    .control-row { display: flex; gap: 5px; margin-top: 10px; flex-shrink: 0; }
     #symbolInput { font-family: monospace; font-size: 28px; width: 100%; max-width: 400px; background: #000; color: #fff; border: 1px solid #444; }
     #startBtn { font-family: monospace; font-size: 28px; background: #222; color: #fff; border: 1px solid #444; cursor: pointer; padding: 0 10px; }
-    #dexLink { font-family: monospace; font-size: 16px; width: 100%; background: #111; color: #888; border: 1px solid #333; padding: 5px; cursor: pointer; margin-top: 5px; }
+    #dexLink { font-family: monospace; font-size: 16px; width: 100%; background: #111; color: #888; border: 1px solid #333; padding: 5px; cursor: pointer; margin-top: 5px; flex-shrink: 0; }
+    
+    /* Блок отладки */
+    #debug { font-size: 14px; color: #888; border-top: 1px solid #333; margin-top: 5px; padding-top: 5px; height: 80px; overflow: auto; flex-shrink: 0; background: #050505; }
+    
     .dex-row { color: #00ff00; }
     .best { color: #ffff00; }
     .blink-dot { animation: blink 1s infinite; display: inline-block; }
@@ -139,45 +153,75 @@ app.get('/', (req, res) => {
         <button id="startBtn">СТАРТ</button>
       </div>
       <input id="dexLink" readonly placeholder="DEX URL" onclick="this.select(); document.execCommand('copy');" />
-      <div id="status" style="font-size: 18px; margin-top: 5px; color: #444;"></div>
+      <div id="status" style="font-size: 18px; margin-top: 5px; color: #444; flex-shrink: 0;"></div>
+      
+      <div id="debug">System ready...</div>
 
     <script>
     const exchangesOrder = ["Binance", "Bybit", "Gate", "Bitget", "BingX", "OKX", "Kucoin"];
+    
+    // --- Инициализация переменных из URL ---
     let urlParams = new URLSearchParams(window.location.search);
     let symbol = urlParams.get('symbol')?.toUpperCase() || 'BTC';
     let token = urlParams.get('token') || '777';
+    // Важно: читаем chain и addr один раз при загрузке
     let chain = urlParams.get('chain');
     let addr = urlParams.get('addr');
-    let timer=null, blink=false;
+    
+    let timer = null; 
+    let blink = false;
 
-    const output=document.getElementById("output");
-    const input=document.getElementById("symbolInput");
-    const dexLink=document.getElementById("dexLink");
-    const statusEl=document.getElementById("status");
+    const output = document.getElementById("output");
+    const input = document.getElementById("symbolInput");
+    const dexLink = document.getElementById("dexLink");
+    const statusEl = document.getElementById("status");
+    const debugEl = document.getElementById("debug");
 
     function formatP(p) { 
         if(!p || p == 0) return "0";
         return parseFloat(p).toString();
     }
 
+    function logDebug(msg) {
+        let chainInfo = chain ? chain : "null";
+        let addrInfo = addr ? (addr.substring(0,6)+"...") : "null";
+        debugEl.innerHTML = 
+            "<span style='color:#aaa'>Symbol:</span> " + symbol + 
+            " | <span style='color:#aaa'>Chain:</span> " + chainInfo + 
+            " | <span style='color:#aaa'>Addr:</span> " + addrInfo + "<br>" +
+            "<span style='color:#fff'>STATUS:</span> " + msg;
+    }
+
     async function update() {
         blink = !blink;
         let dexPrice = 0;
+        let dexMsg = "";
 
+        // Если у нас есть chain и addr (из URL или после поиска), запрашиваем DexScreener
         if (chain && addr) {
             try {
-                // Если chain и addr известны (из URL или после резолва), берем цену напрямую
                 const r = await fetch('https://api.dexscreener.com/latest/dex/pairs/' + chain + '/' + addr);
                 const d = await r.json();
                 if (d.pair) {
                     dexPrice = parseFloat(d.pair.priceUsd);
                     document.title = symbol + ': ' + d.pair.priceUsd;
                     dexLink.value = d.pair.url;
+                    dexMsg = "OK";
+                } else {
+                    dexMsg = "Pair not found";
                 }
-            } catch(e) {}
+            } catch(e) {
+                dexMsg = "Error: " + e.message;
+            }
+        } else {
+            dexMsg = "Waiting for chain/addr...";
         }
+        
+        // Обновляем отладку
+        logDebug(dexMsg + (dexPrice > 0 ? " (Price: " + dexPrice + ")" : ""));
 
         try {
+            // Запрашиваем цены CEX
             const res = await fetch('/api/all?symbol=' + symbol + '&token=' + token);
             const data = await res.json();
             if(!data.ok) return;
@@ -223,7 +267,9 @@ app.get('/', (req, res) => {
         if(timer) clearInterval(timer);
         output.innerHTML = "Обработка...";
         
-        // 1. Проверяем, не ссылка ли это DexScreener
+        let valUpper = val.toUpperCase();
+        
+        // --- ПРОВЕРКА ССЫЛКИ DEXSCREENER ---
         if (val.includes("dexscreener.com")) {
             dexLink.value = "";
             try {
@@ -243,20 +289,20 @@ app.get('/', (req, res) => {
                 output.innerHTML = "Ошибка ссылки!";
                 return;
             }
-        } else {
-            // Это тикер
-            let valUpper = val.toUpperCase();
-            
-            // --- ИСПРАВЛЕНИЕ ---
-            // Если символ совпадает с текущим (из URL) И у нас уже есть chain/addr,
-            // то мы НЕ сбрасываем их и НЕ обращаемся к /api/resolve (экономим ключи MEXC).
+        } 
+        // --- ПРОВЕРКА ОБЫЧНОГО ТИКЕРА ---
+        else {
+            // КЛЮЧЕВОЙ МОМЕНТ:
+            // Если введенный тикер совпадает с URL и у нас УЖЕ есть chain/addr,
+            // мы сохраняем их и НЕ делаем сброс.
             if (valUpper === symbol && chain && addr) {
-                console.log("Using existing chain/addr from URL");
-                // Ничего не меняем, переменные chain и addr уже установлены
+                console.log("Using preserved chain parameters from URL");
+                // Ничего не сбрасываем, идем дальше к update()
             } else {
-                // Если это новый поиск или параметров не было
+                // Иначе (новый тикер или нет данных) - ищем через сервер
                 symbol = valUpper;
-                chain = null; addr = null;
+                chain = null; 
+                addr = null;
                 dexLink.value = "";
                 
                 try {
@@ -269,6 +315,7 @@ app.get('/', (req, res) => {
             }
         }
 
+        // Обновляем URL (чтобы параметры сохранились при рефреше)
         const url = new URL(window.location);
         url.searchParams.set('symbol', symbol);
         if(chain) url.searchParams.set('chain', chain);
@@ -282,7 +329,7 @@ app.get('/', (req, res) => {
     document.getElementById("startBtn").onclick = start;
     input.addEventListener("keypress", (e) => { if(e.key === "Enter") start(); });
 
-    // Запускаем при загрузке
+    // Запуск при загрузке страницы
     if (urlParams.get('symbol')) {
         start();
     } else {
