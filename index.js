@@ -8,14 +8,14 @@ app.use(express.json());
 
 // --- КОНФИГУРАЦИЯ ---
 const PORT = process.env.PORT || 3000;
-const SECRET_TOKEN = process.env.SECRET_TOKEN || '777'; 
+const SECRET_TOKEN = process.env.SECRET_TOKEN; 
 const MEXC_API_KEY = process.env.MEXC_API_KEY || '';
 const MEXC_API_SECRET = process.env.MEXC_API_SECRET || '';
 
 const exchangesOrder = ["Binance", "Bybit", "Gate", "Bitget", "BingX", "OKX", "Kucoin"];
 
 function signMexc(params) {
-    const queryString = Object.keys(params).sort().map(k => `${k}=${params[k]}`).join('&');
+    const queryString = Object.keys(params).sort().map(k => `\( {k}= \){params[k]}`).join('&');
     return crypto.createHmac('sha256', MEXC_API_SECRET).update(queryString).digest('hex');
 }
 
@@ -26,7 +26,7 @@ async function mexcPrivateGet(path, params = {}) {
         params.timestamp = Date.now();
         params.signature = signMexc(params);
         const query = new URLSearchParams(params).toString();
-        const res = await fetch(`https://api.mexc.com${path}?${query}`, {
+        const res = await fetch(`https://api.mexc.com\( {path}? \){query}`, {
             headers: { 'X-MEXC-APIKEY': MEXC_API_KEY }
         });
         return await res.json();
@@ -99,6 +99,7 @@ function formatPrice(price) {
 }
 
 app.get('/api/resolve', async (req, res) => {
+    if (req.query.token !== SECRET_TOKEN) return res.status(403).json({ok:false});
     const symbol = (req.query.symbol || '').toUpperCase();
     const data = await mexcPrivateGet("/api/v3/capital/config/getall");
     if (!data || !Array.isArray(data)) return res.json({ ok: false });
@@ -204,7 +205,8 @@ app.get('/api/all', async (req, res) => {
 });
 
 app.get('/', (req, res) => {
-    const initialSymbol = (req.query.symbol || 'BTC').toUpperCase();
+    if (req.query.token !== SECRET_TOKEN) return res.send("Доступ запрещён");
+    const initialSymbol = (req.query.symbol || '').toUpperCase();
     res.send(`
     <!DOCTYPE html>
     <html>
@@ -229,7 +231,7 @@ app.get('/', (req, res) => {
     </head>
     <body>
       <div id="output">Готов к работе</div>
-      <div class="control-row">
+      <div class="control-row" style="margin-top: -92px;">
         <input id="symbolInput" value="${initialSymbol}" autocomplete="off" onfocus="this.select()" />
         <button id="startBtn">СТАРТ</button>
       </div>
@@ -239,8 +241,8 @@ app.get('/', (req, res) => {
     <script>
     const exchangesOrder = ["Binance", "Bybit", "Gate", "Bitget", "BingX", "OKX", "Kucoin"];
     let urlParams = new URLSearchParams(window.location.search);
-    let symbol = urlParams.get('symbol')?.toUpperCase() || 'BTC';
-    let token = urlParams.get('token') || '777';
+    let symbol = urlParams.get('symbol')?.toUpperCase() || '';
+    let token = urlParams.get('token');
     let chain = urlParams.get('chain');
     let addr = urlParams.get('addr');
     let mexcDepositOpen = true;
@@ -355,7 +357,7 @@ app.get('/', (req, res) => {
                     const priceDisplay = data.pricesFormatted && data.pricesFormatted[ex] 
                         ? data.pricesFormatted[ex] 
                         : formatP(p);
-                    lines.push('<span ' + cls + '>' + mark + ' ' + ex.padEnd(8, ' ') + ': ' + priceDisplay + ' (' + (diff > 0 ? "+" : "") + diff + '%)</span>');
+                    lines.push('<span ' + cls + '>' + mark + ' ' + ex.padEnd(6, ' ') + ': ' + priceDisplay + ' (' + (diff > 0 ? "+" : "") + diff + '%)</span>');
                 }
             });
 
@@ -421,11 +423,8 @@ app.get('/', (req, res) => {
     document.getElementById("startBtn").onclick = start;
     input.addEventListener("keypress", (e) => { if(e.key === "Enter") start(); });
 
-    if (urlParams.get('symbol')) {
+    if (urlParams.get('symbol') || (urlParams.get('chain') && urlParams.get('addr'))) {
         start();
-    } else {
-        update();
-        timer = setInterval(update, 1000);
     }
     </script>
     </body>
