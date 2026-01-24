@@ -33,7 +33,6 @@ async function mexcPrivateGet(path, params = {}) {
     } catch (e) { return null; }
 }
 
-// Исправленная функция проверки статуса депозитов на MEXC
 async function getMexcDepositStatus(symbol) {
     if (!MEXC_API_KEY || !MEXC_API_SECRET) return true;
     
@@ -56,12 +55,17 @@ async function getMexcDepositStatus(symbol) {
     }
 }
 
-// ИСПРАВЛЕННАЯ функция форматирования цены (без научной нотации)
+// Улучшенная функция форматирования цены
 function formatPrice(price) {
-    if (!price || price == 0) return "0";
+    if (!price || price == 0) return "0".padStart(15, ' ');
     const num = parseFloat(price);
     
-    // Определяем количество знаков после запятой
+    // Для очень маленьких чисел используем фиксированный формат
+    if (num < 0.000001) {
+        return num.toFixed(8).padStart(15, ' ');
+    }
+    
+    // Для обычных чисел определяем оптимальное количество знаков
     let decimals;
     if (num >= 1000) {
         decimals = 2;
@@ -73,19 +77,28 @@ function formatPrice(price) {
         decimals = 6;
     } else if (num >= 0.001) {
         decimals = 7;
-    } else {
-        // Для чисел меньше 0.001 фиксируем 8 знаков (вместо научной нотации)
+    } else if (num >= 0.000001) {
         decimals = 8;
     }
     
-    // Форматируем, обрезая лишние нули в конце
+    // Форматируем с фиксированными знаками после запятой
     let formatted = num.toFixed(decimals);
-    // Убираем лишние нули в конце дробной части
-    formatted = formatted.replace(/(\.\d*?[1-9])0+$/, "$1");
-    // Если после точки остались только нули, убираем и точку
-    formatted = formatted.replace(/\.0+$/, "");
     
-    return formatted;
+    // Добавляем недостающие нули в конец для выравнивания
+    const parts = formatted.split('.');
+    if (parts.length === 2) {
+        const integerPart = parts[0];
+        let decimalPart = parts[1];
+        
+        // Добавляем нули до нужного количества знаков
+        while (decimalPart.length < decimals) {
+            decimalPart += '0';
+        }
+        
+        formatted = integerPart + '.' + decimalPart;
+    }
+    
+    return formatted.padStart(15, ' ');
 }
 
 app.get('/api/resolve', async (req, res) => {
@@ -172,7 +185,6 @@ app.get('/api/all', async (req, res) => {
     const prices = {};
     await Promise.all(exchangesOrder.map(async ex => { prices[ex] = await getExPrice(ex, symbol); }));
     
-    // Используем исправленную функцию formatPrice для форматирования цен
     const mexcFormatted = formatPrice(mexc);
     const pricesFormatted = {};
     Object.keys(prices).forEach(ex => {
@@ -232,19 +244,25 @@ app.get('/', (req, res) => {
     let chain = urlParams.get('chain');
     let addr = urlParams.get('addr');
     let mexcDepositOpen = true;
-    let timer=null, blink=false;
+    let timer = null, blink = false;
+    let currentRequestId = 0; // Для предотвращения гонки запросов
 
-    const output=document.getElementById("output");
-    const input=document.getElementById("symbolInput");
-    const dexLink=document.getElementById("dexLink");
-    const statusEl=document.getElementById("status");
+    const output = document.getElementById("output");
+    const input = document.getElementById("symbolInput");
+    const dexLink = document.getElementById("dexLink");
+    const statusEl = document.getElementById("status");
 
-    // ИСПРАВЛЕННАЯ функция форматирования на фронтенде
+    // Улучшенная функция форматирования на фронтенде
     function formatP(p) { 
-        if(!p || p == 0) return "0".padStart(12, ' ');
+        if(!p || p == 0) return "0".padStart(15, ' ');
         const num = parseFloat(p);
         
-        // Определяем количество знаков после запятой
+        // Для очень маленьких чисел используем фиксированный формат
+        if (num < 0.000001) {
+            return num.toFixed(8).padStart(15, ' ');
+        }
+        
+        // Для обычных чисел определяем оптимальное количество знаков
         let decimals;
         if (num >= 1000) {
             decimals = 2;
@@ -256,29 +274,42 @@ app.get('/', (req, res) => {
             decimals = 6;
         } else if (num >= 0.001) {
             decimals = 7;
-        } else {
-            // Для чисел меньше 0.001 фиксируем 8 знаков
+        } else if (num >= 0.000001) {
             decimals = 8;
         }
         
-        // Форматируем, обрезая лишние нули в конце
+        // Форматируем с фиксированными знаками после запятой
         let formatted = num.toFixed(decimals);
-        // Убираем лишние нули в конце дробной части
-        formatted = formatted.replace(/(\.\d*?[1-9])0+$/, "$1");
-        // Если после точки остались только нули, убираем и точку
-        formatted = formatted.replace(/\.0+$/, "");
         
-        // Выравниваем фиксированной шириной (12 символов)
-        return formatted.padStart(12, ' ');
+        // Добавляем недостающие нули в конец для выравнивания
+        const parts = formatted.split('.');
+        if (parts.length === 2) {
+            const integerPart = parts[0];
+            let decimalPart = parts[1];
+            
+            // Добавляем нули до нужного количества знаков
+            while (decimalPart.length < decimals) {
+                decimalPart += '0';
+            }
+            
+            formatted = integerPart + '.' + decimalPart;
+        }
+        
+        return formatted.padStart(15, ' ');
     }
 
     async function update() {
         blink = !blink;
         let dexPrice = 0;
+        
+        // Увеличиваем ID запроса для отслеживания
+        const requestId = ++currentRequestId;
 
         if (chain && addr) {
             try {
                 const r = await fetch('https://api.dexscreener.com/latest/dex/pairs/' + chain + '/' + addr);
+                // Проверяем, актуален ли еще запрос
+                if (requestId !== currentRequestId) return;
                 const d = await r.json();
                 if (d.pair) {
                     dexPrice = parseFloat(d.pair.priceUsd);
@@ -290,6 +321,8 @@ app.get('/', (req, res) => {
 
         try {
             const res = await fetch('/api/all?symbol=' + symbol + '&token=' + token);
+            // Проверяем, актуален ли еще запрос
+            if (requestId !== currentRequestId) return;
             const data = await res.json();
             if(!data.ok) return;
 
@@ -303,8 +336,7 @@ app.get('/', (req, res) => {
             }
             
             let lines = [];
-            // Используем отформатированные цены из бэкенда или форматируем локально
-            const mexcDisplay = data.mexcFormatted ? data.mexcFormatted.padStart(12, ' ') : formatP(data.mexc);
+            const mexcDisplay = data.mexcFormatted ? data.mexcFormatted : formatP(data.mexc);
             lines.push(dot + ' ' + symbol + ' MEXC: ' + mexcDisplay);
 
             if (dexPrice > 0) {
@@ -328,9 +360,8 @@ app.get('/', (req, res) => {
                     let isBest = (ex === bestEx);
                     let mark = isBest ? '◆' : '◇';
                     let cls = isBest ? 'class="best"' : '';
-                    // Используем отформатированные цены из бэкенда или форматируем локально
                     const priceDisplay = data.pricesFormatted && data.pricesFormatted[ex] 
-                        ? data.pricesFormatted[ex].padStart(12, ' ') 
+                        ? data.pricesFormatted[ex] 
                         : formatP(p);
                     lines.push('<span ' + cls + '>' + mark + ' ' + ex.padEnd(8, ' ') + ': ' + priceDisplay + ' (' + (diff > 0 ? "+" : "") + diff + '%)</span>');
                 }
@@ -346,8 +377,12 @@ app.get('/', (req, res) => {
         let val = input.value.trim();
         if(!val) return;
         
+        // Останавливаем текущий таймер и сбрасываем запросы
         if(timer) clearInterval(timer);
-        output.innerHTML = "Обработка...";
+        currentRequestId++; // Инвалидируем все текущие запросы
+        
+        // Сразу очищаем вывод и показываем загрузку
+        output.innerHTML = "Загрузка...";
         dexLink.value = "";
         
         if (val.includes("dexscreener.com")) {
@@ -370,7 +405,8 @@ app.get('/', (req, res) => {
             }
         } else {
             symbol = val.toUpperCase();
-            chain = null; addr = null;
+            chain = null; 
+            addr = null;
             try {
                 const res = await fetch('/api/resolve?symbol=' + symbol + '&token=' + token);
                 const d = await res.json();
@@ -391,12 +427,15 @@ app.get('/', (req, res) => {
         if(addr) url.searchParams.set('addr', addr);
         window.history.replaceState({}, '', url);
 
+        // Запускаем обновление и таймер
         update();
         timer = setInterval(update, 1000);
     }
 
     document.getElementById("startBtn").onclick = start;
-    input.addEventListener("keypress", (e) => { if(e.key === "Enter") start(); });
+    input.addEventListener("keypress", (e) => { 
+        if(e.key === "Enter") start(); 
+    });
 
     if (urlParams.get('symbol')) {
         start();
