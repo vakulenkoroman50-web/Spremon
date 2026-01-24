@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
+const os = require('os'); // Для мониторинга системы
 const app = express();
 
 app.use(cors());
@@ -13,8 +14,37 @@ const MEXC_API_KEY = process.env.MEXC_API_KEY || '';
 const MEXC_API_SECRET = process.env.MEXC_API_SECRET || '';
 const SET_UPDATE = parseInt(process.env.SET_UPDATE) || 1000;
 
+// Переменные Northflank
+const NF_LIMIT_CPU = process.env.NF_CPU_RESOURCES || '1'; // По умолчанию 1 ядро
+const NF_LIMIT_RAM = process.env.NF_RAM_RESOURCES || '512Mi';
+const NF_POD_IP = process.env.NF_POD_IP || '127.0.0.1';
+
 const exchangesOrder = ["Binance", "Bybit", "Gate", "Bitget", "BingX", "OKX", "Kucoin"];
 
+// Хелпер для перевода лимитов Northflank в цифры
+function parseRamLimit(limit) {
+    const val = parseFloat(limit);
+    if (limit.includes('Gi')) return val * 1024 * 1024 * 1024;
+    if (limit.includes('Mi')) return val * 1024 * 1024;
+    return val * 1024 * 1024; // По умолчанию мегабайты
+}
+
+function getSystemMetrics() {
+    const ramUsage = process.memoryUsage().rss;
+    const ramLimit = parseRamLimit(NF_LIMIT_RAM);
+    const ramPercent = ((ramUsage / ramLimit) * 100).toFixed(1);
+    
+    // CPU load за 1 минуту (нормализовано на количество ядер)
+    const cpuLoad = (os.loadavg()[0] / parseFloat(NF_LIMIT_CPU) * 100).toFixed(1);
+
+    return {
+        ip: NF_POD_IP,
+        cpu: cpuLoad,
+        ram: ramPercent
+    };
+}
+
+// ... (Функции signMexc, mexcPrivateGet, getMexcDepositStatus, formatPrice, getMexcPrice, getExPrice остаются без изменений)
 function signMexc(params) {
     const queryString = Object.keys(params).sort().map(k => `${k}=${params[k]}`).join('&');
     return crypto.createHmac('sha256', MEXC_API_SECRET).update(queryString).digest('hex');
@@ -63,31 +93,6 @@ function formatPrice(price) {
     return formatted.padStart(15, ' ');
 }
 
-app.get('/api/resolve', async (req, res) => {
-    if (req.query.token !== SECRET_TOKEN) return res.status(403).json({ok:false});
-    const symbol = (req.query.symbol || '').toUpperCase();
-    const data = await mexcPrivateGet("/api/v3/capital/config/getall");
-    if (!data || !Array.isArray(data)) return res.json({ ok: false, error: "Ошибка API MEXC" });
-    const token = data.find(t => t.coin === symbol);
-    if (!token || !token.networkList) return res.json({ ok: false, error: "Токен не найден" });
-    const depositOpen = token.depositAllEnable !== false && token.networkList.some(network => network.depositEnable === true);
-    let bestPair = null;
-    const fetch = (await import('node-fetch')).default;
-    for (const net of token.networkList) {
-        if (!net.contract) continue;
-        try {
-            const dsRes = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${net.contract}`);
-            const dsData = await dsRes.json();
-            if (dsData.pairs) {
-                dsData.pairs.forEach(pair => {
-                    if (!bestPair || (parseFloat(pair.volume?.h24 || 0) > parseFloat(bestPair.volume?.h24 || 0))) bestPair = pair;
-                });
-            }
-        } catch (e) {}
-    }
-    res.json({ ok: !!bestPair, chain: bestPair?.chainId, addr: bestPair?.pairAddress, url: bestPair?.url, depositOpen });
-});
-
 async function getMexcPrice(symbol) {
     try {
         const fetch = (await import('node-fetch')).default;
@@ -124,20 +129,48 @@ async function getExPrice(ex, symbol) {
     } catch(e) { return 0; }
 }
 
+app.get('/api/resolve', async (req, res) => {
+    if (req.query.token !== SECRET_TOKEN) return res.status(403).json({ok:false});
+    const symbol = (req.query.symbol || '').toUpperCase();
+    const data = await mexcPrivateGet("/api/v3/capital/config/getall");
+    if (!data || !Array.isArray(data)) return res.json({ ok: false, error: "Ошибка API MEXC" });
+    const token = data.find(t => t.coin === symbol);
+    if (!token || !token.networkList) return res.json({ ok: false, error: "Токен не найден" });
+    const depositOpen = token.depositAllEnable !== false && token.networkList.some(network => network.depositEnable === true);
+    let bestPair = null;
+    const fetch = (await import('node-fetch')).default;
+    for (const net of token.networkList) {
+        if (!net.contract) continue;
+        try {
+            const dsRes = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${net.contract}`);
+            const dsData = await dsRes.json();
+            if (dsData.pairs) {
+                dsData.pairs.forEach(pair => {
+                    if (!bestPair || (parseFloat(pair.volume?.h24 || 0) > parseFloat(bestPair.volume?.h24 || 0))) bestPair = pair;
+                });
+            }
+        } catch (e) {}
+    }
+    res.json({ ok: !!bestPair, chain: bestPair?.chainId, addr: bestPair?.pairAddress, url: bestPair?.url, depositOpen });
+});
+
 app.get('/api/all', async (req, res) => {
     if (req.query.token !== SECRET_TOKEN) return res.status(403).json({ok:false});
     const symbol = (req.query.symbol || '').toUpperCase();
     if(!symbol) return res.json({ok:false});
+    
     const [mexc, depositOpen] = await Promise.all([getMexcPrice(symbol), getMexcDepositStatus(symbol)]);
     const prices = {};
     await Promise.all(exchangesOrder.map(async ex => { prices[ex] = await getExPrice(ex, symbol); }));
+    
     res.json({ 
         ok: true, 
         mexc, 
         prices,
         mexcFormatted: formatPrice(mexc),
         pricesFormatted: Object.fromEntries(Object.entries(prices).map(([k, v]) => [k, formatPrice(v)])),
-        depositOpen 
+        depositOpen,
+        sys: getSystemMetrics() // Добавляем метрики системы
     });
 });
 
@@ -159,6 +192,7 @@ app.get('/', (req, res) => {
     #startBtn { font-family: monospace; font-size: 28px; background: #222; color: #fff; border: 1px solid #444; cursor: pointer; padding: 0 15px; }
     #dexLink { font-family: monospace; font-size: 16px; width: 100%; background: #111; color: #888; border: 1px solid #333; padding: 5px; cursor: pointer; margin-top: 10px; }
     #debugInfo { font-size: 14px; color: #666; margin-top: 5px; line-height: 1.2; }
+    #sysInfo { font-size: 16px; margin-top: 10px; padding-top: 10px; border-top: 1px solid #222; color: #555; }
     .error { color: #ff4444 !important; }
     .dex-row { color: #00ff00; }
     .best { color: #ffff00; }
@@ -177,6 +211,7 @@ app.get('/', (req, res) => {
       <div id="debugInfo"></div>
       <input id="dexLink" readonly placeholder="DEX URL" onclick="this.select(); document.execCommand('copy');" />
       <div id="status" style="font-size: 18px; margin-top: 5px; color: #444;"></div>
+      <div id="sysInfo"></div>
 
     <script>
     const SET_UPDATE = ${SET_UPDATE};
@@ -186,7 +221,7 @@ app.get('/', (req, res) => {
     let timer=null, blink=false;
 
     const output=document.getElementById("output"), input=document.getElementById("symbolInput");
-    const dexLink=document.getElementById("dexLink"), statusEl=document.getElementById("status"), debugInfo=document.getElementById("debugInfo");
+    const dexLink=document.getElementById("dexLink"), statusEl=document.getElementById("status"), debugInfo=document.getElementById("debugInfo"), sysInfoEl=document.getElementById("sysInfo");
 
     function logDebug(msg, isError = false) { debugInfo.innerHTML = isError ? '<span class="error">'+msg+'</span>' : msg; }
     function formatP(p) { 
@@ -207,14 +242,12 @@ app.get('/', (req, res) => {
         if (!symbol && !(chain && addr)) return;
         blink = !blink;
 
-        // ЗАПУСКАЕМ ЗАПРОСЫ ПАРАЛЛЕЛЬНО
         const dexTask = (chain && addr) 
             ? fetch('https://api.dexscreener.com/latest/dex/pairs/' + chain + '/' + addr).then(r => r.json()).catch(() => null)
             : Promise.resolve(null);
         const apiTask = fetch('/api/all?symbol=' + symbol + '&token=' + token).then(r => r.json()).catch(() => null);
 
         const [dexData, apiData] = await Promise.all([dexTask, apiTask]);
-
         if(!apiData || !apiData.ok) return;
 
         let dexPrice = (dexData && dexData.pair) ? parseFloat(dexData.pair.priceUsd) : 0;
@@ -223,6 +256,11 @@ app.get('/', (req, res) => {
             dexLink.value = dexData.pair.url;
             logDebug("Chain: " + chain + " | Addr: " + addr);
         }
+
+        // Обновление системной информации
+        const cpuClass = apiData.sys.cpu > 85 ? 'class="error"' : '';
+        const ramClass = apiData.sys.ram > 85 ? 'class="error"' : '';
+        sysInfoEl.innerHTML = 'Pod IP: ' + apiData.sys.ip + ' | CPU: <span ' + cpuClass + '>' + apiData.sys.cpu + '%</span> | RAM: <span ' + ramClass + '>' + apiData.sys.ram + '%</span>';
 
         let lines = [];
         let dot = apiData.depositOpen !== false 
@@ -306,4 +344,4 @@ app.get('/', (req, res) => {
     `);
 });
 
-app.listen(PORT, () => console.log(`Fast Server on ${PORT} | Upd: ${SET_UPDATE}ms`));
+app.listen(PORT, () => console.log(`Monitor on ${PORT} | IP: ${NF_POD_IP}`));
