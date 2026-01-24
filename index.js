@@ -245,7 +245,7 @@ app.get('/', (req, res) => {
     let addr = urlParams.get('addr');
     let mexcDepositOpen = true;
     let timer = null, blink = false;
-    let currentRequestId = 0; // Для предотвращения гонки запросов
+    let currentRequestId = 0;
 
     const output = document.getElementById("output");
     const input = document.getElementById("symbolInput");
@@ -302,13 +302,11 @@ app.get('/', (req, res) => {
         blink = !blink;
         let dexPrice = 0;
         
-        // Увеличиваем ID запроса для отслеживания
         const requestId = ++currentRequestId;
 
         if (chain && addr) {
             try {
                 const r = await fetch('https://api.dexscreener.com/latest/dex/pairs/' + chain + '/' + addr);
-                // Проверяем, актуален ли еще запрос
                 if (requestId !== currentRequestId) return;
                 const d = await r.json();
                 if (d.pair) {
@@ -321,10 +319,14 @@ app.get('/', (req, res) => {
 
         try {
             const res = await fetch('/api/all?symbol=' + symbol + '&token=' + token);
-            // Проверяем, актуален ли еще запрос
             if (requestId !== currentRequestId) return;
             const data = await res.json();
-            if(!data.ok) return;
+            
+            if(!data.ok) {
+                output.innerHTML = "Ошибка: неверный токен или символ";
+                statusEl.textContent = "Ошибка загрузки данных";
+                return;
+            }
 
             mexcDepositOpen = data.depositOpen !== false;
             
@@ -364,13 +366,21 @@ app.get('/', (req, res) => {
                         ? data.pricesFormatted[ex] 
                         : formatP(p);
                     lines.push('<span ' + cls + '>' + mark + ' ' + ex.padEnd(8, ' ') + ': ' + priceDisplay + ' (' + (diff > 0 ? "+" : "") + diff + '%)</span>');
+                } else {
+                    // Если цена 0, показываем, что биржа не работает
+                    lines.push('◇ ' + ex.padEnd(8, ' ') + ': -'.padStart(15, ' ') + ' ( - )');
                 }
             });
 
             output.innerHTML = lines.join("<br>");
             statusEl.textContent = "Last: " + new Date().toLocaleTimeString() + 
                                   (mexcDepositOpen ? "" : " | MEXC deposits: CLOSED");
-        } catch(e) {}
+        } catch(e) {
+            if (requestId === currentRequestId) {
+                output.innerHTML = "Ошибка при обновлении данных";
+                statusEl.textContent = "Ошибка: " + e.message;
+            }
+        }
     }
 
     async function start() {
@@ -379,24 +389,30 @@ app.get('/', (req, res) => {
         
         // Останавливаем текущий таймер и сбрасываем запросы
         if(timer) clearInterval(timer);
-        currentRequestId++; // Инвалидируем все текущие запросы
+        currentRequestId++;
         
         // Сразу очищаем вывод и показываем загрузку
         output.innerHTML = "Загрузка...";
         dexLink.value = "";
+        document.title = "Crypto Monitor";
+        
+        // Сбрасываем значения для нового тикера
+        let newSymbol = symbol;
+        let newChain = null;
+        let newAddr = null;
         
         if (val.includes("dexscreener.com")) {
             try {
                 const parts = val.split('/');
-                chain = parts[parts.length - 2];
-                addr = parts[parts.length - 1].split('?')[0];
+                newChain = parts[parts.length - 2];
+                newAddr = parts[parts.length - 1].split('?')[0];
                 
-                const dsRes = await fetch('https://api.dexscreener.com/latest/dex/pairs/' + chain + '/' + addr);
+                const dsRes = await fetch('https://api.dexscreener.com/latest/dex/pairs/' + newChain + '/' + newAddr);
                 const dsData = await dsRes.json();
                 
                 if (dsData.pair) {
-                    symbol = dsData.pair.baseToken.symbol.toUpperCase();
-                    input.value = symbol;
+                    newSymbol = dsData.pair.baseToken.symbol.toUpperCase();
+                    input.value = newSymbol;
                     dexLink.value = dsData.pair.url;
                 }
             } catch(e) {
@@ -404,22 +420,29 @@ app.get('/', (req, res) => {
                 return;
             }
         } else {
-            symbol = val.toUpperCase();
-            chain = null; 
-            addr = null;
+            newSymbol = val.toUpperCase();
+            input.value = newSymbol;
+            
             try {
-                const res = await fetch('/api/resolve?symbol=' + symbol + '&token=' + token);
+                const res = await fetch('/api/resolve?symbol=' + newSymbol + '&token=' + token);
                 const d = await res.json();
                 if (d.ok) {
-                    chain = d.chain; 
-                    addr = d.addr; 
+                    newChain = d.chain; 
+                    newAddr = d.addr; 
                     dexLink.value = d.url;
                     mexcDepositOpen = d.depositOpen !== false;
                 } else {
                     mexcDepositOpen = d.depositOpen !== false;
                 }
-            } catch(e) {}
+            } catch(e) {
+                // Продолжаем даже если запрос не удался
+            }
         }
+
+        // Обновляем глобальные переменные
+        symbol = newSymbol;
+        chain = newChain;
+        addr = newAddr;
 
         const url = new URL(window.location);
         url.searchParams.set('symbol', symbol);
@@ -437,11 +460,15 @@ app.get('/', (req, res) => {
         if(e.key === "Enter") start(); 
     });
 
+    // При загрузке страницы, если есть symbol в URL, запускаем мониторинг
     if (urlParams.get('symbol')) {
+        // Не показываем "Готов к работе", сразу запускаем
+        output.innerHTML = "Загрузка...";
         start();
     } else {
+        // Если нет symbol, обновляем раз в 5 секунд для демонстрации
         update();
-        timer = setInterval(update, 1000);
+        timer = setInterval(update, 5000);
     }
     </script>
     </body>
