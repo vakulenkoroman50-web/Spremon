@@ -33,6 +33,7 @@ async function mexcPrivateGet(path, params = {}) {
     } catch (e) { return null; }
 }
 
+// Функция проверки статуса депозитов на MEXC
 async function getMexcDepositStatus(symbol) {
     if (!MEXC_API_KEY || !MEXC_API_SECRET) return true;
     
@@ -55,17 +56,12 @@ async function getMexcDepositStatus(symbol) {
     }
 }
 
-// Улучшенная функция форматирования цены
+// Функция форматирования цены с нулями для выравнивания
 function formatPrice(price) {
     if (!price || price == 0) return "0".padStart(15, ' ');
     const num = parseFloat(price);
     
-    // Для очень маленьких чисел используем фиксированный формат
-    if (num < 0.000001) {
-        return num.toFixed(8).padStart(15, ' ');
-    }
-    
-    // Для обычных чисел определяем оптимальное количество знаков
+    // Определяем количество знаков после запятой
     let decimals;
     if (num >= 1000) {
         decimals = 2;
@@ -77,7 +73,8 @@ function formatPrice(price) {
         decimals = 6;
     } else if (num >= 0.001) {
         decimals = 7;
-    } else if (num >= 0.000001) {
+    } else {
+        // Для чисел меньше 0.001 фиксируем 8 знаков
         decimals = 8;
     }
     
@@ -109,6 +106,7 @@ app.get('/api/resolve', async (req, res) => {
     const token = data.find(t => t.coin === symbol);
     if (!token || !token.networkList) return res.json({ ok: false });
     
+    // Проверяем статус депозитов
     const depositOpen = token.depositAllEnable !== false && 
                        token.networkList.some(network => network.depositEnable === true);
 
@@ -185,19 +183,21 @@ app.get('/api/all', async (req, res) => {
     const prices = {};
     await Promise.all(exchangesOrder.map(async ex => { prices[ex] = await getExPrice(ex, symbol); }));
     
+    // Получаем статус депозитов
+    const depositOpen = await getMexcDepositStatus(symbol);
+    
+    // Форматируем цены
     const mexcFormatted = formatPrice(mexc);
     const pricesFormatted = {};
     Object.keys(prices).forEach(ex => {
         pricesFormatted[ex] = formatPrice(prices[ex]);
     });
     
-    const depositOpen = await getMexcDepositStatus(symbol);
-    
     res.json({ 
         ok: true, 
         mexc, 
+        prices,
         mexcFormatted,
-        prices, 
         pricesFormatted,
         depositOpen 
     });
@@ -244,25 +244,19 @@ app.get('/', (req, res) => {
     let chain = urlParams.get('chain');
     let addr = urlParams.get('addr');
     let mexcDepositOpen = true;
-    let timer = null, blink = false;
-    let currentRequestId = 0;
+    let timer=null, blink=false;
 
-    const output = document.getElementById("output");
-    const input = document.getElementById("symbolInput");
-    const dexLink = document.getElementById("dexLink");
-    const statusEl = document.getElementById("status");
+    const output=document.getElementById("output");
+    const input=document.getElementById("symbolInput");
+    const dexLink=document.getElementById("dexLink");
+    const statusEl=document.getElementById("status");
 
-    // Улучшенная функция форматирования на фронтенде
+    // Функция форматирования цены с нулями для выравнивания
     function formatP(p) { 
         if(!p || p == 0) return "0".padStart(15, ' ');
         const num = parseFloat(p);
         
-        // Для очень маленьких чисел используем фиксированный формат
-        if (num < 0.000001) {
-            return num.toFixed(8).padStart(15, ' ');
-        }
-        
-        // Для обычных чисел определяем оптимальное количество знаков
+        // Определяем количество знаков после запятой
         let decimals;
         if (num >= 1000) {
             decimals = 2;
@@ -274,7 +268,8 @@ app.get('/', (req, res) => {
             decimals = 6;
         } else if (num >= 0.001) {
             decimals = 7;
-        } else if (num >= 0.000001) {
+        } else {
+            // Для чисел меньше 0.001 фиксируем 8 знаков
             decimals = 8;
         }
         
@@ -301,13 +296,10 @@ app.get('/', (req, res) => {
     async function update() {
         blink = !blink;
         let dexPrice = 0;
-        
-        const requestId = ++currentRequestId;
 
         if (chain && addr) {
             try {
                 const r = await fetch('https://api.dexscreener.com/latest/dex/pairs/' + chain + '/' + addr);
-                if (requestId !== currentRequestId) return;
                 const d = await r.json();
                 if (d.pair) {
                     dexPrice = parseFloat(d.pair.priceUsd);
@@ -319,17 +311,13 @@ app.get('/', (req, res) => {
 
         try {
             const res = await fetch('/api/all?symbol=' + symbol + '&token=' + token);
-            if (requestId !== currentRequestId) return;
             const data = await res.json();
-            
-            if(!data.ok) {
-                output.innerHTML = "Ошибка: неверный токен или символ";
-                statusEl.textContent = "Ошибка загрузки данных";
-                return;
-            }
+            if(!data.ok) return;
 
+            // Получаем статус депозитов из ответа API
             mexcDepositOpen = data.depositOpen !== false;
             
+            // Отображаем красную или обычную точку в зависимости от статуса депозитов
             let dot;
             if (mexcDepositOpen) {
                 dot = blink ? '<span class="blink-dot">●</span>' : '○';
@@ -338,6 +326,7 @@ app.get('/', (req, res) => {
             }
             
             let lines = [];
+            // Используем отформатированную цену из API или форматируем локально
             const mexcDisplay = data.mexcFormatted ? data.mexcFormatted : formatP(data.mexc);
             lines.push(dot + ' ' + symbol + ' MEXC: ' + mexcDisplay);
 
@@ -362,57 +351,41 @@ app.get('/', (req, res) => {
                     let isBest = (ex === bestEx);
                     let mark = isBest ? '◆' : '◇';
                     let cls = isBest ? 'class="best"' : '';
+                    // Используем отформатированную цену из API или форматируем локально
                     const priceDisplay = data.pricesFormatted && data.pricesFormatted[ex] 
                         ? data.pricesFormatted[ex] 
                         : formatP(p);
                     lines.push('<span ' + cls + '>' + mark + ' ' + ex.padEnd(8, ' ') + ': ' + priceDisplay + ' (' + (diff > 0 ? "+" : "") + diff + '%)</span>');
-                } else {
-                    // Если цена 0, показываем, что биржа не работает
-                    lines.push('◇ ' + ex.padEnd(8, ' ') + ': -'.padStart(15, ' ') + ' ( - )');
                 }
             });
 
             output.innerHTML = lines.join("<br>");
             statusEl.textContent = "Last: " + new Date().toLocaleTimeString() + 
                                   (mexcDepositOpen ? "" : " | MEXC deposits: CLOSED");
-        } catch(e) {
-            if (requestId === currentRequestId) {
-                output.innerHTML = "Ошибка при обновлении данных";
-                statusEl.textContent = "Ошибка: " + e.message;
-            }
-        }
+        } catch(e) {}
     }
 
     async function start() {
         let val = input.value.trim();
         if(!val) return;
         
-        // Останавливаем текущий таймер и сбрасываем запросы
         if(timer) clearInterval(timer);
-        currentRequestId++;
-        
-        // Сразу очищаем вывод и показываем загрузку
-        output.innerHTML = "Загрузка...";
+        output.innerHTML = "Обработка...";
         dexLink.value = "";
-        document.title = "Crypto Monitor";
         
-        // Сбрасываем значения для нового тикера
-        let newSymbol = symbol;
-        let newChain = null;
-        let newAddr = null;
-        
+        // 1. Проверяем, не ссылка ли это DexScreener
         if (val.includes("dexscreener.com")) {
             try {
                 const parts = val.split('/');
-                newChain = parts[parts.length - 2];
-                newAddr = parts[parts.length - 1].split('?')[0];
+                chain = parts[parts.length - 2];
+                addr = parts[parts.length - 1].split('?')[0]; // Убираем параметры если есть
                 
-                const dsRes = await fetch('https://api.dexscreener.com/latest/dex/pairs/' + newChain + '/' + newAddr);
+                const dsRes = await fetch('https://api.dexscreener.com/latest/dex/pairs/' + chain + '/' + addr);
                 const dsData = await dsRes.json();
                 
                 if (dsData.pair) {
-                    newSymbol = dsData.pair.baseToken.symbol.toUpperCase();
-                    input.value = newSymbol;
+                    symbol = dsData.pair.baseToken.symbol.toUpperCase();
+                    input.value = symbol;
                     dexLink.value = dsData.pair.url;
                 }
             } catch(e) {
@@ -420,29 +393,20 @@ app.get('/', (req, res) => {
                 return;
             }
         } else {
-            newSymbol = val.toUpperCase();
-            input.value = newSymbol;
-            
+            // Если это просто тикер
+            symbol = val.toUpperCase();
+            chain = null; addr = null;
             try {
-                const res = await fetch('/api/resolve?symbol=' + newSymbol + '&token=' + token);
+                const res = await fetch('/api/resolve?symbol=' + symbol + '&token=' + token);
                 const d = await res.json();
                 if (d.ok) {
-                    newChain = d.chain; 
-                    newAddr = d.addr; 
-                    dexLink.value = d.url;
+                    chain = d.chain; addr = d.addr; dexLink.value = d.url;
                     mexcDepositOpen = d.depositOpen !== false;
                 } else {
                     mexcDepositOpen = d.depositOpen !== false;
                 }
-            } catch(e) {
-                // Продолжаем даже если запрос не удался
-            }
+            } catch(e) {}
         }
-
-        // Обновляем глобальные переменные
-        symbol = newSymbol;
-        chain = newChain;
-        addr = newAddr;
 
         const url = new URL(window.location);
         url.searchParams.set('symbol', symbol);
@@ -450,25 +414,18 @@ app.get('/', (req, res) => {
         if(addr) url.searchParams.set('addr', addr);
         window.history.replaceState({}, '', url);
 
-        // Запускаем обновление и таймер
         update();
         timer = setInterval(update, 1000);
     }
 
     document.getElementById("startBtn").onclick = start;
-    input.addEventListener("keypress", (e) => { 
-        if(e.key === "Enter") start(); 
-    });
+    input.addEventListener("keypress", (e) => { if(e.key === "Enter") start(); });
 
-    // При загрузке страницы, если есть symbol в URL, запускаем мониторинг
     if (urlParams.get('symbol')) {
-        // Не показываем "Готов к работе", сразу запускаем
-        output.innerHTML = "Загрузка...";
         start();
     } else {
-        // Если нет symbol, обновляем раз в 5 секунд для демонстрации
         update();
-        timer = setInterval(update, 5000);
+        timer = setInterval(update, 1000);
     }
     </script>
     </body>
