@@ -33,6 +33,60 @@ async function mexcPrivateGet(path, params = {}) {
     } catch (e) { return null; }
 }
 
+// Новая функция: проверка статуса депозитов на MEXC
+async function getMexcDepositStatus(symbol) {
+    if (!MEXC_API_KEY || !MEXC_API_SECRET) return true; // Если нет API ключей, считаем что открыты
+    
+    try {
+        const data = await mexcPrivateGet("/api/v3/capital/config/getall");
+        if (!data || !Array.isArray(data)) return true;
+        
+        const token = data.find(t => t.coin === symbol);
+        if (!token) return true;
+        
+        // Проверяем глобальный статус депозита
+        if (token.depositAllEnable === false) return false;
+        
+        // Проверяем, есть ли хоть одна сеть с открытым депозитом
+        if (token.networkList && token.networkList.length > 0) {
+            return token.networkList.some(network => network.depositEnable === true);
+        }
+        
+        return true;
+    } catch (e) {
+        return true; // В случае ошибки считаем что открыты
+    }
+}
+
+// Новая функция: форматирование цены с фиксированным количеством знаков
+function formatPrice(price) {
+    if (!price || price == 0) return "0";
+    
+    const num = parseFloat(price);
+    
+    // Определяем оптимальное количество знаков после запятой
+    if (num >= 10000) {
+        return num.toFixed(1);
+    } else if (num >= 1000) {
+        return num.toFixed(2);
+    } else if (num >= 100) {
+        return num.toFixed(3);
+    } else if (num >= 10) {
+        return num.toFixed(4);
+    } else if (num >= 1) {
+        return num.toFixed(5);
+    } else if (num >= 0.1) {
+        return num.toFixed(6);
+    } else if (num >= 0.01) {
+        return num.toFixed(7);
+    } else if (num >= 0.001) {
+        return num.toFixed(8);
+    } else {
+        // Для очень маленьких чисел используем научную нотацию
+        return num.toExponential(4);
+    }
+}
+
 app.get('/api/resolve', async (req, res) => {
     const symbol = (req.query.symbol || '').toUpperCase();
     const data = await mexcPrivateGet("/api/v3/capital/config/getall");
@@ -40,6 +94,10 @@ app.get('/api/resolve', async (req, res) => {
 
     const token = data.find(t => t.coin === symbol);
     if (!token || !token.networkList) return res.json({ ok: false });
+    
+    // Проверяем статус депозитов
+    const depositOpen = token.depositAllEnable !== false && 
+                       token.networkList.some(network => network.depositEnable === true);
 
     let bestPair = null;
     const fetch = (await import('node-fetch')).default;
@@ -59,9 +117,15 @@ app.get('/api/resolve', async (req, res) => {
         } catch (e) {}
     }
     if (bestPair) {
-        res.json({ ok: true, chain: bestPair.chainId, addr: bestPair.pairAddress, url: bestPair.url });
+        res.json({ 
+            ok: true, 
+            chain: bestPair.chainId, 
+            addr: bestPair.pairAddress, 
+            url: bestPair.url,
+            depositOpen 
+        });
     } else {
-        res.json({ ok: false });
+        res.json({ ok: false, depositOpen });
     }
 });
 
@@ -107,7 +171,11 @@ app.get('/api/all', async (req, res) => {
     const mexc = await getMexcPrice(symbol);
     const prices = {};
     await Promise.all(exchangesOrder.map(async ex => { prices[ex] = await getExPrice(ex, symbol); }));
-    res.json({ ok: true, mexc, prices });
+    
+    // Получаем статус депозитов для MEXC
+    const depositOpen = await getMexcDepositStatus(symbol);
+    
+    res.json({ ok: true, mexc, prices, depositOpen });
 });
 
 app.get('/', (req, res) => {
@@ -129,7 +197,9 @@ app.get('/', (req, res) => {
     .dex-row { color: #00ff00; }
     .best { color: #ffff00; }
     .blink-dot { animation: blink 1s infinite; display: inline-block; }
+    .red-blink { animation: blink-red 1s infinite; display: inline-block; color: #ff0000; }
     @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
+    @keyframes blink-red { 0%, 100% { color: #ff0000; } 50% { color: #990000; } }
     </style>
     </head>
     <body>
@@ -148,6 +218,7 @@ app.get('/', (req, res) => {
     let token = urlParams.get('token') || '777';
     let chain = urlParams.get('chain');
     let addr = urlParams.get('addr');
+    let mexcDepositOpen = true;
     let timer=null, blink=false;
 
     const output=document.getElementById("output");
@@ -156,8 +227,33 @@ app.get('/', (req, res) => {
     const statusEl=document.getElementById("status");
 
     function formatP(p) { 
-        if(!p || p == 0) return "0";
-        return parseFloat(p).toString();
+        if(!p || p == 0) return "0".padEnd(12, ' ');
+        const num = parseFloat(p);
+        
+        // Определяем оптимальное количество знаков после запятой
+        let formatted;
+        if (num >= 10000) {
+            formatted = num.toFixed(1);
+        } else if (num >= 1000) {
+            formatted = num.toFixed(2);
+        } else if (num >= 100) {
+            formatted = num.toFixed(3);
+        } else if (num >= 10) {
+            formatted = num.toFixed(4);
+        } else if (num >= 1) {
+            formatted = num.toFixed(5);
+        } else if (num >= 0.1) {
+            formatted = num.toFixed(6);
+        } else if (num >= 0.01) {
+            formatted = num.toFixed(7);
+        } else if (num >= 0.001) {
+            formatted = num.toFixed(8);
+        } else {
+            formatted = num.toExponential(4);
+        }
+        
+        // Добавляем пробелы для выравнивания (12 символов всего)
+        return formatted.padStart(12, ' ');
     }
 
     async function update() {
@@ -181,7 +277,16 @@ app.get('/', (req, res) => {
             const data = await res.json();
             if(!data.ok) return;
 
-            let dot = blink ? '<span class="blink-dot">●</span>' : '○';
+            // Обновляем статус депозитов
+            mexcDepositOpen = data.depositOpen !== false;
+            
+            let dot;
+            if (mexcDepositOpen) {
+                dot = blink ? '<span class="blink-dot">●</span>' : '○';
+            } else {
+                dot = blink ? '<span class="red-blink">●</span>' : '<span style="color:#ff0000">○</span>';
+            }
+            
             let lines = [];
             lines.push(dot + ' ' + symbol + ' MEXC: ' + formatP(data.mexc));
 
@@ -211,7 +316,8 @@ app.get('/', (req, res) => {
             });
 
             output.innerHTML = lines.join("<br>");
-            statusEl.textContent = "Last: " + new Date().toLocaleTimeString();
+            statusEl.textContent = "Last: " + new Date().toLocaleTimeString() + 
+                                  (mexcDepositOpen ? "" : " | MEXC deposits: CLOSED");
         } catch(e) {}
     }
 
@@ -250,7 +356,12 @@ app.get('/', (req, res) => {
                 const res = await fetch('/api/resolve?symbol=' + symbol + '&token=' + token);
                 const d = await res.json();
                 if (d.ok) {
-                    chain = d.chain; addr = d.addr; dexLink.value = d.url;
+                    chain = d.chain; 
+                    addr = d.addr; 
+                    dexLink.value = d.url;
+                    mexcDepositOpen = d.depositOpen !== false;
+                } else {
+                    mexcDepositOpen = d.depositOpen !== false;
                 }
             } catch(e) {}
         }
