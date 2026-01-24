@@ -8,7 +8,6 @@ app.use(express.json());
 
 // --- КОНФИГУРАЦИЯ ---
 const PORT = process.env.PORT || 3000;
-// Токен берется ТОЛЬКО из переменных окружения
 const SECRET_TOKEN = process.env.SECRET_TOKEN; 
 const MEXC_API_KEY = process.env.MEXC_API_KEY || '';
 const MEXC_API_SECRET = process.env.MEXC_API_SECRET || '';
@@ -52,21 +51,13 @@ async function getMexcDepositStatus(symbol) {
 function formatPrice(price) {
     if (!price || price == 0) return "0".padStart(15, ' ');
     const num = parseFloat(price);
-    let decimals;
-    if (num >= 1000) decimals = 2;
-    else if (num >= 1) decimals = 4;
-    else if (num >= 0.1) decimals = 5;
-    else if (num >= 0.01) decimals = 6;
-    else if (num >= 0.001) decimals = 7;
-    else decimals = 8;
-    
+    let decimals = num >= 1000 ? 2 : num >= 1 ? 4 : num >= 0.1 ? 5 : num >= 0.01 ? 6 : num >= 0.001 ? 7 : 8;
     let formatted = num.toFixed(decimals);
     const parts = formatted.split('.');
     if (parts.length === 2) {
-        const integerPart = parts[0];
-        let decimalPart = parts[1];
-        while (decimalPart.length < decimals) { decimalPart += '0'; }
-        formatted = integerPart + '.' + decimalPart;
+        let [int, dec] = parts;
+        while (dec.length < decimals) { dec += '0'; }
+        formatted = int + '.' + dec;
     }
     return formatted.padStart(15, ' ');
 }
@@ -74,20 +65,13 @@ function formatPrice(price) {
 app.get('/api/resolve', async (req, res) => {
     if (!SECRET_TOKEN || req.query.token !== SECRET_TOKEN) return res.status(403).json({ok:false});
     const symbol = (req.query.symbol || '').toUpperCase();
-    if (!symbol) return res.json({ ok: false });
-
     const data = await mexcPrivateGet("/api/v3/capital/config/getall");
     if (!data || !Array.isArray(data)) return res.json({ ok: false });
-
     const token = data.find(t => t.coin === symbol);
     if (!token || !token.networkList) return res.json({ ok: false });
-    
-    const depositOpen = token.depositAllEnable !== false && 
-                       token.networkList.some(network => network.depositEnable === true);
-
+    const depositOpen = token.depositAllEnable !== false && token.networkList.some(network => network.depositEnable === true);
     let bestPair = null;
     const fetch = (await import('node-fetch')).default;
-
     for (const net of token.networkList) {
         if (!net.contract) continue;
         try {
@@ -95,20 +79,12 @@ app.get('/api/resolve', async (req, res) => {
             const dsData = await dsRes.json();
             if (dsData.pairs) {
                 dsData.pairs.forEach(pair => {
-                    if (!bestPair || (parseFloat(pair.volume?.h24 || 0) > parseFloat(bestPair.volume?.h24 || 0))) {
-                        bestPair = pair;
-                    }
+                    if (!bestPair || (parseFloat(pair.volume?.h24 || 0) > parseFloat(bestPair.volume?.h24 || 0))) bestPair = pair;
                 });
             }
         } catch (e) {}
     }
-    res.json({ 
-        ok: !!bestPair, 
-        chain: bestPair?.chainId, 
-        addr: bestPair?.pairAddress, 
-        url: bestPair?.url,
-        depositOpen 
-    });
+    res.json({ ok: !!bestPair, chain: bestPair?.chainId, addr: bestPair?.pairAddress, url: bestPair?.url, depositOpen });
 });
 
 async function getMexcPrice(symbol) {
@@ -150,13 +126,11 @@ async function getExPrice(ex, symbol) {
 app.get('/api/all', async (req, res) => {
     if (!SECRET_TOKEN || req.query.token !== SECRET_TOKEN) return res.status(403).json({ok:false});
     const symbol = (req.query.symbol || '').toUpperCase();
-    if (!symbol) return res.json({ ok: false });
-
+    if(!symbol) return res.json({ok:false});
     const mexc = await getMexcPrice(symbol);
     const prices = {};
     await Promise.all(exchangesOrder.map(async ex => { prices[ex] = await getExPrice(ex, symbol); }));
     const depositOpen = await getMexcDepositStatus(symbol);
-    
     res.json({ 
         ok: true, 
         mexc, 
@@ -168,11 +142,9 @@ app.get('/api/all', async (req, res) => {
 });
 
 app.get('/', (req, res) => {
-    // Жёсткая проверка токена при входе
     if (!SECRET_TOKEN || req.query.token !== SECRET_TOKEN) {
-        return res.status(403).send("<h1>Доступ запрещён</h1><p>Некорректный или отсутствует токен доступа.</p>");
+        return res.status(403).send("<h1>Доступ запрещён</h1>");
     }
-
     const initialSymbol = (req.query.symbol || '').toUpperCase();
     res.send(`
     <!DOCTYPE html>
@@ -182,11 +154,11 @@ app.get('/', (req, res) => {
     <title>Crypto Monitor</title>
     <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { background: #000; font-family: monospace; font-size: 28px; color: #fff; padding: 15px; overflow: hidden; }
-    .control-row { display: flex; gap: 5px; margin-bottom: 15px; }
+    body { background: #000; font-family: monospace; font-size: 28px; color: #fff; padding: 10px; overflow: hidden; }
+    #output { white-space: pre; line-height: 1.1; min-height: 200px; }
+    .control-row { display: flex; gap: 5px; margin-top: 15px; border-top: 1px solid #222; padding-top: 15px; }
     #symbolInput { font-family: monospace; font-size: 28px; width: 100%; max-width: 400px; background: #000; color: #fff; border: 1px solid #444; padding: 5px; }
-    #startBtn { font-family: monospace; font-size: 28px; background: #222; color: #fff; border: 1px solid #444; cursor: pointer; padding: 0 20px; }
-    #output { white-space: pre; line-height: 1.2; height: 350px; border-top: 1px solid #222; padding-top: 10px; }
+    #startBtn { font-family: monospace; font-size: 28px; background: #222; color: #fff; border: 1px solid #444; cursor: pointer; padding: 0 15px; }
     #dexLink { font-family: monospace; font-size: 16px; width: 100%; background: #111; color: #888; border: 1px solid #333; padding: 5px; cursor: pointer; margin-top: 10px; }
     .dex-row { color: #00ff00; }
     .best { color: #ffff00; }
@@ -197,15 +169,15 @@ app.get('/', (req, res) => {
     </style>
     </head>
     <body>
+      <div id="output">Готов к работе</div>
+
       <div class="control-row">
-        <input id="symbolInput" value="${initialSymbol}" placeholder="TICKER OR DEX URL" autocomplete="off" onfocus="this.select()" />
+        <input id="symbolInput" value="${initialSymbol}" autocomplete="off" placeholder="TICKER" onfocus="this.select()" />
         <button id="startBtn">СТАРТ</button>
       </div>
 
-      <div id="output">Готов к работе</div>
-      
       <input id="dexLink" readonly placeholder="DEX URL" onclick="this.select(); document.execCommand('copy');" />
-      <div id="status" style="font-size: 18px; margin-top: 10px; color: #444;"></div>
+      <div id="status" style="font-size: 18px; margin-top: 5px; color: #444;"></div>
 
     <script>
     const exchangesOrder = ["Binance", "Bybit", "Gate", "Bitget", "BingX", "OKX", "Kucoin"];
@@ -265,11 +237,13 @@ app.get('/', (req, res) => {
             
             let lines = [];
             const mexcDisplay = data.mexcFormatted || formatP(data.mexc);
-            lines.push(dot + ' ' + symbol + ' MEXC: ' + mexcDisplay);
+            // Выравнивание "MEXC    " (8 символов)
+            lines.push(dot + ' ' + symbol.padEnd(4, ' ') + ' MEXC    : ' + mexcDisplay);
 
             if (dexPrice > 0) {
                 let diff = ((dexPrice - data.mexc) / data.mexc * 100).toFixed(2);
-                lines.push('<span class="dex-row">◇ DEX     : ' + formatP(dexPrice) + ' (' + (diff > 0 ? "+" : "") + diff + '%)</span>');
+                // Выравнивание "DEX     " (8 символов)
+                lines.push('<span class="dex-row">◇ ' + 'DEX'.padEnd(8, ' ') + ': ' + formatP(dexPrice) + ' (' + (diff > 0 ? "+" : "") + diff + '%)</span>');
             }
 
             let bestEx = null, maxSp = 0;
@@ -288,21 +262,21 @@ app.get('/', (req, res) => {
                     let mark = (ex === bestEx) ? '◆' : '◇';
                     let cls = (ex === bestEx) ? 'class="best"' : '';
                     const priceDisplay = (data.pricesFormatted && data.pricesFormatted[ex]) || formatP(p);
-                    lines.push('<span ' + cls + '>' + mark + ' ' + ex.padEnd(6, ' ') + ': ' + priceDisplay + ' (' + (diff > 0 ? "+" : "") + diff + '%)</span>');
+                    // Выравнивание названия биржи (8 символов)
+                    lines.push('<span ' + cls + '>' + mark + ' ' + ex.padEnd(8, ' ') + ': ' + priceDisplay + ' (' + (diff > 0 ? "+" : "") + diff + '%)</span>');
                 }
             });
 
             output.innerHTML = lines.join("<br>");
-            statusEl.textContent = "Last: " + new Date().toLocaleTimeString() + (mexcDepositOpen ? "" : " | MEXC DEPOSITS: CLOSED");
+            statusEl.textContent = "Last: " + new Date().toLocaleTimeString() + (mexcDepositOpen ? "" : " | MEXC CLOSED");
         } catch(e) {}
     }
 
     async function start() {
         let val = input.value.trim();
         if(!val) return;
-        
         if(timer) clearInterval(timer);
-        output.innerHTML = "Поиск данных...";
+        output.innerHTML = "Загрузка...";
         
         if (val.includes("dexscreener.com")) {
             try {
@@ -323,27 +297,15 @@ app.get('/', (req, res) => {
                 const res = await fetch('/api/resolve?symbol=' + symbol + '&token=' + token);
                 const d = await res.json();
                 if (d.ok) { chain = d.chain; addr = d.addr; }
-                mexcDepositOpen = d.depositOpen !== false;
             } catch(e) {}
         }
-
-        const url = new URL(window.location);
-        url.searchParams.set('symbol', symbol);
-        if(chain) url.searchParams.set('chain', chain);
-        if(addr) url.searchParams.set('addr', addr);
-        window.history.replaceState({}, '', url);
-
         update();
         timer = setInterval(update, 2000);
     }
 
     document.getElementById("startBtn").onclick = start;
     input.addEventListener("keypress", (e) => { if(e.key === "Enter") start(); });
-
-    // Автозапуск только если есть параметры в URL
-    if (urlParams.get('symbol') || (urlParams.get('chain') && urlParams.get('addr'))) {
-        start();
-    }
+    if (urlParams.get('symbol') || (urlParams.get('chain') && urlParams.get('addr'))) start();
     </script>
     </body>
     </html>
