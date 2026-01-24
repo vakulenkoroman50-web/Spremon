@@ -11,6 +11,8 @@ const PORT = process.env.PORT || 3000;
 const SECRET_TOKEN = process.env.SECRET_TOKEN; 
 const MEXC_API_KEY = process.env.MEXC_API_KEY || '';
 const MEXC_API_SECRET = process.env.MEXC_API_SECRET || '';
+// Частота обновления из Environment или 1000мс по умолчанию
+const SET_UPDATE = parseInt(process.env.SET_UPDATE) || 1000;
 
 const exchangesOrder = ["Binance", "Bybit", "Gate", "Bitget", "BingX", "OKX", "Kucoin"];
 
@@ -66,12 +68,15 @@ app.get('/api/resolve', async (req, res) => {
     if (!SECRET_TOKEN || req.query.token !== SECRET_TOKEN) return res.status(403).json({ok:false});
     const symbol = (req.query.symbol || '').toUpperCase();
     const data = await mexcPrivateGet("/api/v3/capital/config/getall");
-    if (!data || !Array.isArray(data)) return res.json({ ok: false });
+    if (!data || !Array.isArray(data)) return res.json({ ok: false, error: "Не удалось получить конфиг MEXC" });
+    
     const token = data.find(t => t.coin === symbol);
-    if (!token || !token.networkList) return res.json({ ok: false });
+    if (!token || !token.networkList) return res.json({ ok: false, error: "Токен не найден на MEXC" });
+    
     const depositOpen = token.depositAllEnable !== false && token.networkList.some(network => network.depositEnable === true);
     let bestPair = null;
     const fetch = (await import('node-fetch')).default;
+    
     for (const net of token.networkList) {
         if (!net.contract) continue;
         try {
@@ -85,6 +90,26 @@ app.get('/api/resolve', async (req, res) => {
         } catch (e) {}
     }
     res.json({ ok: !!bestPair, chain: bestPair?.chainId, addr: bestPair?.pairAddress, url: bestPair?.url, depositOpen });
+});
+
+app.get('/api/all', async (req, res) => {
+    if (!SECRET_TOKEN || req.query.token !== SECRET_TOKEN) return res.status(403).json({ok:false});
+    const symbol = (req.query.symbol || '').toUpperCase();
+    if(!symbol) return res.json({ok:false});
+    
+    const mexc = await getMexcPrice(symbol);
+    const prices = {};
+    await Promise.all(exchangesOrder.map(async ex => { prices[ex] = await getExPrice(ex, symbol); }));
+    const depositOpen = await getMexcDepositStatus(symbol);
+    
+    res.json({ 
+        ok: true, 
+        mexc, 
+        prices,
+        mexcFormatted: formatPrice(mexc),
+        pricesFormatted: Object.fromEntries(Object.entries(prices).map(([k, v]) => [k, formatPrice(v)])),
+        depositOpen 
+    });
 });
 
 async function getMexcPrice(symbol) {
@@ -123,28 +148,8 @@ async function getExPrice(ex, symbol) {
     } catch(e) { return 0; }
 }
 
-app.get('/api/all', async (req, res) => {
-    if (!SECRET_TOKEN || req.query.token !== SECRET_TOKEN) return res.status(403).json({ok:false});
-    const symbol = (req.query.symbol || '').toUpperCase();
-    if(!symbol) return res.json({ok:false});
-    const mexc = await getMexcPrice(symbol);
-    const prices = {};
-    await Promise.all(exchangesOrder.map(async ex => { prices[ex] = await getExPrice(ex, symbol); }));
-    const depositOpen = await getMexcDepositStatus(symbol);
-    res.json({ 
-        ok: true, 
-        mexc, 
-        prices,
-        mexcFormatted: formatPrice(mexc),
-        pricesFormatted: Object.fromEntries(Object.entries(prices).map(([k, v]) => [k, formatPrice(v)])),
-        depositOpen 
-    });
-});
-
 app.get('/', (req, res) => {
-    if (!SECRET_TOKEN || req.query.token !== SECRET_TOKEN) {
-        return res.status(403).send("<h1>Доступ запрещён</h1>");
-    }
+    if (!SECRET_TOKEN || req.query.token !== SECRET_TOKEN) return res.status(403).send("<h1>Доступ запрещён</h1>");
     const initialSymbol = (req.query.symbol || '').toUpperCase();
     res.send(`
     <!DOCTYPE html>
@@ -160,6 +165,8 @@ app.get('/', (req, res) => {
     #symbolInput { font-family: monospace; font-size: 28px; width: 100%; max-width: 400px; background: #000; color: #fff; border: 1px solid #444; padding: 5px; }
     #startBtn { font-family: monospace; font-size: 28px; background: #222; color: #fff; border: 1px solid #444; cursor: pointer; padding: 0 15px; }
     #dexLink { font-family: monospace; font-size: 16px; width: 100%; background: #111; color: #888; border: 1px solid #333; padding: 5px; cursor: pointer; margin-top: 10px; }
+    #debugInfo { font-size: 14px; color: #666; margin-top: 5px; line-height: 1.2; }
+    .error { color: #ff4444 !important; }
     .dex-row { color: #00ff00; }
     .best { color: #ffff00; }
     .blink-dot { animation: blink 1s infinite; display: inline-block; }
@@ -176,10 +183,12 @@ app.get('/', (req, res) => {
         <button id="startBtn">СТАРТ</button>
       </div>
 
+      <div id="debugInfo"></div>
       <input id="dexLink" readonly placeholder="DEX URL" onclick="this.select(); document.execCommand('copy');" />
       <div id="status" style="font-size: 18px; margin-top: 5px; color: #444;"></div>
 
     <script>
+    const SET_UPDATE = ${SET_UPDATE};
     const exchangesOrder = ["Binance", "Bybit", "Gate", "Bitget", "BingX", "OKX", "Kucoin"];
     let urlParams = new URLSearchParams(window.location.search);
     let symbol = '';
@@ -193,6 +202,11 @@ app.get('/', (req, res) => {
     const input=document.getElementById("symbolInput");
     const dexLink=document.getElementById("dexLink");
     const statusEl=document.getElementById("status");
+    const debugInfo=document.getElementById("debugInfo");
+
+    function logDebug(msg, isError = false) {
+        debugInfo.innerHTML = isError ? '<span class="error">' + msg + '</span>' : msg;
+    }
 
     function formatP(p) { 
         if(!p || p == 0) return "0".padStart(15, ' ');
@@ -221,8 +235,11 @@ app.get('/', (req, res) => {
                     dexPrice = parseFloat(d.pair.priceUsd);
                     document.title = symbol + ': ' + d.pair.priceUsd;
                     dexLink.value = d.pair.url;
+                    logDebug("Chain: " + chain + " | Addr: " + addr);
+                } else {
+                    logDebug("Пара не найдена на DexScreener для " + chain + ":" + addr, true);
                 }
-            } catch(e) {}
+            } catch(e) { logDebug("Ошибка связи с DexScreener", true); }
         }
 
         try {
@@ -237,12 +254,10 @@ app.get('/', (req, res) => {
             
             let lines = [];
             const mexcDisplay = data.mexcFormatted || formatP(data.mexc);
-            // Выравнивание "MEXC    " (8 символов)
             lines.push(dot + ' ' + symbol.padEnd(4, ' ') + ' MEXC    : ' + mexcDisplay);
 
             if (dexPrice > 0) {
                 let diff = ((dexPrice - data.mexc) / data.mexc * 100).toFixed(2);
-                // Выравнивание "DEX     " (8 символов)
                 lines.push('<span class="dex-row">◇ ' + 'DEX'.padEnd(8, ' ') + ': ' + formatP(dexPrice) + ' (' + (diff > 0 ? "+" : "") + diff + '%)</span>');
             }
 
@@ -262,13 +277,12 @@ app.get('/', (req, res) => {
                     let mark = (ex === bestEx) ? '◆' : '◇';
                     let cls = (ex === bestEx) ? 'class="best"' : '';
                     const priceDisplay = (data.pricesFormatted && data.pricesFormatted[ex]) || formatP(p);
-                    // Выравнивание названия биржи (8 символов)
                     lines.push('<span ' + cls + '>' + mark + ' ' + ex.padEnd(8, ' ') + ': ' + priceDisplay + ' (' + (diff > 0 ? "+" : "") + diff + '%)</span>');
                 }
             });
 
             output.innerHTML = lines.join("<br>");
-            statusEl.textContent = "Last: " + new Date().toLocaleTimeString() + (mexcDepositOpen ? "" : " | MEXC CLOSED");
+            statusEl.textContent = "Upd: " + SET_UPDATE + "ms | Last: " + new Date().toLocaleTimeString() + (mexcDepositOpen ? "" : " | MEXC CLOSED");
         } catch(e) {}
     }
 
@@ -276,31 +290,53 @@ app.get('/', (req, res) => {
         let val = input.value.trim();
         if(!val) return;
         if(timer) clearInterval(timer);
-        output.innerHTML = "Загрузка...";
+        output.innerHTML = "Поиск...";
+        logDebug("Обработка ввода...");
         
         if (val.includes("dexscreener.com")) {
             try {
                 const parts = val.split('/');
+                if(parts.length < 2) throw new Error("Неверный формат ссылки");
                 chain = parts[parts.length - 2];
                 addr = parts[parts.length - 1].split('?')[0];
+                
                 const dsRes = await fetch('https://api.dexscreener.com/latest/dex/pairs/' + chain + '/' + addr);
                 const dsData = await dsRes.json();
                 if (dsData.pair) {
                     symbol = dsData.pair.baseToken.symbol.toUpperCase();
                     input.value = symbol;
+                    logDebug("Найдено: " + symbol + " (" + chain + ")");
+                } else {
+                    throw new Error("Пара не найдена");
                 }
-            } catch(e) { output.innerHTML = "Ошибка DEX ссылки"; return; }
+            } catch(e) { 
+                logDebug("Ошибка DexScreener: " + e.message, true);
+                output.innerHTML = "Ошибка!";
+                return; 
+            }
         } else {
             symbol = val.toUpperCase();
             chain = null; addr = null;
             try {
                 const res = await fetch('/api/resolve?symbol=' + symbol + '&token=' + token);
                 const d = await res.json();
-                if (d.ok) { chain = d.chain; addr = d.addr; }
-            } catch(e) {}
+                if (d.ok) { 
+                    chain = d.chain; addr = d.addr;
+                    logDebug("Резолв: " + chain + " | " + addr);
+                } else {
+                    logDebug(d.error || "Контракт не найден", !d.ok);
+                }
+            } catch(e) { logDebug("Ошибка резолва", true); }
         }
+
+        const url = new URL(window.location);
+        url.searchParams.set('symbol', symbol);
+        if(chain) url.searchParams.set('chain', chain); else url.searchParams.delete('chain');
+        if(addr) url.searchParams.set('addr', addr); else url.searchParams.delete('addr');
+        window.history.replaceState({}, '', url);
+
         update();
-        timer = setInterval(update, 2000);
+        timer = setInterval(update, SET_UPDATE);
     }
 
     document.getElementById("startBtn").onclick = start;
@@ -312,4 +348,4 @@ app.get('/', (req, res) => {
     `);
 });
 
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Server running on port ${PORT} with Upd: ${SET_UPDATE}ms`));
