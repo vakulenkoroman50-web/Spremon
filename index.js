@@ -8,7 +8,7 @@ app.use(express.json());
 
 // --- КОНФИГУРАЦИЯ ---
 const PORT = process.env.PORT || 3000;
-const SECRET_TOKEN = process.env.SECRET_TOKEN || '777'; 
+const SECRET_TOKEN = process.env.SECRET_TOKEN || 'secret123'; // Токен только из environment
 const MEXC_API_KEY = process.env.MEXC_API_KEY || '';
 const MEXC_API_SECRET = process.env.MEXC_API_SECRET || '';
 
@@ -99,21 +99,24 @@ function formatPrice(price) {
 }
 
 app.get('/api/resolve', async (req, res) => {
+    const token = req.query.token;
+    if (!token || token !== SECRET_TOKEN) return res.status(403).json({ ok: false, error: "Invalid token" });
+    
     const symbol = (req.query.symbol || '').toUpperCase();
     const data = await mexcPrivateGet("/api/v3/capital/config/getall");
     if (!data || !Array.isArray(data)) return res.json({ ok: false });
 
-    const token = data.find(t => t.coin === symbol);
-    if (!token || !token.networkList) return res.json({ ok: false });
+    const tokenInfo = data.find(t => t.coin === symbol);
+    if (!tokenInfo || !tokenInfo.networkList) return res.json({ ok: false });
     
     // Проверяем статус депозитов
-    const depositOpen = token.depositAllEnable !== false && 
-                       token.networkList.some(network => network.depositEnable === true);
+    const depositOpen = tokenInfo.depositAllEnable !== false && 
+                       tokenInfo.networkList.some(network => network.depositEnable === true);
 
     let bestPair = null;
     const fetch = (await import('node-fetch')).default;
 
-    for (const net of token.networkList) {
+    for (const net of tokenInfo.networkList) {
         if (!net.contract) continue;
         try {
             const dsRes = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${net.contract}`);
@@ -177,8 +180,10 @@ async function getExPrice(ex, symbol) {
 }
 
 app.get('/api/all', async (req, res) => {
-    if (req.query.token !== SECRET_TOKEN) return res.status(403).json({ok:false});
-    const symbol = (req.query.symbol || 'BTC').toUpperCase();
+    const token = req.query.token;
+    if (!token || token !== SECRET_TOKEN) return res.status(403).json({ok: false, error: "Invalid token"});
+    
+    const symbol = (req.query.symbol || '').toUpperCase();
     const mexc = await getMexcPrice(symbol);
     const prices = {};
     await Promise.all(exchangesOrder.map(async ex => { prices[ex] = await getExPrice(ex, symbol); }));
@@ -204,7 +209,34 @@ app.get('/api/all', async (req, res) => {
 });
 
 app.get('/', (req, res) => {
-    const initialSymbol = (req.query.symbol || 'BTC').toUpperCase();
+    const token = req.query.token;
+    const initialSymbol = req.query.symbol || '';
+    
+    // Если нет токена, показываем сообщение о запрете доступа
+    if (!token) {
+        return res.send(`
+        <!DOCTYPE html>
+        <html>
+        <head>
+        <meta charset="UTF-8">
+        <title>Crypto Monitor - Access Denied</title>
+        <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { background: #000; font-family: monospace; font-size: 28px; color: #fff; display: flex; justify-content: center; align-items: center; height: 100vh; text-align: center; }
+        .message { padding: 20px; border: 2px solid #ff0000; border-radius: 10px; background: #111; }
+        </style>
+        </head>
+        <body>
+            <div class="message">
+                <h1>Доступ запрещен</h1>
+                <p>Для доступа к мониторингу необходим токен авторизации.</p>
+                <p>Добавьте параметр ?token=ВАШ_ТОКЕН к URL</p>
+            </div>
+        </body>
+        </html>
+        `);
+    }
+    
     res.send(`
     <!DOCTYPE html>
     <html>
@@ -214,8 +246,8 @@ app.get('/', (req, res) => {
     <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body { background: #000; font-family: monospace; font-size: 28px; color: #fff; padding: 10px; overflow: hidden; }
-    #output { white-space: pre; line-height: 1.1; height: 320px; }
-    .control-row { display: flex; gap: 5px; margin-top: 10px; }
+    #output { white-space: pre; line-height: 1.1; height: 220px; margin-top: 20px; }
+    .control-row { display: flex; gap: 5px; margin-top: 30px; }
     #symbolInput { font-family: monospace; font-size: 28px; width: 100%; max-width: 400px; background: #000; color: #fff; border: 1px solid #444; }
     #startBtn { font-family: monospace; font-size: 28px; background: #222; color: #fff; border: 1px solid #444; cursor: pointer; padding: 0 10px; }
     #dexLink { font-family: monospace; font-size: 16px; width: 100%; background: #111; color: #888; border: 1px solid #333; padding: 5px; cursor: pointer; margin-top: 5px; }
@@ -228,28 +260,28 @@ app.get('/', (req, res) => {
     </style>
     </head>
     <body>
-      <div id="output">Готов к работе</div>
       <div class="control-row">
-        <input id="symbolInput" value="${initialSymbol}" autocomplete="off" onfocus="this.select()" />
+        <input id="symbolInput" value="${initialSymbol}" placeholder="Введите тикер или ссылку DexScreener" autocomplete="off" onfocus="this.select()" />
         <button id="startBtn">СТАРТ</button>
       </div>
+      <div id="output">Готов к работе</div>
       <input id="dexLink" readonly placeholder="DEX URL" onclick="this.select(); document.execCommand('copy');" />
       <div id="status" style="font-size: 18px; margin-top: 5px; color: #444;"></div>
 
     <script>
     const exchangesOrder = ["Binance", "Bybit", "Gate", "Bitget", "BingX", "OKX", "Kucoin"];
     let urlParams = new URLSearchParams(window.location.search);
-    let symbol = urlParams.get('symbol')?.toUpperCase() || 'BTC';
-    let token = urlParams.get('token') || '777';
+    let token = urlParams.get('token') || '';
+    let symbol = urlParams.get('symbol')?.toUpperCase() || '';
     let chain = urlParams.get('chain');
     let addr = urlParams.get('addr');
     let mexcDepositOpen = true;
-    let timer=null, blink=false;
+    let timer = null, blink = false;
 
-    const output=document.getElementById("output");
-    const input=document.getElementById("symbolInput");
-    const dexLink=document.getElementById("dexLink");
-    const statusEl=document.getElementById("status");
+    const output = document.getElementById("output");
+    const input = document.getElementById("symbolInput");
+    const dexLink = document.getElementById("dexLink");
+    const statusEl = document.getElementById("status");
 
     // Функция форматирования цены с нулями для выравнивания
     function formatP(p) { 
@@ -294,6 +326,9 @@ app.get('/', (req, res) => {
     }
 
     async function update() {
+        // Если нет символа, цепочки и адреса, не обновляем
+        if (!symbol && !chain && !addr) return;
+        
         blink = !blink;
         let dexPrice = 0;
 
@@ -312,7 +347,10 @@ app.get('/', (req, res) => {
         try {
             const res = await fetch('/api/all?symbol=' + symbol + '&token=' + token);
             const data = await res.json();
-            if(!data.ok) return;
+            if(!data.ok) {
+                output.innerHTML = "Ошибка загрузки данных";
+                return;
+            }
 
             // Получаем статус депозитов из ответа API
             mexcDepositOpen = data.depositOpen !== false;
@@ -332,7 +370,7 @@ app.get('/', (req, res) => {
 
             if (dexPrice > 0) {
                 let diff = ((dexPrice - data.mexc) / data.mexc * 100).toFixed(2);
-                lines.push('<span class="dex-row">◇ DEX     : ' + formatP(dexPrice) + ' (' + (diff > 0 ? "+" : "") + diff + '%)</span>');
+                lines.push('<span class="dex-row">  DEX     : ' + formatP(dexPrice) + ' (' + (diff > 0 ? "+" : "") + diff + '%)</span>');
             }
 
             let bestEx = null, maxSp = 0;
@@ -355,14 +393,17 @@ app.get('/', (req, res) => {
                     const priceDisplay = data.pricesFormatted && data.pricesFormatted[ex] 
                         ? data.pricesFormatted[ex] 
                         : formatP(p);
-                    lines.push('<span ' + cls + '>' + mark + ' ' + ex.padEnd(8, ' ') + ': ' + priceDisplay + ' (' + (diff > 0 ? "+" : "") + diff + '%)</span>');
+                    // Уменьшаем разрыв на два пробела: padEnd(6) вместо padEnd(8)
+                    lines.push('<span ' + cls + '>' + mark + ' ' + ex.padEnd(6, ' ') + ': ' + priceDisplay + ' (' + (diff > 0 ? "+" : "") + diff + '%)</span>');
                 }
             });
 
             output.innerHTML = lines.join("<br>");
             statusEl.textContent = "Last: " + new Date().toLocaleTimeString() + 
                                   (mexcDepositOpen ? "" : " | MEXC deposits: CLOSED");
-        } catch(e) {}
+        } catch(e) {
+            console.error("Update error:", e);
+        }
     }
 
     async function start() {
@@ -370,8 +411,9 @@ app.get('/', (req, res) => {
         if(!val) return;
         
         if(timer) clearInterval(timer);
-        output.innerHTML = "Обработка...";
+        output.innerHTML = "Загрузка...";
         dexLink.value = "";
+        document.title = "Crypto Monitor";
         
         // 1. Проверяем, не ссылка ли это DexScreener
         if (val.includes("dexscreener.com")) {
@@ -419,13 +461,17 @@ app.get('/', (req, res) => {
     }
 
     document.getElementById("startBtn").onclick = start;
-    input.addEventListener("keypress", (e) => { if(e.key === "Enter") start(); });
+    input.addEventListener("keypress", (e) => { 
+        if(e.key === "Enter") start(); 
+    });
 
-    if (urlParams.get('symbol')) {
+    // Запускаем мониторинг только если есть symbol ИЛИ (chain И addr)
+    if (symbol || (chain && addr)) {
         start();
     } else {
-        update();
-        timer = setInterval(update, 1000);
+        // Если нет символа или адреса, не запускаем автоматически
+        output.innerHTML = "Готов к работе";
+        statusEl.textContent = "Введите тикер или ссылку для начала мониторинга";
     }
     </script>
     </body>
