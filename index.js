@@ -1,7 +1,6 @@
 const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
-const os = require('os');
 const app = express();
 
 app.use(cors());
@@ -9,54 +8,12 @@ app.use(express.json());
 
 // --- КОНФИГУРАЦИЯ ---
 const PORT = process.env.PORT || 3000;
-const SECRET_TOKEN = process.env.SECRET_TOKEN || ''; 
+const SECRET_TOKEN = process.env.SECRET_TOKEN || '777'; 
 const MEXC_API_KEY = process.env.MEXC_API_KEY || '';
 const MEXC_API_SECRET = process.env.MEXC_API_SECRET || '';
 const SET_UPDATE = parseInt(process.env.SET_UPDATE) || 1000;
 
-// Переменные Northflank
-const NF_LIMIT_CPU = process.env.NF_CPU_RESOURCES || '1'; 
-const NF_LIMIT_RAM = process.env.NF_RAM_RESOURCES || '512Mi';
-const NF_POD_IP = process.env.NF_POD_IP || '127.0.0.1';
-
-// Переменные для расчета CPU
-let lastCpuUsage = process.cpuUsage();
-let lastUsageTime = Date.now();
-
 const exchangesOrder = ["Binance", "Bybit", "Gate", "Bitget", "BingX", "OKX", "Kucoin"];
-
-// --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
-
-function parseRamLimit(limit) {
-    const val = parseFloat(limit);
-    if (limit.includes('Gi')) return val * 1024 * 1024 * 1024;
-    if (limit.includes('Mi')) return val * 1024 * 1024;
-    return val * 1024 * 1024;
-}
-
-function getSystemMetrics() {
-    // RAM
-    const ramUsage = process.memoryUsage().rss;
-    const ramLimit = parseRamLimit(NF_LIMIT_RAM);
-    const ramPercent = ((ramUsage / ramLimit) * 100).toFixed(1);
-    
-    // CPU (Дифференциальный метод)
-    const currCpuUsage = process.cpuUsage();
-    const currUsageTime = Date.now();
-    
-    const deltaTimeMicros = (currUsageTime - lastUsageTime) * 1000;
-    const deltaTotalCpuMicros = (currCpuUsage.user - lastCpuUsage.user) + (currCpuUsage.system - lastCpuUsage.system);
-    
-    // Нагрузка относительно выделенного лимита (напр. 0.2 CPU)
-    let cpuPercent = (deltaTotalCpuMicros / (deltaTimeMicros * parseFloat(NF_LIMIT_CPU)) * 100).toFixed(1);
-    
-    if (isNaN(cpuPercent) || cpuPercent < 0) cpuPercent = "0.0";
-
-    lastCpuUsage = currCpuUsage;
-    lastUsageTime = currUsageTime;
-
-    return { ip: NF_POD_IP, cpu: cpuPercent, ram: ramPercent };
-}
 
 function signMexc(params) {
     const queryString = Object.keys(params).sort().map(k => `${k}=${params[k]}`).join('&');
@@ -84,10 +41,11 @@ async function getMexcDepositStatus(symbol) {
         if (!data || !Array.isArray(data)) return true;
         const token = data.find(t => t.coin === symbol);
         if (!token) return true;
-        const depositOpen = token.depositAllEnable !== false && 
-                           token.networkList && 
-                           token.networkList.some(net => net.depositEnable === true);
-        return depositOpen;
+        if (token.depositAllEnable === false) return false;
+        if (token.networkList && token.networkList.length > 0) {
+            return token.networkList.some(network => network.depositEnable === true);
+        }
+        return true;
     } catch (e) { return true; }
 }
 
@@ -104,6 +62,31 @@ function formatPrice(price) {
     }
     return formatted.padStart(15, ' ');
 }
+
+app.get('/api/resolve', async (req, res) => {
+    if (req.query.token !== SECRET_TOKEN) return res.status(403).json({ok:false});
+    const symbol = (req.query.symbol || '').toUpperCase();
+    const data = await mexcPrivateGet("/api/v3/capital/config/getall");
+    if (!data || !Array.isArray(data)) return res.json({ ok: false, error: "Ошибка API MEXC" });
+    const token = data.find(t => t.coin === symbol);
+    if (!token || !token.networkList) return res.json({ ok: false, error: "Токен не найден" });
+    const depositOpen = token.depositAllEnable !== false && token.networkList.some(network => network.depositEnable === true);
+    let bestPair = null;
+    const fetch = (await import('node-fetch')).default;
+    for (const net of token.networkList) {
+        if (!net.contract) continue;
+        try {
+            const dsRes = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${net.contract}`);
+            const dsData = await dsRes.json();
+            if (dsData.pairs) {
+                dsData.pairs.forEach(pair => {
+                    if (!bestPair || (parseFloat(pair.volume?.h24 || 0) > parseFloat(bestPair.volume?.h24 || 0))) bestPair = pair;
+                });
+            }
+        } catch (e) {}
+    }
+    res.json({ ok: !!bestPair, chain: bestPair?.chainId, addr: bestPair?.pairAddress, url: bestPair?.url, depositOpen });
+});
 
 async function getMexcPrice(symbol) {
     try {
@@ -141,59 +124,20 @@ async function getExPrice(ex, symbol) {
     } catch(e) { return 0; }
 }
 
-// --- API ENDPOINTS ---
-
-app.get('/api/resolve', async (req, res) => {
-    if (req.query.token !== SECRET_TOKEN) return res.status(403).json({ok:false});
-    const symbol = (req.query.symbol || '').toUpperCase();
-    const data = await mexcPrivateGet("/api/v3/capital/config/getall");
-    if (!data || !Array.isArray(data)) return res.json({ ok: false });
-    const token = data.find(t => t.coin === symbol);
-    if (!token || !token.networkList) return res.json({ ok: false });
-    
-    const depositOpen = token.depositAllEnable !== false && token.networkList.some(n => n.depositEnable === true);
-    let bestPair = null;
-    const fetch = (await import('node-fetch')).default;
-    for (const net of token.networkList) {
-        if (!net.contract) continue;
-        try {
-            const dsRes = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${net.contract}`);
-            const dsData = await dsRes.json();
-            if (dsData.pairs) {
-                dsData.pairs.forEach(pair => {
-                    if (!bestPair || (parseFloat(pair.volume?.h24 || 0) > parseFloat(bestPair.volume?.h24 || 0))) bestPair = pair;
-                });
-            }
-        } catch (e) {}
-    }
-    res.json({ ok: !!bestPair, chain: bestPair?.chainId, addr: bestPair?.pairAddress, url: bestPair?.url, depositOpen });
-});
-
 app.get('/api/all', async (req, res) => {
     if (req.query.token !== SECRET_TOKEN) return res.status(403).json({ok:false});
     const symbol = (req.query.symbol || '').toUpperCase();
     if(!symbol) return res.json({ok:false});
-    
-    // Параллельный запуск всех запросов на сервере
-    const [mexc, depositOpen, sys] = await Promise.all([
-        getMexcPrice(symbol),
-        getMexcDepositStatus(symbol),
-        getSystemMetrics()
-    ]);
-
+    const [mexc, depositOpen] = await Promise.all([getMexcPrice(symbol), getMexcDepositStatus(symbol)]);
     const prices = {};
-    await Promise.all(exchangesOrder.map(async ex => { 
-        prices[ex] = await getExPrice(ex, symbol); 
-    }));
-    
+    await Promise.all(exchangesOrder.map(async ex => { prices[ex] = await getExPrice(ex, symbol); }));
     res.json({ 
         ok: true, 
         mexc, 
         prices,
         mexcFormatted: formatPrice(mexc),
         pricesFormatted: Object.fromEntries(Object.entries(prices).map(([k, v]) => [k, formatPrice(v)])),
-        depositOpen,
-        sys
+        depositOpen 
     });
 });
 
@@ -215,8 +159,7 @@ app.get('/', (req, res) => {
     #startBtn { font-family: monospace; font-size: 28px; background: #222; color: #fff; border: 1px solid #444; cursor: pointer; padding: 0 15px; }
     #dexLink { font-family: monospace; font-size: 16px; width: 100%; background: #111; color: #888; border: 1px solid #333; padding: 5px; cursor: pointer; margin-top: 10px; }
     #debugInfo { font-size: 14px; color: #666; margin-top: 5px; line-height: 1.2; }
-    #sysInfo { font-size: 16px; margin-top: 10px; padding-top: 10px; border-top: 1px solid #222; color: #555; }
-    .error { color: #ff0000 !important; font-weight: bold; }
+    .error { color: #ff4444 !important; }
     .dex-row { color: #00ff00; }
     .best { color: #ffff00; }
     .blink-dot { animation: blink 1s infinite; display: inline-block; }
@@ -234,7 +177,6 @@ app.get('/', (req, res) => {
       <div id="debugInfo"></div>
       <input id="dexLink" readonly placeholder="DEX URL" onclick="this.select(); document.execCommand('copy');" />
       <div id="status" style="font-size: 18px; margin-top: 5px; color: #444;"></div>
-      <div id="sysInfo"></div>
 
     <script>
     const SET_UPDATE = ${SET_UPDATE};
@@ -244,10 +186,9 @@ app.get('/', (req, res) => {
     let timer=null, blink=false;
 
     const output=document.getElementById("output"), input=document.getElementById("symbolInput");
-    const dexLink=document.getElementById("dexLink"), statusEl=document.getElementById("status"), debugInfo=document.getElementById("debugInfo"), sysInfoEl=document.getElementById("sysInfo");
+    const dexLink=document.getElementById("dexLink"), statusEl=document.getElementById("status"), debugInfo=document.getElementById("debugInfo");
 
     function logDebug(msg, isError = false) { debugInfo.innerHTML = isError ? '<span class="error">'+msg+'</span>' : msg; }
-    
     function formatP(p) { 
         if(!p || p == 0) return "0".padStart(15, ' ');
         const num = parseFloat(p);
@@ -266,25 +207,22 @@ app.get('/', (req, res) => {
         if (!symbol && !(chain && addr)) return;
         blink = !blink;
 
-        // Параллельные запросы на клиенте
+        // ЗАПУСКАЕМ ЗАПРОСЫ ПАРАЛЛЕЛЬНО
         const dexTask = (chain && addr) 
             ? fetch('https://api.dexscreener.com/latest/dex/pairs/' + chain + '/' + addr).then(r => r.json()).catch(() => null)
             : Promise.resolve(null);
         const apiTask = fetch('/api/all?symbol=' + symbol + '&token=' + token).then(r => r.json()).catch(() => null);
 
         const [dexData, apiData] = await Promise.all([dexTask, apiTask]);
+
         if(!apiData || !apiData.ok) return;
 
         let dexPrice = (dexData && dexData.pair) ? parseFloat(dexData.pair.priceUsd) : 0;
         if(dexPrice) {
             document.title = symbol + ': ' + dexData.pair.priceUsd;
             dexLink.value = dexData.pair.url;
+            logDebug("Chain: " + chain + " | Addr: " + addr);
         }
-
-        // Рендеринг системных метрик
-        const cpuClass = parseFloat(apiData.sys.cpu) > 85 ? 'class="error"' : '';
-        const ramClass = parseFloat(apiData.sys.ram) > 85 ? 'class="error"' : '';
-        sysInfoEl.innerHTML = 'Pod IP: ' + apiData.sys.ip + ' | CPU: <span ' + cpuClass + '>' + apiData.sys.cpu + '%</span> | RAM: <span ' + ramClass + '>' + apiData.sys.ram + '%</span>';
 
         let lines = [];
         let dot = apiData.depositOpen !== false 
@@ -337,7 +275,7 @@ app.get('/', (req, res) => {
                 if (dsData.pair) {
                     symbol = dsData.pair.baseToken.symbol.toUpperCase();
                     input.value = symbol;
-                } else throw new Error("Пара не найдена");
+                } else throw new Error("Не найдено");
             } catch(e) { logDebug("Ошибка DEX: " + e.message, true); return; }
         } else {
             symbol = val.toUpperCase();
@@ -345,7 +283,7 @@ app.get('/', (req, res) => {
                 const res = await fetch('/api/resolve?symbol=' + symbol + '&token=' + token);
                 const d = await res.json();
                 if (d.ok) { chain = d.chain; addr = d.addr; }
-                else { chain = null; addr = null; logDebug("CEX Only", false); }
+                else { chain = null; addr = null; logDebug(d.error || "Только CEX", false); }
             } catch(e) { logDebug("Ошибка резолва", true); }
         }
 
@@ -368,5 +306,4 @@ app.get('/', (req, res) => {
     `);
 });
 
-app.listen(PORT, () => console.log(`System Monitor Active | Port: ${PORT}`));
-                                                 
+app.listen(PORT, () => console.log(`Fast Server on ${PORT} | Upd: ${SET_UPDATE}ms`));
