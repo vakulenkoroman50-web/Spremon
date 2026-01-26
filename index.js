@@ -8,7 +8,7 @@ app.use(express.json());
 
 // --- КОНФИГУРАЦИЯ ---
 const PORT = process.env.PORT || 3000;
-const SECRET_TOKEN = process.env.SECRET_TOKEN || '777'; 
+const SECRET_TOKEN = process.env.SECRET_TOKEN || ''; 
 const MEXC_API_KEY = process.env.MEXC_API_KEY || '';
 const MEXC_API_SECRET = process.env.MEXC_API_SECRET || '';
 
@@ -103,7 +103,7 @@ async function getExPrice(ex, symbol) {
 
 app.get('/api/all', async (req, res) => {
     if (req.query.token !== SECRET_TOKEN) return res.status(403).json({ok:false});
-    const symbol = (req.query.symbol || 'BTC').toUpperCase();
+    const symbol = (req.query.symbol || '').toUpperCase();
     const mexc = await getMexcPrice(symbol);
     const prices = {};
     await Promise.all(exchangesOrder.map(async ex => { prices[ex] = await getExPrice(ex, symbol); }));
