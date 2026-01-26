@@ -34,14 +34,20 @@ async function mexcPrivateGet(path, params = {}) {
 }
 
 app.get('/api/resolve', async (req, res) => {
+    if (req.query.token !== SECRET_TOKEN) return res.status(403).json({ok:false, msg: "AUTH_ERR"});
     const symbol = (req.query.symbol || '').toUpperCase();
     const data = await mexcPrivateGet("/api/v3/capital/config/getall");
     if (!data || !Array.isArray(data)) return res.json({ ok: false });
-    const token = data.find(t => t.coin === symbol);
-    if (!token || !token.networkList) return res.json({ ok: false });
+    
+    const tokenData = data.find(t => t.coin === symbol);
+    if (!tokenData || !tokenData.networkList) return res.json({ ok: false });
+
+    // Проверяем, открыт ли депозит хотя бы на одной сети
+    const depositOpen = tokenData.networkList.some(net => net.depositEnable === true);
+
     let bestPair = null;
     const fetch = (await import('node-fetch')).default;
-    for (const net of token.networkList) {
+    for (const net of tokenData.networkList) {
         if (!net.contract) continue;
         try {
             const dsRes = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${net.contract}`);
@@ -55,11 +61,14 @@ app.get('/api/resolve', async (req, res) => {
             }
         } catch (e) {}
     }
-    if (bestPair) {
-        res.json({ ok: true, chain: bestPair.chainId, addr: bestPair.pairAddress, url: bestPair.url });
-    } else {
-        res.json({ ok: false });
-    }
+    
+    res.json({ 
+        ok: true, 
+        chain: bestPair?.chainId, 
+        addr: bestPair?.pairAddress, 
+        url: bestPair?.url,
+        depositOpen: depositOpen 
+    });
 });
 
 async function getMexcPrice(symbol) {
@@ -119,18 +128,14 @@ app.get('/', (req, res) => {
     <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body { background: #000; font-family: monospace; font-size: 28px; color: #fff; padding: 10px; overflow: hidden; }
-    
-    /* Убрали лишнюю высоту и отступы снизу */
     #output { white-space: pre; line-height: 1.1; min-height: 280px; }
-    
-    /* Убрали margin-top, чтобы прижать поле к окну выше */
     .control-row { display: flex; gap: 5px; margin-top: 0; }
-    
     #symbolInput { font-family: monospace; font-size: 28px; width: 100%; max-width: 400px; background: #000; color: #fff; border: 1px solid #444; }
     #startBtn { font-family: monospace; font-size: 28px; background: #222; color: #fff; border: 1px solid #444; cursor: pointer; padding: 0 10px; }
     #dexLink { font-family: monospace; font-size: 16px; width: 100%; background: #111; color: #888; border: 1px solid #333; padding: 5px; cursor: pointer; margin-top: 5px; }
     .dex-row { color: #00ff00; }
     .best { color: #ffff00; }
+    .closed { color: #ff0000 !important; }
     .blink-dot { animation: blink 1s infinite; display: inline-block; }
     @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
     </style>
@@ -153,6 +158,7 @@ app.get('/', (req, res) => {
     let token = urlParams.get('token') || '';
     let chain = urlParams.get('chain');
     let addr = urlParams.get('addr');
+    let depositOpen = true; 
     let timer=null, blink=false;
 
     const output=document.getElementById("output");
@@ -164,7 +170,8 @@ app.get('/', (req, res) => {
 
     async function update() {
         if (!symbol) return;
-        blink = !blink;
+        
+        // 1. Максимально быстрый приоритет - DEX в заголовок
         let dexPrice = 0;
         if (chain && addr) {
             try {
@@ -177,11 +184,22 @@ app.get('/', (req, res) => {
                 }
             } catch(e) {}
         }
+
+        // 2. Все остальное
+        blink = !blink;
         try {
             const res = await fetch('/api/all?symbol=' + symbol + '&token=' + token);
+            if (res.status === 403) {
+                output.innerHTML = "<span style='color:red'>Доступ запрещён!</span>";
+                if(timer) clearInterval(timer);
+                return;
+            }
             const data = await res.json();
             if(!data.ok) return;
-            let dot = blink ? '<span class="blink-dot">●</span>' : '○';
+
+            let dotColorClass = depositOpen ? '' : 'closed';
+            let dot = blink ? '<span class="blink-dot '+dotColorClass+'">●</span>' : '○';
+            
             let lines = [dot + ' ' + symbol + ' MEXC: ' + formatP(data.mexc)];
             if (dexPrice > 0) {
                 let diff = ((dexPrice - data.mexc) / data.mexc * 100).toFixed(2);
@@ -212,8 +230,13 @@ app.get('/', (req, res) => {
     async function start() {
         let val = input.value.trim();
         if(!val) return;
+        if (!token) {
+            output.innerHTML = "<span style='color:red'>Доступ запрещён!</span>";
+            return;
+        }
         if(timer) clearInterval(timer);
         output.innerHTML = "Поиск...";
+        
         if (val.includes("dexscreener.com")) {
             try {
                 const parts = val.split('/');
@@ -229,18 +252,32 @@ app.get('/', (req, res) => {
             } catch(e) { output.innerHTML = "Ошибка ссылки!"; return; }
         } else {
             symbol = val.toUpperCase();
-            chain = null; addr = null;
-            try {
-                const res = await fetch('/api/resolve?symbol=' + symbol + '&token=' + token);
-                const d = await res.json();
-                if (d.ok) { chain = d.chain; addr = d.addr; dexLink.value = d.url; }
-            } catch(e) {}
         }
+
+        // Одноразовая проверка депозита и резолв пары при старте
+        try {
+            const res = await fetch('/api/resolve?symbol=' + symbol + '&token=' + token);
+            if (res.status === 403) {
+                output.innerHTML = "<span style='color:red'>Доступ запрещён!</span>";
+                return;
+            }
+            const d = await res.json();
+            if (d.ok) { 
+                chain = d.chain; 
+                addr = d.addr; 
+                dexLink.value = d.url || ''; 
+                depositOpen = d.depositOpen; 
+            } else {
+                depositOpen = true; // сброс если не нашли
+            }
+        } catch(e) {}
+        
         const url = new URL(window.location);
         url.searchParams.set('symbol', symbol);
         if(chain) url.searchParams.set('chain', chain);
         if(addr) url.searchParams.set('addr', addr);
         window.history.replaceState({}, '', url);
+        
         update();
         timer = setInterval(update, 1000);
     }
@@ -248,8 +285,8 @@ app.get('/', (req, res) => {
     document.getElementById("startBtn").onclick = start;
     input.addEventListener("keypress", (e) => { if(e.key === "Enter") start(); });
 
-    // Запуск только если тикер вшит в URL
     if (urlParams.get('symbol')) start();
+    else if (!token) output.innerHTML = "<span style='color:red'>Доступ запрещён!</span>";
     </script>
     </body>
     </html>
@@ -257,4 +294,3 @@ app.get('/', (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`Server running on ${PORT}`));
-             
