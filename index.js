@@ -185,7 +185,7 @@ app.get('/', (req, res) => {
             let lines = [dot + ' ' + symbol + ' MEXC: ' + formatP(data.mexc)];
             if (dexPrice > 0) {
                 let diff = ((dexPrice - data.mexc) / data.mexc * 100).toFixed(2);
-                lines.push('<span class="dex-row">  DEX     : ' + formatP(dexPrice) + ' (' + (diff > 0 ? "+" : "") + diff + '%)</span>');
+                lines.push('<span class="dex-row">◇ DEX     : ' + formatP(dexPrice) + ' (' + (diff > 0 ? "+" : "") + diff + '%)</span>');
             }
             let bestEx = null, maxSp = 0;
             exchangesOrder.forEach(ex => {
