@@ -130,7 +130,7 @@ app.get('/', (req, res) => {
     body { background: #000; font-family: monospace; font-size: 28px; color: #fff; padding: 10px; overflow: hidden; }
     #output { white-space: pre; line-height: 1.1; height: 320px; }
     .control-row { display: flex; gap: 5px; margin-top: 10px; }
-    #symbolInput { font-family: monospace; font-size: 28px; width: 150px; background: #000; color: #fff; border: 1px solid #444; padding: 5px; }
+    #symbolInput { font-family: monospace; font-size: 28px; width: 250px; background: #000; color: #fff; border: 1px solid #444; padding: 5px; }
     #startBtn { font-family: monospace; font-size: 28px; background: #222; color: #fff; border: 1px solid #444; cursor: pointer; padding: 0 20px; }
     #dexLink { font-family: monospace; font-size: 16px; width: 100%; background: #111; color: #888; border: 1px solid #333; padding: 5px; cursor: pointer; margin-top: 5px; }
     .dex-row { color: #00ff00; }
