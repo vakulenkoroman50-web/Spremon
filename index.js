@@ -111,7 +111,7 @@ app.get('/api/all', async (req, res) => {
 });
 
 app.get('/', (req, res) => {
-    const initialSymbol = (req.query.symbol || 'BTC').toUpperCase();
+    const initialSymbol = (req.query.symbol || '').toUpperCase();
     res.send(`
     <!DOCTYPE html>
     <html>
@@ -145,7 +145,7 @@ app.get('/', (req, res) => {
     const exchangesOrder = ["Binance", "Bybit", "Gate", "Bitget", "BingX", "OKX", "Kucoin"];
     let urlParams = new URLSearchParams(window.location.search);
     let symbol = urlParams.get('symbol')?.toUpperCase() || 'BTC';
-    let token = urlParams.get('token') || '777';
+    let token = urlParams.get('token') || '';
     let chain = urlParams.get('chain');
     let addr = urlParams.get('addr');
     let timer=null, blink=false;
