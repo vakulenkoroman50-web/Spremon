@@ -8,7 +8,7 @@ app.use(express.json());
 
 // --- КОНФИГУРАЦИЯ ---
 const PORT = process.env.PORT || 3000;
-const SECRET_TOKEN = process.env.SECRET_TOKEN || ''; 
+const SECRET_TOKEN = process.env.SECRET_TOKEN; // Хранится только в ENV
 const MEXC_API_KEY = process.env.MEXC_API_KEY || '';
 const MEXC_API_SECRET = process.env.MEXC_API_SECRET || '';
 
@@ -33,18 +33,21 @@ async function mexcPrivateGet(path, params = {}) {
     } catch (e) { return null; }
 }
 
+// Проверка токена во всех API запросах
 app.get('/api/resolve', async (req, res) => {
+    if (req.query.token !== SECRET_TOKEN) return res.status(403).json({ ok: false, msg: "Access denied" });
+    
     const symbol = (req.query.symbol || '').toUpperCase();
     const data = await mexcPrivateGet("/api/v3/capital/config/getall");
     if (!data || !Array.isArray(data)) return res.json({ ok: false });
 
-    const token = data.find(t => t.coin === symbol);
-    if (!token || !token.networkList) return res.json({ ok: false });
+    const tokenData = data.find(t => t.coin === symbol);
+    if (!tokenData || !tokenData.networkList) return res.json({ ok: false });
 
     let bestPair = null;
     const fetch = (await import('node-fetch')).default;
 
-    for (const net of token.networkList) {
+    for (const net of tokenData.networkList) {
         if (!net.contract) continue;
         try {
             const dsRes = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${net.contract}`);
@@ -63,6 +66,20 @@ app.get('/api/resolve', async (req, res) => {
     } else {
         res.json({ ok: false });
     }
+});
+
+app.get('/api/all', async (req, res) => {
+    if (req.query.token !== SECRET_TOKEN) return res.status(403).json({ ok: false });
+    
+    const symbol = (req.query.symbol || 'BTC').toUpperCase();
+    const mexc = await getMexcPrice(symbol);
+    const prices = {};
+    
+    await Promise.all(exchangesOrder.map(async ex => { 
+        prices[ex] = await getExPrice(ex, symbol); 
+    }));
+    
+    res.json({ ok: true, mexc, prices });
 });
 
 async function getMexcPrice(symbol) {
@@ -101,17 +118,7 @@ async function getExPrice(ex, symbol) {
     } catch(e) { return 0; }
 }
 
-app.get('/api/all', async (req, res) => {
-    if (req.query.token !== SECRET_TOKEN) return res.status(403).json({ok:false});
-    const symbol = (req.query.symbol || '').toUpperCase();
-    const mexc = await getMexcPrice(symbol);
-    const prices = {};
-    await Promise.all(exchangesOrder.map(async ex => { prices[ex] = await getExPrice(ex, symbol); }));
-    res.json({ ok: true, mexc, prices });
-});
-
 app.get('/', (req, res) => {
-    const initialSymbol = (req.query.symbol || '').toUpperCase();
     res.send(`
     <!DOCTYPE html>
     <html>
@@ -123,8 +130,8 @@ app.get('/', (req, res) => {
     body { background: #000; font-family: monospace; font-size: 28px; color: #fff; padding: 10px; overflow: hidden; }
     #output { white-space: pre; line-height: 1.1; height: 320px; }
     .control-row { display: flex; gap: 5px; margin-top: 10px; }
-    #symbolInput { font-family: monospace; font-size: 28px; width: 100%; max-width: 400px; background: #000; color: #fff; border: 1px solid #444; }
-    #startBtn { font-family: monospace; font-size: 28px; background: #222; color: #fff; border: 1px solid #444; cursor: pointer; padding: 0 10px; }
+    #symbolInput { font-family: monospace; font-size: 28px; width: 100%; background: #000; color: #fff; border: 1px solid #444; padding: 5px; }
+    #startBtn { font-family: monospace; font-size: 28px; background: #222; color: #fff; border: 1px solid #444; cursor: pointer; padding: 0 20px; }
     #dexLink { font-family: monospace; font-size: 16px; width: 100%; background: #111; color: #888; border: 1px solid #333; padding: 5px; cursor: pointer; margin-top: 5px; }
     .dex-row { color: #00ff00; }
     .best { color: #ffff00; }
@@ -133,31 +140,33 @@ app.get('/', (req, res) => {
     </style>
     </head>
     <body>
-      <div id="output">Готов к работе</div>
+      <div id="output">Готов к работе...</div>
+      
       <div class="control-row">
-        <input id="symbolInput" value="${initialSymbol}" autocomplete="off" onfocus="this.select()" />
+        <input id="symbolInput" placeholder="SYMBOL ИЛИ DEX LINK" autocomplete="off" />
         <button id="startBtn">СТАРТ</button>
       </div>
+
       <input id="dexLink" readonly placeholder="DEX URL" onclick="this.select(); document.execCommand('copy');" />
       <div id="status" style="font-size: 18px; margin-top: 5px; color: #444;"></div>
 
     <script>
     const exchangesOrder = ["Binance", "Bybit", "Gate", "Bitget", "BingX", "OKX", "Kucoin"];
-    let urlParams = new URLSearchParams(window.location.search);
-    let symbol = urlParams.get('symbol')?.toUpperCase();
-    let token = urlParams.get('token') || '';
-    let chain = urlParams.get('chain');
-    let addr = urlParams.get('addr');
-    let timer=null, blink=false;
+    
+    // Считываем токен из URL один раз при загрузке
+    const urlParams = new URLSearchParams(window.location.search);
+    const apiToken = urlParams.get('token') || '';
+    
+    let currentSymbol = '', chain = null, addr = null;
+    let timer = null, blink = false;
 
-    const output=document.getElementById("output");
-    const input=document.getElementById("symbolInput");
-    const dexLink=document.getElementById("dexLink");
-    const statusEl=document.getElementById("status");
+    const output = document.getElementById("output");
+    const input = document.getElementById("symbolInput");
+    const dexLink = document.getElementById("dexLink");
+    const statusEl = document.getElementById("status");
 
     function formatP(p) { 
-        if(!p || p == 0) return "0";
-        return parseFloat(p).toString();
+        return (p && p != 0) ? parseFloat(p).toString() : "0";
     }
 
     async function update() {
@@ -170,20 +179,26 @@ app.get('/', (req, res) => {
                 const d = await r.json();
                 if (d.pair) {
                     dexPrice = parseFloat(d.pair.priceUsd);
-                    document.title = symbol + ': ' + d.pair.priceUsd;
+                    document.title = currentSymbol + ': ' + d.pair.priceUsd;
                     dexLink.value = d.pair.url;
                 }
             } catch(e) {}
         }
 
         try {
-            const res = await fetch('/api/all?symbol=' + symbol + '&token=' + token);
+            // Передаем токен в каждом запросе
+            const res = await fetch('/api/all?symbol=' + currentSymbol + '&token=' + apiToken);
+            if (res.status === 403) {
+                output.innerHTML = "<span style='color:red'>ОШИБКА: ТОКЕН НЕВЕРЕН</span>";
+                clearInterval(timer);
+                return;
+            }
+            
             const data = await res.json();
             if(!data.ok) return;
 
             let dot = blink ? '<span class="blink-dot">●</span>' : '○';
-            let lines = [];
-            lines.push(dot + ' ' + symbol + ' MEXC: ' + formatP(data.mexc));
+            let lines = [dot + ' ' + currentSymbol + ' MEXC: ' + formatP(data.mexc)];
 
             if (dexPrice > 0) {
                 let diff = ((dexPrice - data.mexc) / data.mexc * 100).toFixed(2);
@@ -211,7 +226,7 @@ app.get('/', (req, res) => {
             });
 
             output.innerHTML = lines.join("<br>");
-            statusEl.textContent = "Last: " + new Date().toLocaleTimeString();
+            statusEl.textContent = "Last Update: " + new Date().toLocaleTimeString();
         } catch(e) {}
     }
 
@@ -220,34 +235,31 @@ app.get('/', (req, res) => {
         if(!val) return;
         
         if(timer) clearInterval(timer);
-        output.innerHTML = "Обработка...";
-        dexLink.value = "";
+        output.innerHTML = "Инициализация...";
         
-        // 1. Проверяем, не ссылка ли это DexScreener
         if (val.includes("dexscreener.com")) {
             try {
                 const parts = val.split('/');
                 chain = parts[parts.length - 2];
-                addr = parts[parts.length - 1].split('?')[0]; // Убираем параметры если есть
+                addr = parts[parts.length - 1].split('?')[0];
                 
                 const dsRes = await fetch('https://api.dexscreener.com/latest/dex/pairs/' + chain + '/' + addr);
                 const dsData = await dsRes.json();
                 
                 if (dsData.pair) {
-                    symbol = dsData.pair.baseToken.symbol.toUpperCase();
-                    input.value = symbol;
-                    dexLink.value = dsData.pair.url;
+                    currentSymbol = dsData.pair.baseToken.symbol.toUpperCase();
+                    input.value = currentSymbol;
                 }
             } catch(e) {
-                output.innerHTML = "Ошибка ссылки!";
+                output.innerHTML = "Ошибка ссылки DEX";
                 return;
             }
         } else {
-            // Если это просто тикер
-            symbol = val.toUpperCase();
+            currentSymbol = val.toUpperCase();
             chain = null; addr = null;
             try {
-                const res = await fetch('/api/resolve?symbol=' + symbol + '&token=' + token);
+                // Здесь тоже нужен токен для резолва
+                const res = await fetch('/api/resolve?symbol=' + currentSymbol + '&token=' + apiToken);
                 const d = await res.json();
                 if (d.ok) {
                     chain = d.chain; addr = d.addr; dexLink.value = d.url;
@@ -255,25 +267,12 @@ app.get('/', (req, res) => {
             } catch(e) {}
         }
 
-        const url = new URL(window.location);
-        url.searchParams.set('symbol', symbol);
-        if(chain) url.searchParams.set('chain', chain);
-        if(addr) url.searchParams.set('addr', addr);
-        window.history.replaceState({}, '', url);
-
         update();
         timer = setInterval(update, 1000);
     }
 
     document.getElementById("startBtn").onclick = start;
     input.addEventListener("keypress", (e) => { if(e.key === "Enter") start(); });
-
-    if (urlParams.get('symbol')) {
-        start();
-    } else {
-        update();
-        timer = setInterval(update, 1000);
-    }
     </script>
     </body>
     </html>
