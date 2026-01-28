@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>URL Go</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 10px;
+            font-family: Arial, sans-serif;
+        }
+
+        .container {
+            display: flex;
+            gap: 5px;
+            align-items: center;
+        }
+
+        input[type="url"] {
+            width: 50%;
+            padding: 10px;
+            font-size: 40px;
+        }
+
+        button {
+            padding: 10px 20px;
+            font-size: 40px;
+            cursor: pointer;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="container">
+        <input type="url" id="urlInput" placeholder="Введите URL">
+        <button onclick="go()">Go</button>
+    </div>
+
+    <script>
+        const input = document.getElementById("urlInput");
+
+        input.addEventListener("keydown", function(event) {
+            if (event.key === "Enter") {
+                go();
+            }
+        });
+
+        function go() {
+            let url = input.value.trim();
+            if (!url) return;
+
+            if (!url.startsWith("http://") && !url.startsWith("https://")) {
+                url = "https://" + url;
+            }
+
+            window.location.href = url;
+        }
+    </script>
+
+</body>
+</html>
