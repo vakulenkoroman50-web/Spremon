@@ -2,7 +2,7 @@
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
-    <title>URL Go & Search</title>
+    <title>Home Page</title>
     <style>
         body {
             margin: 0;
@@ -18,8 +18,9 @@
             align-items: center;
         }
 
-        input[type="url"] {
-            width: 50%;
+        /* Исправленный селектор: теперь работает для type="text" */
+        input[type="text"] {
+            width: 45%;
             padding: 10px;
             font-size: 40px;
             background-color: #222;
@@ -45,7 +46,7 @@
 <body>
 
     <div class="container">
-        <input type="text" id="urlInput" placeholder="Введите URL или поисковый запрос">
+        <input type="text" id="urlInput" placeholder="Введите URL или поиск">
         <button onclick="go()">Go</button>
     </div>
 
@@ -62,21 +63,17 @@
             let query = input.value.trim();
             if (!query) return;
 
-            // Проверка: является ли ввод ссылкой
-            // Ссылка обычно начинается с протокола ИЛИ содержит точку и не содержит пробелов
             const isUrl = query.startsWith("http://") || 
                           query.startsWith("https://") || 
                           (query.includes(".") && !query.includes(" "));
 
             if (isUrl) {
-                // Если это ссылка, но без протокола — добавляем https
                 let url = query;
                 if (!url.startsWith("http://") && !url.startsWith("https://")) {
                     url = "https://" + url;
                 }
                 window.location.href = url;
             } else {
-                // Если это не ссылка — ищем в Google
                 window.location.href = "https://www.google.com/search?q=" + encodeURIComponent(query);
             }
         }
