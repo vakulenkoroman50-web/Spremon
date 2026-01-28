@@ -56,6 +56,8 @@ const CEX_ADAPTERS = {
 const app = express();
 app.use(cors());
 app.use(express.json());
+// Добавь эту строку:
+app.use(express.static('public'));
 
 // Глобальный fetch для производительности
 let fetch;
