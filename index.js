@@ -205,7 +205,7 @@ body { background: #000; font-family: monospace; font-size: 28px; color: #fff; p
 <div class="control-row">  
     <input id="symbolInput" value="${initialSymbol}" placeholder="TICKER OR LINK" autocomplete="off" onfocus="this.select()" />  
     <button id="startBtn">СТАРТ</button>  
-    <button id="mexcBtn">Mexc</button>
+    <button id="mexcBtn">MEXC</button>
 </div>  
 <input id="dexLink" readonly placeholder="DEX URL" onclick="this.select(); document.execCommand('copy');" />  
 <div id="status" style="font-size: 18px; margin-top: 5px; color: #444;"></div>  
