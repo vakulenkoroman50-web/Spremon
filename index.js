@@ -187,8 +187,11 @@ app.get('/', (req, res) => {
 body { background: #000; font-family: monospace; font-size: 28px; color: #fff; padding: 10px; overflow: hidden; }
 #output { white-space: pre; line-height: 1.1; min-height: 280px; }
 .control-row { display: flex; gap: 5px; margin-top: 0; }
-#symbolInput { font-family: monospace; font-size: 28px; width: 100%; max-width: 400px; background: #000; color: #fff; border: 1px solid #444; }
+/* Уменьшили max-width с 400px до 280px (на 30%) */
+#symbolInput { font-family: monospace; font-size: 28px; width: 100%; max-width: 280px; background: #000; color: #fff; border: 1px solid #444; }
 #startBtn { font-family: monospace; font-size: 28px; background: #222; color: #fff; border: 1px solid #444; cursor: pointer; padding: 0 10px; }
+/* Стиль для кнопки Mexc, такой же как Start */
+#mexcBtn { font-family: monospace; font-size: 28px; background: #222; color: #fff; border: 1px solid #444; cursor: pointer; padding: 0 10px; }
 #dexLink { font-family: monospace; font-size: 16px; width: 100%; background: #111; color: #888; border: 1px solid #333; padding: 5px; cursor: pointer; margin-top: 5px; }
 .dex-row { color: #00ff00; }
 .best { color: #ffff00; }
@@ -202,6 +205,7 @@ body { background: #000; font-family: monospace; font-size: 28px; color: #fff; p
 <div class="control-row">  
     <input id="symbolInput" value="${initialSymbol}" placeholder="TICKER OR LINK" autocomplete="off" onfocus="this.select()" />  
     <button id="startBtn">СТАРТ</button>  
+    <button id="mexcBtn">Mexc</button>
 </div>  
 <input id="dexLink" readonly placeholder="DEX URL" onclick="this.select(); document.execCommand('copy');" />  
 <div id="status" style="font-size: 18px; margin-top: 5px; color: #444;"></div>  
@@ -336,6 +340,13 @@ async function start() {
 }  
 
 document.getElementById("startBtn").onclick = start;  
+document.getElementById("mexcBtn").onclick = function() {
+    let val = input.value.trim().toUpperCase();
+    if(val) {
+        window.location.href = "mxcappscheme://kline?extra_page_name=其他&trade_pair=" + val + "_USDT&contract=1";
+    }
+};
+
 input.addEventListener("keypress", (e) => { if(e.key === "Enter") start(); });  
 
 if (urlParams.get('symbol')) start();  
@@ -347,4 +358,3 @@ else if (!token) output.innerHTML = "<span style='color:red'>Доступ зап
 });
 
 app.listen(CONFIG.PORT, () => console.log(`🚀 Server running on port ${CONFIG.PORT}`));
-            
