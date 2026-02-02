@@ -205,10 +205,10 @@ body { background: #000; font-family: monospace; font-size: 28px; color: #fff; p
     gap: 5px;
     align-items: center;
     font-family: Arial, sans-serif; /* Как в исходнике */
-    margin-top: 20px;
+    margin-top: 10px;
 }
 #urlInput {
-    width: 45%;
+    width: 46%;
     padding: 10px;
     font-size: 40px;
     background-color: #222;
