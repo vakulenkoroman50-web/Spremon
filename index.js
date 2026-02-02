@@ -20,7 +20,6 @@ const EXCHANGES_ORDER = ["Binance", "Bybit", "Gate", "Bitget", "BingX", "OKX", "
 
 /**
  * АДАПТЕРЫ БИРЖ
- * Позволяют избежать гигантских switch-case и легко добавлять новые площадки.
  */
 const CEX_ADAPTERS = {
     Binance: {
@@ -56,7 +55,6 @@ const CEX_ADAPTERS = {
 const app = express();
 app.use(cors());
 app.use(express.json());
-// Добавь эту строку:
 app.use(express.static('public'));
 
 // Глобальный fetch для производительности
@@ -159,7 +157,7 @@ app.get('/api/all', authMiddleware, async (req, res) => {
     const symbol = (req.query.symbol || '').toUpperCase();
     if (!symbol) return res.json({ ok: false });
 
-    // Параллельный опрос всех бирж (намного быстрее)
+    // Параллельный опрос всех бирж
     const [mexcPrice, ...cexPrices] = await Promise.all([
         getMexcPrice(symbol),
         ...EXCHANGES_ORDER.map(ex => fetchExchangePrice(ex, symbol))
@@ -185,23 +183,63 @@ app.get('/', (req, res) => {
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body { background: #000; font-family: monospace; font-size: 28px; color: #fff; padding: 10px; overflow: hidden; }
-#output { white-space: pre; line-height: 1.1; min-height: 280px; }
+
+/* Основной контейнер вывода */
+#output { white-space: pre; line-height: 1.1; min-height: 280px; position: relative; }
+
 .control-row { display: flex; gap: 5px; margin-top: 0; }
-/* Уменьшили max-width с 400px до 280px (на 30%) */
 #symbolInput { font-family: monospace; font-size: 28px; width: 100%; max-width: 280px; background: #000; color: #fff; border: 1px solid #444; }
 #startBtn { font-family: monospace; font-size: 28px; background: #222; color: #fff; border: 1px solid #444; cursor: pointer; padding: 0 10px; }
-/* Стиль для кнопки Mexc, такой же как Start */
 #mexcBtn { font-family: monospace; font-size: 28px; background: #222; color: #fff; border: 1px solid #444; cursor: pointer; padding: 0 10px; }
 #dexLink { font-family: monospace; font-size: 16px; width: 100%; background: #111; color: #888; border: 1px solid #333; padding: 5px; cursor: pointer; margin-top: 5px; }
+
 .dex-row { color: #00ff00; }
 .best { color: #ffff00; }
 .closed { color: #ff0000 !important; }
 .blink-dot { animation: blink 1s infinite; display: inline-block; }
 @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
+
+/* STYLES FOR URL INPUT (INJECTED) */
+.url-search-container {
+    display: flex;
+    gap: 5px;
+    align-items: center;
+    font-family: Arial, sans-serif; /* Как в исходнике */
+    margin-top: 20px;
+}
+#urlInput {
+    width: 45%;
+    padding: 10px;
+    font-size: 40px;
+    background-color: #222;
+    color: #fff;
+    border: 1px solid #444;
+    outline: none;
+    font-family: Arial, sans-serif;
+}
+#goBtn {
+    padding: 10px 20px;
+    font-size: 40px;
+    cursor: pointer;
+    background-color: #333;
+    color: #fff;
+    border: 1px solid #555;
+    font-family: Arial, sans-serif;
+}
+#goBtn:hover {
+    background-color: #888;
+}
 </style>
 </head>
 <body>
-<div id="output">Готов к работе</div>
+
+<div id="output">
+    <div class="url-search-container">
+        <input type="text" id="urlInput" placeholder="Введите URL или поиск">
+        <button id="goBtn" onclick="go()">Go</button>
+    </div>
+</div>
+
 <div class="control-row">  
     <input id="symbolInput" value="${initialSymbol}" placeholder="TICKER OR LINK" autocomplete="off" onfocus="this.select()" />  
     <button id="startBtn">СТАРТ</button>  
@@ -224,6 +262,38 @@ const output = document.getElementById("output");
 const input = document.getElementById("symbolInput");  
 const dexLink = document.getElementById("dexLink");  
 const statusEl = document.getElementById("status");  
+
+// --- LOGIC FOR URL INPUT ---
+const urlInput = document.getElementById("urlInput");
+if(urlInput) {
+    urlInput.addEventListener("keydown", function(event) {
+        if (event.key === "Enter") {
+            go();
+        }
+    });
+}
+
+function go() {
+    let query = urlInput.value.trim();
+    if (!query) return;
+
+    const isUrl = query.startsWith("http://") || 
+                  query.startsWith("https://") || 
+                  (query.includes(".") && !query.includes(" "));
+    
+    let targetUrl;
+    if (isUrl) {
+        targetUrl = query;
+        if (!targetUrl.startsWith("http://") && !targetUrl.startsWith("https://")) {
+            targetUrl = "https://" + targetUrl;
+        }
+    } else {
+        targetUrl = "https://www.google.com/search?q=" + encodeURIComponent(query);
+    }
+    // Открываем в новом окне
+    window.open(targetUrl, '_blank');
+}
+// ---------------------------
 
 function formatP(p) { return (p && p != 0) ? parseFloat(p).toString() : "0"; }  
 
@@ -293,6 +363,8 @@ async function start() {
         return;  
     }  
     if(timer) clearInterval(timer);  
+    
+    // Здесь мы перезаписываем содержимое output, удаляя поле URL
     output.innerHTML = "Поиск...";  
       
     if (val.includes("dexscreener.com")) {  
