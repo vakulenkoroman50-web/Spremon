@@ -129,7 +129,6 @@ app.get('/api/resolve', authMiddleware, async (req, res) => {
     let bestPair = null;
     const contracts = tokenData.networkList.filter(n => n.contract).map(n => n.contract);
     
-    // Параллельный поиск по DexScreener для всех сетей сразу
     await Promise.all(contracts.map(async (contract) => {
         try {
             const dsRes = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${contract}`);
@@ -157,7 +156,6 @@ app.get('/api/all', authMiddleware, async (req, res) => {
     const symbol = (req.query.symbol || '').toUpperCase();
     if (!symbol) return res.json({ ok: false });
 
-    // Параллельный опрос всех бирж
     const [mexcPrice, ...cexPrices] = await Promise.all([
         getMexcPrice(symbol),
         ...EXCHANGES_ORDER.map(ex => fetchExchangePrice(ex, symbol))
@@ -170,7 +168,7 @@ app.get('/api/all', authMiddleware, async (req, res) => {
 });
 
 /**
- * ГЛАВНАЯ СТРАНИЦА (ФРОНТЕНД)
+ * ГЛАВНАЯ СТРАНИЦА
  */
 app.get('/', (req, res) => {
     const initialSymbol = (req.query.symbol || '').toUpperCase();
@@ -181,34 +179,41 @@ app.get('/', (req, res) => {
 <meta charset="UTF-8">
 <title>Crypto Monitor</title>
 <style>
+/* Reset and Base Styles */
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body { background: #000; font-family: monospace; font-size: 28px; color: #fff; padding: 10px; overflow: hidden; }
 
-/* Основной контейнер вывода */
-#output { white-space: pre; line-height: 1.1; min-height: 280px; position: relative; }
+/* Output Container */
+#output { white-space: pre; line-height: 1.1; min-height: 280px; }
 
+/* Control Row (Crypto Input) */
 .control-row { display: flex; gap: 5px; margin-top: 0; }
 #symbolInput { font-family: monospace; font-size: 28px; width: 100%; max-width: 280px; background: #000; color: #fff; border: 1px solid #444; }
 #startBtn { font-family: monospace; font-size: 28px; background: #222; color: #fff; border: 1px solid #444; cursor: pointer; padding: 0 10px; }
 #mexcBtn { font-family: monospace; font-size: 28px; background: #222; color: #fff; border: 1px solid #444; cursor: pointer; padding: 0 10px; }
 #dexLink { font-family: monospace; font-size: 16px; width: 100%; background: #111; color: #888; border: 1px solid #333; padding: 5px; cursor: pointer; margin-top: 5px; }
 
+/* Indicators */
 .dex-row { color: #00ff00; }
 .best { color: #ffff00; }
 .closed { color: #ff0000 !important; }
 .blink-dot { animation: blink 1s infinite; display: inline-block; }
 @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
 
-/* STYLES FOR URL INPUT (INJECTED) */
-.url-search-container {
+/* --- STYLES FOR URL INPUT (STRICTLY FROM SOURCE) --- */
+.url-wrapper {
+    white-space: normal; /* Resetting pre for this container */
+    margin-bottom: 20px;
+    font-family: Arial, sans-serif;
+}
+.container {
     display: flex;
     gap: 5px;
     align-items: center;
-    font-family: Arial, sans-serif; /* Как в исходнике */
-    margin-top: 10px;
 }
-#urlInput {
-    width: 46%;
+/* Using specific ID to override generic input styles */
+input[type="text"]#urlInput {
+    width: 45%;
     padding: 10px;
     font-size: 40px;
     background-color: #222;
@@ -217,7 +222,7 @@ body { background: #000; font-family: monospace; font-size: 28px; color: #fff; p
     outline: none;
     font-family: Arial, sans-serif;
 }
-#goBtn {
+button#goBtn {
     padding: 10px 20px;
     font-size: 40px;
     cursor: pointer;
@@ -226,7 +231,7 @@ body { background: #000; font-family: monospace; font-size: 28px; color: #fff; p
     border: 1px solid #555;
     font-family: Arial, sans-serif;
 }
-#goBtn:hover {
+button#goBtn:hover {
     background-color: #888;
 }
 </style>
@@ -234,9 +239,11 @@ body { background: #000; font-family: monospace; font-size: 28px; color: #fff; p
 <body>
 
 <div id="output">
-    <div class="url-search-container">
-        <input type="text" id="urlInput" placeholder="Введите URL или поиск">
-        <button id="goBtn" onclick="go()">Go</button>
+    <div class="url-wrapper">
+        <div class="container">
+            <input type="text" id="urlInput" placeholder="Введите URL или поиск">
+            <button id="goBtn" onclick="go()">Go</button>
+        </div>
     </div>
 </div>
 
@@ -263,24 +270,26 @@ const input = document.getElementById("symbolInput");
 const dexLink = document.getElementById("dexLink");  
 const statusEl = document.getElementById("status");  
 
-// --- LOGIC FOR URL INPUT ---
+// --- URL SEARCH LOGIC ---
 const urlInput = document.getElementById("urlInput");
-if(urlInput) {
+if (urlInput) {
     urlInput.addEventListener("keydown", function(event) {
         if (event.key === "Enter") {
             go();
         }
     });
+    // Фокус на URL поле при загрузке, если нет символа
+    if (!symbol) urlInput.focus();
 }
 
 function go() {
-    let query = urlInput.value.trim();
+    let query = document.getElementById("urlInput").value.trim();
     if (!query) return;
 
     const isUrl = query.startsWith("http://") || 
                   query.startsWith("https://") || 
                   (query.includes(".") && !query.includes(" "));
-    
+
     let targetUrl;
     if (isUrl) {
         targetUrl = query;
@@ -290,10 +299,10 @@ function go() {
     } else {
         targetUrl = "https://www.google.com/search?q=" + encodeURIComponent(query);
     }
-    // Открываем в новом окне
+    // Открыть в новой вкладке
     window.open(targetUrl, '_blank');
 }
-// ---------------------------
+// ------------------------
 
 function formatP(p) { return (p && p != 0) ? parseFloat(p).toString() : "0"; }  
 
@@ -364,7 +373,7 @@ async function start() {
     }  
     if(timer) clearInterval(timer);  
     
-    // Здесь мы перезаписываем содержимое output, удаляя поле URL
+    // Перезаписываем output, что удаляет форму URL
     output.innerHTML = "Поиск...";  
       
     if (val.includes("dexscreener.com")) {  
