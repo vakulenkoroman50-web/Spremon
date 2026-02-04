@@ -27,12 +27,11 @@ const GLOBAL_PRICES = {};
 // Хелпер для безопасного обновления цены
 const updatePrice = (symbol, exchange, price) => {
     if (!symbol || !price) return;
-    // Приводим все к единому виду (BTC)
     const s = symbol.toUpperCase()
-        .replace(/[-_]/g, '')     // Убираем тире и подчеркивания
-        .replace('USDT', '')      // Убираем USDT
-        .replace('SWAP', '')      // Убираем SWAP (OKX)
-        .replace('M', '');        // Убираем M (Kucoin XBTUSDTM -> XBTUSDT)
+        .replace(/[-_]/g, '')     
+        .replace('USDT', '')      
+        .replace('SWAP', '')      
+        .replace('M', '');        
         
     if (!GLOBAL_PRICES[s]) GLOBAL_PRICES[s] = {};
     GLOBAL_PRICES[s][exchange] = parseFloat(price);
@@ -164,18 +163,16 @@ const initBingxGlobal = () => {
     }, 2000);
 };
 
-// 8. KUCOIN GLOBAL (ИСПРАВЛЕНО)
+// 8. KUCOIN GLOBAL
 const initKucoinGlobal = () => {
     setInterval(async () => {
         try {
             if (!fetch) return;
-            // Правильный эндпоинт для всех тикеров фьючерсов
             const res = await fetch('https://api-futures.kucoin.com/api/v1/allTickers');
             const d = await res.json();
             if (d.data && Array.isArray(d.data)) {
                 d.data.forEach(i => {
                     let sym = i.symbol;
-                    // Исправляем XBT на BTC для Кукоина
                     if (sym.startsWith('XBT')) sym = sym.replace('XBT', 'BTC');
                     updatePrice(sym, 'Kucoin', i.price);
                 });
@@ -308,8 +305,8 @@ body { background: #000; font-family: monospace; font-size: 28px; color: #fff; p
 .blink-dot { animation: blink 1s infinite; display: inline-block; }
 @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
 .url-search-container { display: flex; gap: 5px; align-items: center; font-family: Arial, sans-serif; margin-top: 20px; }
-#urlInput { width: 46%; padding: 10px; font-size: 37px; background-color: #222; color: #fff; border: 1px solid #444; outline: none; font-family: Arial, sans-serif; }
-#goBtn { padding: 10px 20px; font-size: 37px; cursor: pointer; background-color: #333; color: #fff; border: 1px solid #555; font-family: Arial, sans-serif; }
+#urlInput { width: 46%; padding: 10px; font-size: 36px; background-color: #222; color: #fff; border: 1px solid #444; outline: none; font-family: Arial, sans-serif; }
+#goBtn { padding: 10px 20px; font-size: 36px; cursor: pointer; background-color: #333; color: #fff; border: 1px solid #555; font-family: Arial, sans-serif; }
 #goBtn:hover { background-color: #888; }
 </style>
 </head>
@@ -367,7 +364,24 @@ async function update() {
             const d = await r.json();  
             if (d.pair) {  
                 dexPrice = parseFloat(d.pair.priceUsd);  
-                document.title = symbol + ': ' + d.pair.priceUsd;  
+                
+                // --- ЛОГИКА ОБРЕЗКИ ЗАГОЛОВКА ---
+                let pStr = d.pair.priceUsd;
+                let sStr = symbol;
+                const maxLen = 18; 
+                
+                // Если название + цена + разделитель больше 18
+                if ((sStr.length + pStr.length + 2) > maxLen) {
+                    // Вычисляем, сколько места осталось для имени
+                    let spaceForName = maxLen - pStr.length - 2;
+                    // Оставляем минимум 3 символа, даже если не влезает
+                    if (spaceForName < 3) spaceForName = 3;
+                    sStr = sStr.substring(0, spaceForName);
+                }
+                
+                document.title = sStr + ': ' + pStr;
+                // ---------------------------------
+
                 dexLink.value = d.pair.url;  
             }  
         } catch(e) {}  
@@ -461,3 +475,4 @@ else if (!token) output.innerHTML = "<span style='color:red'>Доступ зап
 });
 
 app.listen(CONFIG.PORT, () => console.log(`🚀 Server running on port ${CONFIG.PORT}`));
+                             
