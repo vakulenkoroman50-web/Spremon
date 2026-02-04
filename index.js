@@ -125,11 +125,14 @@ const WS_CONNECTORS = {
 
 // Специальный WS для MEXC
 let mexcWs = null;
+
 const startMexcWs = (symbol) => {
     // БЕЗОПАСНОЕ ЗАКРЫТИЕ СТАРОГО СОКЕТА
     if (mexcWs) {
         try {
-            mexcWs.removeAllListeners(); // Убираем слушатели, чтобы не стреляли ошибки при закрытии
+            // ВАЖНО: Не делаем removeAllListeners, иначе ошибка при terminate крашнет сервер
+            // Вместо этого вешаем пустой обработчик, чтобы проглотить ошибку закрытия
+            mexcWs.on('error', () => {}); 
             mexcWs.terminate();
         } catch (e) {
             console.error('[WS Error] Failed to terminate MEXC ws:', e.message);
@@ -141,7 +144,6 @@ const startMexcWs = (symbol) => {
         
         // ВАЖНО: Обработчик ошибок должен быть навешен сразу
         mexcWs.on('error', (err) => {
-            // Просто логируем, не роняем сервер
             // console.error('[WS Error] MEXC socket error:', err.message); 
         });
 
@@ -170,7 +172,9 @@ const switchSubscription = (newSymbol) => {
     // Безопасное закрытие всех старых сокетов
     activeSockets.forEach(ws => {
         try {
-            ws.removeAllListeners(); // Предотвращает ошибки при terminate
+            // КРИТИЧЕСКИЙ FIX: Не удаляем слушателей. Добавляем глушилку ошибок и закрываем.
+            // Если сокет в статусе CONNECTING, terminate вызовет ошибку, которую поймает эта глушилка.
+            ws.on('error', () => {}); 
             ws.terminate();
         } catch(e){}
     });
@@ -500,4 +504,4 @@ else if (!token) output.innerHTML = "<span style='color:red'>Доступ зап
 });
 
 app.listen(CONFIG.PORT, () => console.log(`🚀 Server running on port ${CONFIG.PORT}`));
-                
+        
