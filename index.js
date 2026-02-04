@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
+const WebSocket = require('ws'); // Требуется: npm install ws
 
 /**
  * КОНФИГУРАЦИЯ
@@ -19,37 +20,173 @@ const CONFIG = {
 const EXCHANGES_ORDER = ["Binance", "Bybit", "Gate", "Bitget", "BingX", "OKX", "Kucoin"];
 
 /**
- * АДАПТЕРЫ БИРЖ
+ * WEBSOCKET MANAGER
+ * Управляет соединениями с биржами.
+ * Если пользователь меняет символ, старые сокеты закрываются, новые открываются.
  */
-const CEX_ADAPTERS = {
-    Binance: {
-        url: (s) => `https://fapi.binance.com/fapi/v1/ticker/price?symbol=${s}USDT`,
-        parse: (d) => d.price
+let activeSymbol = null;
+let priceCache = {};
+let activeSockets = [];
+
+// Сброс кэша для конкретной биржи или всего сразу
+const resetCache = (exchange = null) => {
+    if (exchange) priceCache[exchange] = 0;
+    else EXCHANGES_ORDER.forEach(ex => priceCache[ex] = 0);
+};
+
+// Функция безопасного парсинга JSON
+const safeJson = (data) => {
+    try { return JSON.parse(data); } catch (e) { return null; }
+};
+
+// Генераторы подключений для каждой биржи
+const WS_CONNECTORS = {
+    Binance: (symbol) => {
+        const ws = new WebSocket(`wss://fstream.binance.com/ws/${symbol.toLowerCase()}usdt@aggTrade`);
+        ws.on('message', (data) => {
+            const d = safeJson(data);
+            if (d && d.p) priceCache['Binance'] = parseFloat(d.p);
+        });
+        return ws;
     },
+    Bybit: (symbol) => {
+        const ws = new WebSocket('wss://stream.bybit.com/v5/public/linear');
+        ws.on('open', () => {
+            ws.send(JSON.stringify({ "op": "subscribe", "args": [`publicTrade.${symbol}USDT`] }));
+        });
+        ws.on('message', (data) => {
+            const d = safeJson(data);
+            if (d && d.topic && d.data && d.data[0]) priceCache['Bybit'] = parseFloat(d.data[0].p);
+        });
+        return ws;
+    },
+    Gate: (symbol) => {
+        const ws = new WebSocket('wss://fx-ws.gateio.ws/v4/ws/usdt');
+        ws.on('open', () => {
+            ws.send(JSON.stringify({
+                "time": Date.now(),
+                "channel": "futures.tickers",
+                "event": "subscribe",
+                "payload": [`${symbol}_USDT`]
+            }));
+        });
+        ws.on('message', (data) => {
+            const d = safeJson(data);
+            if (d && d.event === 'update' && d.result && d.result[0]) {
+                priceCache['Gate'] = parseFloat(d.result[0].last);
+            }
+        });
+        return ws;
+    },
+    Bitget: (symbol) => {
+        const ws = new WebSocket('wss://ws.bitget.com/v2/ws/public');
+        ws.on('open', () => {
+            ws.send(JSON.stringify({
+                "op": "subscribe",
+                "args": [{ "instType": "USDT-FUTURES", "channel": "ticker", "instId": `${symbol}USDT` }]
+            }));
+        });
+        ws.on('message', (data) => {
+            const d = safeJson(data);
+            if (d && d.action === 'snapshot' && d.data && d.data[0]) {
+                priceCache['Bitget'] = parseFloat(d.data[0].lastPr);
+            }
+        });
+        return ws;
+    },
+    BingX: (symbol) => {
+        const ws = new WebSocket('wss://open-api-swap.bingx.com/swap-market');
+        ws.on('open', () => {
+            ws.send(JSON.stringify({
+                "id": "id1",
+                "reqType": "sub",
+                "dataType": `${symbol}-USDT@ticker`
+            }));
+        });
+        ws.on('message', (data) => {
+            // BingX использует GZIP иногда, но на простых стримах часто plaintext JSON
+            // Если приходят кракозябры, нужен zlib, но обычно ticker идет текстом или JSON
+            const d = safeJson(data);
+            if (d && d.data && d.data.c) priceCache['BingX'] = parseFloat(d.data.c);
+        });
+        return ws;
+    },
+    OKX: (symbol) => {
+        const ws = new WebSocket('wss://ws.okx.com:8443/ws/v5/public');
+        ws.on('open', () => {
+            ws.send(JSON.stringify({
+                "op": "subscribe",
+                "args": [{ "channel": "tickers", "instId": `${symbol}-USDT-SWAP` }]
+            }));
+        });
+        ws.on('message', (data) => {
+            const d = safeJson(data);
+            if (d && d.data && d.data[0]) priceCache['OKX'] = parseFloat(d.data[0].last);
+        });
+        return ws;
+    },
+    // Kucoin сложен для WS без токена, оставляем на HTTP Fallback
+    Kucoin: null 
+};
+
+// Специальный WS для MEXC (основная биржа)
+let mexcWs = null;
+const startMexcWs = (symbol) => {
+    if (mexcWs) mexcWs.terminate();
+    mexcWs = new WebSocket('wss://contract.mexc.com/edge');
+    mexcWs.on('open', () => {
+        mexcWs.send(JSON.stringify({ "method": "sub.ticker", "params": { "symbol": `${symbol}_USDT` } }));
+    });
+    mexcWs.on('message', (data) => {
+        const d = safeJson(data);
+        if (d && d.channel === 'push.ticker' && d.data) {
+            priceCache['MEXC'] = parseFloat(d.data.lastPrice);
+        }
+    });
+};
+
+const switchSubscription = (newSymbol) => {
+    if (!newSymbol || newSymbol === activeSymbol) return;
+    
+    console.log(`[WS] Switching symbol: ${activeSymbol} -> ${newSymbol}`);
+    
+    // Закрываем старые
+    activeSockets.forEach(ws => {
+        try { ws.terminate(); } catch(e){}
+    });
+    activeSockets = [];
+    
+    activeSymbol = newSymbol;
+    resetCache(); // Обнуляем цены перед новыми данными
+
+    // Запускаем новые
+    Object.keys(WS_CONNECTORS).forEach(ex => {
+        const connector = WS_CONNECTORS[ex];
+        if (connector) {
+            try {
+                const ws = connector(newSymbol);
+                ws.on('error', () => {}); // Игнорируем ошибки соединения
+                activeSockets.push(ws);
+            } catch (e) {
+                console.error(`Error connecting to ${ex}`, e);
+            }
+        }
+    });
+
+    // Отдельно MEXC
+    startMexcWs(newSymbol);
+};
+
+/**
+ * АДАПТЕРЫ БИРЖ (HTTP FALLBACK)
+ * Используются для Kucoin и для первого "холодного" старта
+ */
+const CEX_HTTP_ADAPTERS = {
     Kucoin: {
         url: (s) => `https://api-futures.kucoin.com/api/v1/ticker?symbol=${s === 'BTC' ? 'XBT' : s}USDTM`,
         parse: (d) => d.data?.price
     },
-    BingX: {
-        url: (s) => `https://open-api.bingx.com/openApi/swap/v2/quote/ticker?symbol=${s}-USDT`,
-        parse: (d) => d.data?.lastPrice
-    },
-    Bybit: {
-        url: (s) => `https://api.bybit.com/v5/market/tickers?category=linear&symbol=${s}USDT`,
-        parse: (d) => d.result?.list?.[0]?.lastPrice
-    },
-    Bitget: {
-        url: (s) => `https://api.bitget.com/api/v2/mix/market/ticker?symbol=${s}USDT&productType=USDT-FUTURES`,
-        parse: (d) => d.data?.[0]?.lastPr
-    },
-    OKX: {
-        url: (s) => `https://www.okx.com/api/v5/market/ticker?instId=${s}-USDT-SWAP`,
-        parse: (d) => d.data?.[0]?.last
-    },
-    Gate: {
-        url: (s) => `https://api.gateio.ws/api/v4/futures/usdt/tickers?contract=${s}_USDT`,
-        parse: (d) => d.last || (d[0] && d[0].last)
-    }
+    // Для остальных бирж HTTP не нужен, но можно оставить для отладки
 };
 
 const app = express();
@@ -57,7 +194,7 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static('public'));
 
-// Глобальный fetch для производительности
+// Глобальный fetch
 let fetch;
 (async () => {
     fetch = (await import('node-fetch')).default;
@@ -74,7 +211,7 @@ const authMiddleware = (req, res, next) => {
 };
 
 /**
- * УТИЛИТЫ
+ * УТИЛИТЫ MEXC API
  */
 const signMexc = (params) => {
     const queryString = Object.keys(params).sort().map(k => `${k}=${params[k]}`).join('&');
@@ -94,7 +231,7 @@ async function mexcPrivateRequest(path, params = {}) {
     } catch (e) { return null; }
 }
 
-async function getMexcPrice(symbol) {
+async function getMexcPriceHttp(symbol) {
     try {
         const res = await fetch(`${CONFIG.MEXC.FUTURES_URL}/api/v1/contract/ticker?symbol=${symbol}_USDT`);
         const d = await res.json();
@@ -102,8 +239,9 @@ async function getMexcPrice(symbol) {
     } catch (e) { return 0; }
 }
 
-async function fetchExchangePrice(exchange, symbol) {
-    const adapter = CEX_ADAPTERS[exchange];
+async function fetchExchangePriceHttp(exchange, symbol) {
+    const adapter = CEX_HTTP_ADAPTERS[exchange];
+    // Если нет HTTP адаптера (значит используем только WS), возвращаем 0
     if (!adapter) return 0;
     try {
         const res = await fetch(adapter.url(symbol));
@@ -129,7 +267,6 @@ app.get('/api/resolve', authMiddleware, async (req, res) => {
     let bestPair = null;
     const contracts = tokenData.networkList.filter(n => n.contract).map(n => n.contract);
     
-    // Параллельный поиск по DexScreener для всех сетей сразу
     await Promise.all(contracts.map(async (contract) => {
         try {
             const dsRes = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${contract}`);
@@ -157,16 +294,34 @@ app.get('/api/all', authMiddleware, async (req, res) => {
     const symbol = (req.query.symbol || '').toUpperCase();
     if (!symbol) return res.json({ ok: false });
 
-    // Параллельный опрос всех бирж
-    const [mexcPrice, ...cexPrices] = await Promise.all([
-        getMexcPrice(symbol),
-        ...EXCHANGES_ORDER.map(ex => fetchExchangePrice(ex, symbol))
-    ]);
+    // 1. Управление подписками
+    // Если запрошен новый символ, переключаем вебсокеты
+    if (symbol !== activeSymbol) {
+        switchSubscription(symbol);
+        
+        // "Холодный старт": пока сокеты подключаются, сделаем один HTTP запрос для MEXC и Kucoin
+        // чтобы пользователь не ждал нулей
+        const [mexcHttp, kucoinHttp] = await Promise.all([
+            getMexcPriceHttp(symbol),
+            fetchExchangePriceHttp('Kucoin', symbol)
+        ]);
+        priceCache['MEXC'] = mexcHttp;
+        if(kucoinHttp) priceCache['Kucoin'] = kucoinHttp;
+    }
 
+    // 2. Kucoin всегда опрашиваем по HTTP (нет простого WS)
+    // Делаем это асинхронно, не блокируя ответ, если в кэше уже что-то есть
+    // Но для точности лучше дождаться
+    const kucoinPrice = await fetchExchangePriceHttp('Kucoin', symbol);
+    if (kucoinPrice) priceCache['Kucoin'] = kucoinPrice;
+
+    // 3. Формируем ответ из кэша (который наполняется вебсокетами в фоне)
     const prices = {};
-    EXCHANGES_ORDER.forEach((ex, i) => { prices[ex] = cexPrices[i]; });
+    EXCHANGES_ORDER.forEach((ex) => { 
+        prices[ex] = priceCache[ex] || 0; 
+    });
 
-    res.json({ ok: true, mexc: mexcPrice, prices });
+    res.json({ ok: true, mexc: priceCache['MEXC'] || 0, prices });
 });
 
 /**
@@ -430,3 +585,4 @@ else if (!token) output.innerHTML = "<span style='color:red'>Доступ зап
 });
 
 app.listen(CONFIG.PORT, () => console.log(`🚀 Server running on port ${CONFIG.PORT}`));
+                    
