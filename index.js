@@ -1,8 +1,6 @@
 const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
-const fs = require('fs'); // Добавлен модуль для работы с файлами
-const path = require('path'); // Добавлен модуль для путей
 
 /**
  * КОНФИГУРАЦИЯ
@@ -58,22 +56,6 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 app.use(express.static('public'));
-
-// Чтение файла public/url.html при старте
-let startPageHtml = '';
-try {
-    const filePath = path.join(__dirname, 'public', 'url.html');
-    if (fs.existsSync(filePath)) {
-        startPageHtml = fs.readFileSync(filePath, 'utf8');
-        // АВТО-ФИКС: заменяем window.location на window.parent.location, 
-        // чтобы переход работал из iframe на всю страницу
-        startPageHtml = startPageHtml.replace(/window\.location\.href/g, 'window.parent.location.href');
-    } else {
-        startPageHtml = '<h3 style="color:white; text-align:center;">File public/url.html not found</h3>';
-    }
-} catch (e) {
-    startPageHtml = '<h3 style="color:red;">Error loading url.html</h3>';
-}
 
 // Глобальный fetch для производительности
 let fetch;
@@ -147,6 +129,7 @@ app.get('/api/resolve', authMiddleware, async (req, res) => {
     let bestPair = null;
     const contracts = tokenData.networkList.filter(n => n.contract).map(n => n.contract);
     
+    // Параллельный поиск по DexScreener для всех сетей сразу
     await Promise.all(contracts.map(async (contract) => {
         try {
             const dsRes = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${contract}`);
@@ -174,6 +157,7 @@ app.get('/api/all', authMiddleware, async (req, res) => {
     const symbol = (req.query.symbol || '').toUpperCase();
     if (!symbol) return res.json({ ok: false });
 
+    // Параллельный опрос всех бирж
     const [mexcPrice, ...cexPrices] = await Promise.all([
         getMexcPrice(symbol),
         ...EXCHANGES_ORDER.map(ex => fetchExchangePrice(ex, symbol))
@@ -190,9 +174,6 @@ app.get('/api/all', authMiddleware, async (req, res) => {
  */
 app.get('/', (req, res) => {
     const initialSymbol = (req.query.symbol || '').toUpperCase();
-    // Кодируем HTML из файла для безопасной вставки в iframe
-    const encodedStartPage = encodeURIComponent(startPageHtml);
-
     res.send(`
 <!DOCTYPE html>
 <html>
@@ -202,21 +183,62 @@ app.get('/', (req, res) => {
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body { background: #000; font-family: monospace; font-size: 28px; color: #fff; padding: 10px; overflow: hidden; }
-#output { white-space: pre; line-height: 1.1; min-height: 280px; }
+
+/* Основной контейнер вывода */
+#output { white-space: pre; line-height: 1.1; min-height: 280px; position: relative; }
+
 .control-row { display: flex; gap: 5px; margin-top: 0; }
 #symbolInput { font-family: monospace; font-size: 28px; width: 100%; max-width: 280px; background: #000; color: #fff; border: 1px solid #444; }
 #startBtn { font-family: monospace; font-size: 28px; background: #222; color: #fff; border: 1px solid #444; cursor: pointer; padding: 0 10px; }
 #mexcBtn { font-family: monospace; font-size: 28px; background: #222; color: #fff; border: 1px solid #444; cursor: pointer; padding: 0 10px; }
 #dexLink { font-family: monospace; font-size: 16px; width: 100%; background: #111; color: #888; border: 1px solid #333; padding: 5px; cursor: pointer; margin-top: 5px; }
+
 .dex-row { color: #00ff00; }
 .best { color: #ffff00; }
 .closed { color: #ff0000 !important; }
 .blink-dot { animation: blink 1s infinite; display: inline-block; }
 @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
+
+/* STYLES FOR URL INPUT (INJECTED) */
+.url-search-container {
+    display: flex;
+    gap: 5px;
+    align-items: center;
+    font-family: Arial, sans-serif; /* Как в исходнике */
+    margin-top: 20px;
+}
+#urlInput {
+    width: 46%;
+    padding: 10px;
+    font-size: 36px;
+    background-color: #222;
+    color: #fff;
+    border: 1px solid #444;
+    outline: none;
+    font-family: Arial, sans-serif;
+}
+#goBtn {
+    padding: 10px 20px;
+    font-size: 36px;
+    cursor: pointer;
+    background-color: #333;
+    color: #fff;
+    border: 1px solid #555;
+    font-family: Arial, sans-serif;
+}
+#goBtn:hover {
+    background-color: #888;
+}
 </style>
 </head>
 <body>
-<div id="output"><iframe src="data:text/html;charset=utf-8,${encodedStartPage}" style="width:100%; height:100%; min-height:280px; border:none; overflow:hidden;"></iframe></div>
+
+<div id="output">
+    <div class="url-search-container">
+        <input type="text" id="urlInput" placeholder="Введите URL или поиск">
+        <button id="goBtn" onclick="go()">Go</button>
+    </div>
+</div>
 
 <div class="control-row">  
     <input id="symbolInput" value="${initialSymbol}" placeholder="TICKER OR LINK" autocomplete="off" onfocus="this.select()" />  
@@ -240,6 +262,38 @@ const output = document.getElementById("output");
 const input = document.getElementById("symbolInput");  
 const dexLink = document.getElementById("dexLink");  
 const statusEl = document.getElementById("status");  
+
+// --- LOGIC FOR URL INPUT ---
+const urlInput = document.getElementById("urlInput");
+if(urlInput) {
+    urlInput.addEventListener("keydown", function(event) {
+        if (event.key === "Enter") {
+            go();
+        }
+    });
+}
+
+function go() {
+    let query = urlInput.value.trim();
+    if (!query) return;
+
+    const isUrl = query.startsWith("http://") || 
+                  query.startsWith("https://") || 
+                  (query.includes(".") && !query.includes(" "));
+    
+    let targetUrl;
+    if (isUrl) {
+        targetUrl = query;
+        if (!targetUrl.startsWith("http://") && !targetUrl.startsWith("https://")) {
+            targetUrl = "https://" + targetUrl;
+        }
+    } else {
+        targetUrl = "https://www.google.com/search?q=" + encodeURIComponent(query);
+    }
+    // Открываем в новом окне
+    window.open(targetUrl, '_blank');
+}
+// ---------------------------
 
 function formatP(p) { return (p && p != 0) ? parseFloat(p).toString() : "0"; }  
 
@@ -309,6 +363,8 @@ async function start() {
         return;  
     }  
     if(timer) clearInterval(timer);  
+    
+    // Здесь мы перезаписываем содержимое output, удаляя поле URL
     output.innerHTML = "Поиск...";  
       
     if (val.includes("dexscreener.com")) {  
