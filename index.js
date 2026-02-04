@@ -21,14 +21,19 @@ const EXCHANGES_ORDER = ["Binance", "Bybit", "Gate", "Bitget", "BingX", "OKX", "
 
 /**
  * GLOBAL PRICE CACHE
- * Структура: { "BTC": { Mexc: 100, Binance: 100.5, ... }, "ETH": { ... } }
  */
 const GLOBAL_PRICES = {};
 
-// Хелпер для безопасного обновления цены
+// Хелпер для безопасного обновления цены и нормализации тикеров
 const updatePrice = (symbol, exchange, price) => {
     if (!symbol || !price) return;
-    const s = symbol.toUpperCase().replace(/[-_]/g, '').replace('USDT', '').replace('SWAP', ''); // Нормализация к виду "BTC"
+    // Приводим все к единому виду (например, BTC)
+    const s = symbol.toUpperCase()
+        .replace(/[-_]/g, '')     // Убираем тире и подчеркивания
+        .replace('USDT', '')      // Убираем USDT
+        .replace('SWAP', '')      // Убираем SWAP (OKX)
+        .replace('M', '');        // Убираем M (Kucoin XBTUSDTM)
+        
     if (!GLOBAL_PRICES[s]) GLOBAL_PRICES[s] = {};
     GLOBAL_PRICES[s][exchange] = parseFloat(price);
 };
@@ -38,11 +43,10 @@ const safeJson = (data) => {
 };
 
 /**
- * --- GLOBAL WEBSOCKET MANAGERS ---
- * Каждая функция открывает одно соединение на ВЕСЬ рынок сразу.
+ * --- GLOBAL MONITORS (ФОНОВЫЕ ПРОЦЕССЫ) ---
  */
 
-// 1. MEXC GLOBAL
+// 1. MEXC GLOBAL (WebSocket - Global Tickers)
 const initMexcGlobal = () => {
     let ws = null;
     const connect = () => {
@@ -55,7 +59,9 @@ const initMexcGlobal = () => {
             ws.on('message', (data) => {
                 const d = safeJson(data);
                 if (!d) return;
+                // Пинг-понг
                 if (d.method === 'ping') { ws.send(JSON.stringify({ "method": "pong" })); return; }
+                // Данные
                 if (d.channel === 'push.tickers' && d.data) {
                     const items = Array.isArray(d.data) ? d.data : [d.data];
                     items.forEach(i => updatePrice(i.symbol, 'MEXC', i.lastPrice));
@@ -68,12 +74,11 @@ const initMexcGlobal = () => {
     connect();
 };
 
-// 2. BINANCE GLOBAL (All Market Mini Tickers)
+// 2. BINANCE GLOBAL (WebSocket - All Mini Tickers)
 const initBinanceGlobal = () => {
     let ws = null;
     const connect = () => {
         try {
-            // !miniTicker@arr - поток всех мини-тикеров (легче чем aggTrade)
             ws = new WebSocket('wss://fstream.binance.com/ws/!ticker@arr'); 
             ws.on('open', () => console.log('[Binance] Connected Global'));
             ws.on('message', (data) => {
@@ -89,29 +94,11 @@ const initBinanceGlobal = () => {
     connect();
 };
 
-// 3. BYBIT GLOBAL
+// 3. BYBIT GLOBAL (Polling - REST API)
 const initBybitGlobal = () => {
-    let ws = null;
-    const connect = () => {
-        try {
-            ws = new WebSocket('wss://stream.bybit.com/v5/public/linear');
-            ws.on('open', () => {
-                console.log('[Bybit] Connected Global');
-                // Bybit не дает подписаться на "ВСЁ" одной командой, нужно перечислять.
-                // Но у них есть топик "tickers" для всех. Пробуем получить топ.
-                // Хак: Bybit сложен для "всего рынка" через WS без перечисления.
-                // Для упрощения мы будем использовать их HTTP API в фоне раз в 1 сек для заполнения кэша, 
-                // так как подписка на 300+ пар через WS может упереться в лимиты сообщения.
-                // НО! Попробуем подписаться на самые популярные, если нужно.
-                // ВМЕСТО WS для Bybit Reliable Global лучше поллинг их Ticker Endpoint (очень быстрый)
-            });
-            // FALLBACK TO POLLING FOR BYBIT GLOBAL (Best practice for "All tickers" on Bybit if not filtering)
-        } catch (e) {}
-    };
-    // Bybit WebSocket All Tickers сложен в реализации (нужно разбивать на пачки).
-    // Сделаем быстрый Polling (раз в 1с), это для Bybit V5 очень эффективно.
     setInterval(async () => {
         try {
+            if (!fetch) return;
             const res = await fetch('https://api.bybit.com/v5/market/tickers?category=linear');
             const d = await res.json();
             if (d.result && d.result.list) {
@@ -121,60 +108,39 @@ const initBybitGlobal = () => {
     }, 1500);
 };
 
-// 4. GATE GLOBAL
+// 4. GATE GLOBAL (Polling - REST API)
 const initGateGlobal = () => {
-    let ws = null;
-    const connect = () => {
+    setInterval(async () => {
         try {
-            ws = new WebSocket('wss://fx-ws.gateio.ws/v4/ws/usdt');
-            ws.on('open', () => {
-                console.log('[Gate] Connected Global');
-                ws.send(JSON.stringify({ time: Date.now(), channel: "futures.tickers", event: "subscribe", payload: ["USDT"] }));
-            });
-            ws.on('message', (data) => {
-                const d = safeJson(data);
-                if (d && d.event === 'update' && d.result) {
-                    (Array.isArray(d.result) ? d.result : [d.result]).forEach(i => {
-                        updatePrice(i.contract, 'Gate', i.last);
-                    });
-                }
-            });
-            ws.on('error', () => {});
-            ws.on('close', () => setTimeout(connect, 3000));
-        } catch (e) { setTimeout(connect, 5000); }
-    };
-    connect();
+            if (!fetch) return;
+            const res = await fetch('https://api.gateio.ws/api/v4/futures/usdt/tickers');
+            const data = await res.json();
+            if (Array.isArray(data)) {
+                data.forEach(i => updatePrice(i.contract, 'Gate', i.last));
+            }
+        } catch(e) {}
+    }, 2000);
 };
 
-// 5. BITGET GLOBAL
-// Bitget WS требует подписки по одному. Используем быстрый Polling для надежности "всего рынка".
+// 5. BITGET GLOBAL (Polling - REST API)
 const initBitgetGlobal = () => {
     setInterval(async () => {
         try {
+            if (!fetch) return;
             const res = await fetch('https://api.bitget.com/api/v2/mix/market/tickers?productType=USDT-FUTURES');
             const d = await res.json();
             if (d.data) {
                 d.data.forEach(i => updatePrice(i.symbol, 'Bitget', i.lastPr));
             }
         } catch(e) {}
-    }, 2000); // Раз в 2 сек (лимиты строже)
+    }, 2000);
 };
 
-// 6. OKX GLOBAL
+// 6. OKX GLOBAL (Polling - REST API)
 const initOkxGlobal = () => {
-    let ws = null;
-    const connect = () => {
-        try {
-            ws = new WebSocket('wss://ws.okx.com:8443/ws/v5/public');
-            ws.on('open', () => {
-                console.log('[OKX] Connected Global');
-                // OKX требует перечисления. Подпишемся только на популярные или используем Polling.
-                // Для надежности берем Polling, т.к. "subscribe all" нет.
-            });
-        } catch (e) {}
-    };
     setInterval(async () => {
         try {
+            if (!fetch) return;
             const res = await fetch('https://www.okx.com/api/v5/market/tickers?instType=SWAP');
             const d = await res.json();
             if (d.data) {
@@ -186,10 +152,11 @@ const initOkxGlobal = () => {
     }, 2000);
 };
 
-// 7. BINGX GLOBAL (Polling, WS сложный для all tickers)
+// 7. BINGX GLOBAL (Polling - REST API)
 const initBingxGlobal = () => {
     setInterval(async () => {
         try {
+            if (!fetch) return;
             const res = await fetch('https://open-api.bingx.com/openApi/swap/v2/quote/ticker');
             const d = await res.json();
             if (d.data) {
@@ -199,30 +166,39 @@ const initBingxGlobal = () => {
     }, 2000);
 };
 
+// 8. KUCOIN GLOBAL (Polling - REST API)
+// Добавили в фон, чтобы не тормозить запрос клиента
+const initKucoinGlobal = () => {
+    setInterval(async () => {
+        try {
+            if (!fetch) return;
+            const res = await fetch('https://api-futures.kucoin.com/api/v1/ticker/all');
+            const d = await res.json();
+            if (d.data && Array.isArray(d.data)) {
+                d.data.forEach(i => updatePrice(i.symbol, 'Kucoin', i.price));
+            }
+        } catch(e) {}
+    }, 2500); // Чуть реже, лимиты Kucoin строгие
+};
+
 // ЗАПУСК ВСЕХ МОНИТОРОВ
 initMexcGlobal();
-initBinanceGlobal(); // WS
-initBybitGlobal();   // Polling (hybrid)
-initGateGlobal();    // WS
-initBitgetGlobal();  // Polling
-initOkxGlobal();     // Polling
-initBingxGlobal();   // Polling
+initBinanceGlobal();
+initBybitGlobal();
+initGateGlobal();
+initBitgetGlobal();
+initOkxGlobal();
+initBingxGlobal();
+initKucoinGlobal();
 
-/**
- * HTTP FALLBACKS
- */
-const CEX_HTTP_ADAPTERS = {
-    Kucoin: {
-        url: (s) => `https://api-futures.kucoin.com/api/v1/ticker?symbol=${s === 'BTC' ? 'XBT' : s}USDTM`,
-        parse: (d) => d.data?.price
-    }
-};
+// --- SERVER SETUP ---
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 app.use(express.static('public'));
 
+// Динамический импорт node-fetch
 let fetch;
 (async () => {
     fetch = (await import('node-fetch')).default;
@@ -235,6 +211,7 @@ const authMiddleware = (req, res, next) => {
     next();
 };
 
+// Mexc Utils
 const signMexc = (params) => {
     const queryString = Object.keys(params).sort().map(k => `${k}=${params[k]}`).join('&');
     return crypto.createHmac('sha256', CONFIG.MEXC.SECRET).update(queryString).digest('hex');
@@ -253,18 +230,9 @@ async function mexcPrivateRequest(path, params = {}) {
     } catch (e) { return null; }
 }
 
-async function fetchExchangePriceHttp(exchange, symbol) {
-    const adapter = CEX_HTTP_ADAPTERS[exchange];
-    if (!adapter) return 0;
-    try {
-        const res = await fetch(adapter.url(symbol));
-        const data = await res.json();
-        return parseFloat(adapter.parse(data)) || 0;
-    } catch (e) { return 0; }
-}
+// --- API ROUTES ---
 
-// --- API ENDPOINTS ---
-
+// 1. Резолвер адресов (нужен для DexScreener)
 app.get('/api/resolve', authMiddleware, async (req, res) => {
     const symbol = (req.query.symbol || '').toUpperCase();
     const data = await mexcPrivateRequest("/api/v3/capital/config/getall");
@@ -302,31 +270,25 @@ app.get('/api/resolve', authMiddleware, async (req, res) => {
     });
 });
 
+// 2. Получение всех цен
 app.get('/api/all', authMiddleware, async (req, res) => {
     const symbol = (req.query.symbol || '').toUpperCase().replace('USDT', '');
     if (!symbol) return res.json({ ok: false });
 
-    // 1. Берем данные из ГЛОБАЛЬНОГО кэша
+    // Берем данные мгновенно из ГЛОБАЛЬНОГО кэша
     const marketData = GLOBAL_PRICES[symbol] || {};
     
     const mexcPrice = marketData['MEXC'] || 0;
 
-    // 2. Kucoin (Все еще HTTP, так как там сложный WS)
-    let kucoinPrice = marketData['Kucoin'];
-    if (!kucoinPrice) {
-        kucoinPrice = await fetchExchangePriceHttp('Kucoin', symbol);
-    }
-
-    // 3. Формируем ответ
     const prices = {};
     EXCHANGES_ORDER.forEach(ex => {
-        if (ex === 'Kucoin') prices[ex] = kucoinPrice;
-        else prices[ex] = marketData[ex] || 0;
+        prices[ex] = marketData[ex] || 0;
     });
 
     res.json({ ok: true, mexc: mexcPrice, prices });
 });
 
+// 3. Главная страница (Frontend)
 app.get('/', (req, res) => {
     const initialSymbol = (req.query.symbol || '').toUpperCase();
     res.send(`
@@ -503,4 +465,4 @@ else if (!token) output.innerHTML = "<span style='color:red'>Доступ зап
 });
 
 app.listen(CONFIG.PORT, () => console.log(`🚀 Server running on port ${CONFIG.PORT}`));
-    
+                
