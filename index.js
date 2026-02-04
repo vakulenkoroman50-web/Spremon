@@ -28,7 +28,13 @@ const GLOBAL_PRICES = {};
 // Хелпер для безопасного обновления цены
 const updatePrice = (symbol, exchange, price) => {
     if (!symbol || !price) return;
-    const s = symbol.toUpperCase().replace(/[-_]/g, '').replace('USDT', '').replace('SWAP', ''); // Нормализация к виду "BTC"
+    // Нормализация к виду "BTC" (удаляем суффиксы USDT, SWAP, M и т.д.)
+    const s = symbol.toUpperCase()
+        .replace(/[-_]/g, '')
+        .replace('USDT', '')
+        .replace('SWAP', '')
+        .replace('M', ''); // KuCoin иногда шлет XBTUSDTM
+        
     if (!GLOBAL_PRICES[s]) GLOBAL_PRICES[s] = {};
     GLOBAL_PRICES[s][exchange] = parseFloat(price);
 };
@@ -39,7 +45,6 @@ const safeJson = (data) => {
 
 /**
  * --- GLOBAL WEBSOCKET MANAGERS ---
- * Каждая функция открывает одно соединение на ВЕСЬ рынок сразу.
  */
 
 // 1. MEXC GLOBAL
@@ -68,12 +73,11 @@ const initMexcGlobal = () => {
     connect();
 };
 
-// 2. BINANCE GLOBAL (All Market Mini Tickers)
+// 2. BINANCE GLOBAL
 const initBinanceGlobal = () => {
     let ws = null;
     const connect = () => {
         try {
-            // !miniTicker@arr - поток всех мини-тикеров (легче чем aggTrade)
             ws = new WebSocket('wss://fstream.binance.com/ws/!ticker@arr'); 
             ws.on('open', () => console.log('[Binance] Connected Global'));
             ws.on('message', (data) => {
@@ -89,36 +93,86 @@ const initBinanceGlobal = () => {
     connect();
 };
 
-// 3. BYBIT GLOBAL
-const initBybitGlobal = () => {
+// 3. KUCOIN GLOBAL (NEW!)
+const initKucoinGlobal = async () => {
     let ws = null;
-    const connect = () => {
+    let pingInterval = null;
+
+    const connect = async () => {
         try {
-            ws = new WebSocket('wss://stream.bybit.com/v5/public/linear');
-            ws.on('open', () => {
-                console.log('[Bybit] Connected Global');
-                // Bybit не дает подписаться на "ВСЁ" одной командой, нужно перечислять.
-                // Но у них есть топик "tickers" для всех. Пробуем получить топ.
-                // Хак: Bybit сложен для "всего рынка" через WS без перечисления.
-                // Для упрощения мы будем использовать их HTTP API в фоне раз в 1 сек для заполнения кэша, 
-                // так как подписка на 300+ пар через WS может упереться в лимиты сообщения.
-                // НО! Попробуем подписаться на самые популярные, если нужно.
-                // ВМЕСТО WS для Bybit Reliable Global лучше поллинг их Ticker Endpoint (очень быстрый)
-            });
-            // FALLBACK TO POLLING FOR BYBIT GLOBAL (Best practice for "All tickers" on Bybit if not filtering)
-        } catch (e) {}
-    };
-    // Bybit WebSocket All Tickers сложен в реализации (нужно разбивать на пачки).
-    // Сделаем быстрый Polling (раз в 1с), это для Bybit V5 очень эффективно.
-    setInterval(async () => {
-        try {
-            const res = await fetch('https://api.bybit.com/v5/market/tickers?category=linear');
-            const d = await res.json();
-            if (d.result && d.result.list) {
-                d.result.list.forEach(i => updatePrice(i.symbol, 'Bybit', i.lastPrice));
+            // 1. Получаем токен для подключения
+            // Используем fetch (он есть глобально в Node 18+)
+            const tokenRes = await fetch('https://api-futures.kucoin.com/api/v1/bullet-public', { method: 'POST' });
+            const tokenData = await tokenRes.json();
+            
+            if (!tokenData || !tokenData.data || !tokenData.data.token) {
+                console.error('[Kucoin] Failed to get token');
+                setTimeout(connect, 5000);
+                return;
             }
-        } catch(e) {}
-    }, 1500);
+
+            const token = tokenData.data.token;
+            const endpoint = tokenData.data.instanceServers[0].endpoint;
+            
+            // 2. Подключаемся
+            ws = new WebSocket(`${endpoint}?token=${token}`);
+            
+            ws.on('open', () => {
+                console.log('[Kucoin] Connected Global');
+                
+                // Запускаем Ping каждые 15 сек (KuCoin требует {type: "ping"})
+                pingInterval = setInterval(() => {
+                    if (ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({ id: Date.now(), type: 'ping' }));
+                    }
+                }, 15000);
+
+                // Подписываемся на ВСЕ пары к USDT
+                ws.send(JSON.stringify({
+                    id: Date.now(),
+                    type: 'subscribe',
+                    topic: '/contract/instrument:USDT', // Топик для всех USDT фьючерсов
+                    response: true
+                }));
+            });
+
+            ws.on('message', (data) => {
+                const d = safeJson(data);
+                if (!d) return;
+                
+                // Ответ на пинг - игнорируем
+                if (d.type === 'pong') return;
+
+                // Данные
+                if (d.type === 'message' && d.subject === 'match' && d.data) {
+                    // Топик 'match' или 'ticker' может отличаться, для instrument:USDT приходит обновление
+                    // Обычно data содержит lastTradePrice
+                     updatePrice(d.data.symbol, 'Kucoin', d.data.lastTradePrice || d.data.price);
+                }
+                
+                // Иногда KuCoin шлет данные в change
+                if (d.subject === 'ticker' && d.data) {
+                    updatePrice(d.data.symbol, 'Kucoin', d.data.price || d.data.lastPrice);
+                }
+                
+                // Для топика /contract/instrument:USDT данные выглядят как snapshot
+                if (d.data && d.data.lastTradePrice) {
+                     updatePrice(d.data.symbol, 'Kucoin', d.data.lastTradePrice);
+                }
+            });
+
+            ws.on('error', () => {});
+            ws.on('close', () => {
+                if (pingInterval) clearInterval(pingInterval);
+                setTimeout(connect, 3000);
+            });
+
+        } catch (e) { 
+            console.error('[Kucoin Error]', e);
+            setTimeout(connect, 5000); 
+        }
+    };
+    connect();
 };
 
 // 4. GATE GLOBAL
@@ -146,8 +200,20 @@ const initGateGlobal = () => {
     connect();
 };
 
-// 5. BITGET GLOBAL
-// Bitget WS требует подписки по одному. Используем быстрый Polling для надежности "всего рынка".
+// 5. BYBIT GLOBAL (Polling is more reliable for "ALL" on V5)
+const initBybitGlobal = () => {
+    setInterval(async () => {
+        try {
+            const res = await fetch('https://api.bybit.com/v5/market/tickers?category=linear');
+            const d = await res.json();
+            if (d.result && d.result.list) {
+                d.result.list.forEach(i => updatePrice(i.symbol, 'Bybit', i.lastPrice));
+            }
+        } catch(e) {}
+    }, 1500);
+};
+
+// 6. BITGET GLOBAL (Polling)
 const initBitgetGlobal = () => {
     setInterval(async () => {
         try {
@@ -157,22 +223,11 @@ const initBitgetGlobal = () => {
                 d.data.forEach(i => updatePrice(i.symbol, 'Bitget', i.lastPr));
             }
         } catch(e) {}
-    }, 2000); // Раз в 2 сек (лимиты строже)
+    }, 2000);
 };
 
-// 6. OKX GLOBAL
+// 7. OKX GLOBAL (Polling)
 const initOkxGlobal = () => {
-    let ws = null;
-    const connect = () => {
-        try {
-            ws = new WebSocket('wss://ws.okx.com:8443/ws/v5/public');
-            ws.on('open', () => {
-                console.log('[OKX] Connected Global');
-                // OKX требует перечисления. Подпишемся только на популярные или используем Polling.
-                // Для надежности берем Polling, т.к. "subscribe all" нет.
-            });
-        } catch (e) {}
-    };
     setInterval(async () => {
         try {
             const res = await fetch('https://www.okx.com/api/v5/market/tickers?instType=SWAP');
@@ -186,7 +241,7 @@ const initOkxGlobal = () => {
     }, 2000);
 };
 
-// 7. BINGX GLOBAL (Polling, WS сложный для all tickers)
+// 8. BINGX GLOBAL (Polling)
 const initBingxGlobal = () => {
     setInterval(async () => {
         try {
@@ -201,23 +256,15 @@ const initBingxGlobal = () => {
 
 // ЗАПУСК ВСЕХ МОНИТОРОВ
 initMexcGlobal();
-initBinanceGlobal(); // WS
-initBybitGlobal();   // Polling (hybrid)
-initGateGlobal();    // WS
-initBitgetGlobal();  // Polling
-initOkxGlobal();     // Polling
-initBingxGlobal();   // Polling
+initBinanceGlobal();
+initKucoinGlobal(); // <-- NEW WEBSOCKET
+initGateGlobal();
+initBybitGlobal();
+initBitgetGlobal();
+initOkxGlobal();
+initBingxGlobal();
 
-/**
- * HTTP FALLBACKS
- */
-const CEX_HTTP_ADAPTERS = {
-    Kucoin: {
-        url: (s) => `https://api-futures.kucoin.com/api/v1/ticker?symbol=${s === 'BTC' ? 'XBT' : s}USDTM`,
-        parse: (d) => d.data?.price
-    }
-};
-
+// API CONFIG
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -251,16 +298,6 @@ async function mexcPrivateRequest(path, params = {}) {
         });
         return await res.json();
     } catch (e) { return null; }
-}
-
-async function fetchExchangePriceHttp(exchange, symbol) {
-    const adapter = CEX_HTTP_ADAPTERS[exchange];
-    if (!adapter) return 0;
-    try {
-        const res = await fetch(adapter.url(symbol));
-        const data = await res.json();
-        return parseFloat(adapter.parse(data)) || 0;
-    } catch (e) { return 0; }
 }
 
 // --- API ENDPOINTS ---
@@ -306,22 +343,15 @@ app.get('/api/all', authMiddleware, async (req, res) => {
     const symbol = (req.query.symbol || '').toUpperCase().replace('USDT', '');
     if (!symbol) return res.json({ ok: false });
 
-    // 1. Берем данные из ГЛОБАЛЬНОГО кэша
+    // Берем данные из ГЛОБАЛЬНОГО кэша
     const marketData = GLOBAL_PRICES[symbol] || {};
     
     const mexcPrice = marketData['MEXC'] || 0;
 
-    // 2. Kucoin (Все еще HTTP, так как там сложный WS)
-    let kucoinPrice = marketData['Kucoin'];
-    if (!kucoinPrice) {
-        kucoinPrice = await fetchExchangePriceHttp('Kucoin', symbol);
-    }
-
-    // 3. Формируем ответ
+    // Формируем ответ
     const prices = {};
     EXCHANGES_ORDER.forEach(ex => {
-        if (ex === 'Kucoin') prices[ex] = kucoinPrice;
-        else prices[ex] = marketData[ex] || 0;
+        prices[ex] = marketData[ex] || 0;
     });
 
     res.json({ ok: true, mexc: mexcPrice, prices });
@@ -503,4 +533,4 @@ else if (!token) output.innerHTML = "<span style='color:red'>Доступ зап
 });
 
 app.listen(CONFIG.PORT, () => console.log(`🚀 Server running on port ${CONFIG.PORT}`));
-    
+                
