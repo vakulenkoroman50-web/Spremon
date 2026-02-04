@@ -1,7 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
-const WebSocket = require('ws'); // Требуется: npm install ws
+const WebSocket = require('ws');
 
 /**
  * КОНФИГУРАЦИЯ
@@ -21,25 +21,22 @@ const EXCHANGES_ORDER = ["Binance", "Bybit", "Gate", "Bitget", "BingX", "OKX", "
 
 /**
  * WEBSOCKET MANAGER
- * Управляет соединениями с биржами.
- * Если пользователь меняет символ, старые сокеты закрываются, новые открываются.
  */
 let activeSymbol = null;
 let priceCache = {};
 let activeSockets = [];
 
-// Сброс кэша для конкретной биржи или всего сразу
+// Сброс кэша
 const resetCache = (exchange = null) => {
     if (exchange) priceCache[exchange] = 0;
     else EXCHANGES_ORDER.forEach(ex => priceCache[ex] = 0);
 };
 
-// Функция безопасного парсинга JSON
 const safeJson = (data) => {
     try { return JSON.parse(data); } catch (e) { return null; }
 };
 
-// Генераторы подключений для каждой биржи
+// Генераторы подключений
 const WS_CONNECTORS = {
     Binance: (symbol) => {
         const ws = new WebSocket(`wss://fstream.binance.com/ws/${symbol.toLowerCase()}usdt@aggTrade`);
@@ -104,8 +101,6 @@ const WS_CONNECTORS = {
             }));
         });
         ws.on('message', (data) => {
-            // BingX использует GZIP иногда, но на простых стримах часто plaintext JSON
-            // Если приходят кракозябры, нужен zlib, но обычно ticker идет текстом или JSON
             const d = safeJson(data);
             if (d && d.data && d.data.c) priceCache['BingX'] = parseFloat(d.data.c);
         });
@@ -125,24 +120,46 @@ const WS_CONNECTORS = {
         });
         return ws;
     },
-    // Kucoin сложен для WS без токена, оставляем на HTTP Fallback
     Kucoin: null 
 };
 
-// Специальный WS для MEXC (основная биржа)
+// Специальный WS для MEXC
 let mexcWs = null;
 const startMexcWs = (symbol) => {
-    if (mexcWs) mexcWs.terminate();
-    mexcWs = new WebSocket('wss://contract.mexc.com/edge');
-    mexcWs.on('open', () => {
-        mexcWs.send(JSON.stringify({ "method": "sub.ticker", "params": { "symbol": `${symbol}_USDT` } }));
-    });
-    mexcWs.on('message', (data) => {
-        const d = safeJson(data);
-        if (d && d.channel === 'push.ticker' && d.data) {
-            priceCache['MEXC'] = parseFloat(d.data.lastPrice);
+    // БЕЗОПАСНОЕ ЗАКРЫТИЕ СТАРОГО СОКЕТА
+    if (mexcWs) {
+        try {
+            mexcWs.removeAllListeners(); // Убираем слушатели, чтобы не стреляли ошибки при закрытии
+            mexcWs.terminate();
+        } catch (e) {
+            console.error('[WS Error] Failed to terminate MEXC ws:', e.message);
         }
-    });
+    }
+
+    try {
+        mexcWs = new WebSocket('wss://contract.mexc.com/edge');
+        
+        // ВАЖНО: Обработчик ошибок должен быть навешен сразу
+        mexcWs.on('error', (err) => {
+            // Просто логируем, не роняем сервер
+            // console.error('[WS Error] MEXC socket error:', err.message); 
+        });
+
+        mexcWs.on('open', () => {
+            try {
+                mexcWs.send(JSON.stringify({ "method": "sub.ticker", "params": { "symbol": `${symbol}_USDT` } }));
+            } catch(e) {}
+        });
+
+        mexcWs.on('message', (data) => {
+            const d = safeJson(data);
+            if (d && d.channel === 'push.ticker' && d.data) {
+                priceCache['MEXC'] = parseFloat(d.data.lastPrice);
+            }
+        });
+    } catch (e) {
+        console.error('Error creating MEXC socket:', e);
+    }
 };
 
 const switchSubscription = (newSymbol) => {
@@ -150,14 +167,17 @@ const switchSubscription = (newSymbol) => {
     
     console.log(`[WS] Switching symbol: ${activeSymbol} -> ${newSymbol}`);
     
-    // Закрываем старые
+    // Безопасное закрытие всех старых сокетов
     activeSockets.forEach(ws => {
-        try { ws.terminate(); } catch(e){}
+        try {
+            ws.removeAllListeners(); // Предотвращает ошибки при terminate
+            ws.terminate();
+        } catch(e){}
     });
     activeSockets = [];
     
     activeSymbol = newSymbol;
-    resetCache(); // Обнуляем цены перед новыми данными
+    resetCache(); 
 
     // Запускаем новые
     Object.keys(WS_CONNECTORS).forEach(ex => {
@@ -165,7 +185,10 @@ const switchSubscription = (newSymbol) => {
         if (connector) {
             try {
                 const ws = connector(newSymbol);
-                ws.on('error', () => {}); // Игнорируем ошибки соединения
+                // ВАЖНО: Глобальный перехват ошибок сокета
+                ws.on('error', (err) => {
+                    // console.error(`[WS Error] ${ex}:`, err.message);
+                });
                 activeSockets.push(ws);
             } catch (e) {
                 console.error(`Error connecting to ${ex}`, e);
@@ -173,20 +196,17 @@ const switchSubscription = (newSymbol) => {
         }
     });
 
-    // Отдельно MEXC
     startMexcWs(newSymbol);
 };
 
 /**
- * АДАПТЕРЫ БИРЖ (HTTP FALLBACK)
- * Используются для Kucoin и для первого "холодного" старта
+ * HTTP ADAPTERS
  */
 const CEX_HTTP_ADAPTERS = {
     Kucoin: {
         url: (s) => `https://api-futures.kucoin.com/api/v1/ticker?symbol=${s === 'BTC' ? 'XBT' : s}USDTM`,
         parse: (d) => d.data?.price
-    },
-    // Для остальных бирж HTTP не нужен, но можно оставить для отладки
+    }
 };
 
 const app = express();
@@ -194,15 +214,11 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static('public'));
 
-// Глобальный fetch
 let fetch;
 (async () => {
     fetch = (await import('node-fetch')).default;
 })();
 
-/**
- * MIDDLEWARE
- */
 const authMiddleware = (req, res, next) => {
     if (req.query.token !== CONFIG.SECRET_TOKEN) {
         return res.status(403).json({ ok: false, msg: "AUTH_ERR" });
@@ -210,9 +226,6 @@ const authMiddleware = (req, res, next) => {
     next();
 };
 
-/**
- * УТИЛИТЫ MEXC API
- */
 const signMexc = (params) => {
     const queryString = Object.keys(params).sort().map(k => `${k}=${params[k]}`).join('&');
     return crypto.createHmac('sha256', CONFIG.MEXC.SECRET).update(queryString).digest('hex');
@@ -241,7 +254,6 @@ async function getMexcPriceHttp(symbol) {
 
 async function fetchExchangePriceHttp(exchange, symbol) {
     const adapter = CEX_HTTP_ADAPTERS[exchange];
-    // Если нет HTTP адаптера (значит используем только WS), возвращаем 0
     if (!adapter) return 0;
     try {
         const res = await fetch(adapter.url(symbol));
@@ -250,9 +262,6 @@ async function fetchExchangePriceHttp(exchange, symbol) {
     } catch (e) { return 0; }
 }
 
-/**
- * ЭНДПОИНТЫ API
- */
 app.get('/api/resolve', authMiddleware, async (req, res) => {
     const symbol = (req.query.symbol || '').toUpperCase();
     const data = await mexcPrivateRequest("/api/v3/capital/config/getall");
@@ -294,13 +303,8 @@ app.get('/api/all', authMiddleware, async (req, res) => {
     const symbol = (req.query.symbol || '').toUpperCase();
     if (!symbol) return res.json({ ok: false });
 
-    // 1. Управление подписками
-    // Если запрошен новый символ, переключаем вебсокеты
     if (symbol !== activeSymbol) {
         switchSubscription(symbol);
-        
-        // "Холодный старт": пока сокеты подключаются, сделаем один HTTP запрос для MEXC и Kucoin
-        // чтобы пользователь не ждал нулей
         const [mexcHttp, kucoinHttp] = await Promise.all([
             getMexcPriceHttp(symbol),
             fetchExchangePriceHttp('Kucoin', symbol)
@@ -309,13 +313,9 @@ app.get('/api/all', authMiddleware, async (req, res) => {
         if(kucoinHttp) priceCache['Kucoin'] = kucoinHttp;
     }
 
-    // 2. Kucoin всегда опрашиваем по HTTP (нет простого WS)
-    // Делаем это асинхронно, не блокируя ответ, если в кэше уже что-то есть
-    // Но для точности лучше дождаться
     const kucoinPrice = await fetchExchangePriceHttp('Kucoin', symbol);
     if (kucoinPrice) priceCache['Kucoin'] = kucoinPrice;
 
-    // 3. Формируем ответ из кэша (который наполняется вебсокетами в фоне)
     const prices = {};
     EXCHANGES_ORDER.forEach((ex) => { 
         prices[ex] = priceCache[ex] || 0; 
@@ -324,9 +324,6 @@ app.get('/api/all', authMiddleware, async (req, res) => {
     res.json({ ok: true, mexc: priceCache['MEXC'] || 0, prices });
 });
 
-/**
- * ГЛАВНАЯ СТРАНИЦА (ФРОНТЕНД)
- */
 app.get('/', (req, res) => {
     const initialSymbol = (req.query.symbol || '').toUpperCase();
     res.send(`
@@ -338,63 +335,30 @@ app.get('/', (req, res) => {
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body { background: #000; font-family: monospace; font-size: 28px; color: #fff; padding: 10px; overflow: hidden; }
-
-/* Основной контейнер вывода */
 #output { white-space: pre; line-height: 1.1; min-height: 280px; position: relative; }
-
 .control-row { display: flex; gap: 5px; margin-top: 0; }
 #symbolInput { font-family: monospace; font-size: 28px; width: 100%; max-width: 280px; background: #000; color: #fff; border: 1px solid #444; }
 #startBtn { font-family: monospace; font-size: 28px; background: #222; color: #fff; border: 1px solid #444; cursor: pointer; padding: 0 10px; }
 #mexcBtn { font-family: monospace; font-size: 28px; background: #222; color: #fff; border: 1px solid #444; cursor: pointer; padding: 0 10px; }
 #dexLink { font-family: monospace; font-size: 16px; width: 100%; background: #111; color: #888; border: 1px solid #333; padding: 5px; cursor: pointer; margin-top: 5px; }
-
 .dex-row { color: #00ff00; }
 .best { color: #ffff00; }
 .closed { color: #ff0000 !important; }
 .blink-dot { animation: blink 1s infinite; display: inline-block; }
 @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
-
-/* STYLES FOR URL INPUT (INJECTED) */
-.url-search-container {
-    display: flex;
-    gap: 5px;
-    align-items: center;
-    font-family: Arial, sans-serif; /* Как в исходнике */
-    margin-top: 20px;
-}
-#urlInput {
-    width: 46%;
-    padding: 10px;
-    font-size: 36px;
-    background-color: #222;
-    color: #fff;
-    border: 1px solid #444;
-    outline: none;
-    font-family: Arial, sans-serif;
-}
-#goBtn {
-    padding: 10px 20px;
-    font-size: 36px;
-    cursor: pointer;
-    background-color: #333;
-    color: #fff;
-    border: 1px solid #555;
-    font-family: Arial, sans-serif;
-}
-#goBtn:hover {
-    background-color: #888;
-}
+.url-search-container { display: flex; gap: 5px; align-items: center; font-family: Arial, sans-serif; margin-top: 20px; }
+#urlInput { width: 46%; padding: 10px; font-size: 36px; background-color: #222; color: #fff; border: 1px solid #444; outline: none; font-family: Arial, sans-serif; }
+#goBtn { padding: 10px 20px; font-size: 36px; cursor: pointer; background-color: #333; color: #fff; border: 1px solid #555; font-family: Arial, sans-serif; }
+#goBtn:hover { background-color: #888; }
 </style>
 </head>
 <body>
-
 <div id="output">
     <div class="url-search-container">
         <input type="text" id="urlInput" placeholder="Введите URL или поиск">
         <button id="goBtn" onclick="go()">Go</button>
     </div>
 </div>
-
 <div class="control-row">  
     <input id="symbolInput" value="${initialSymbol}" placeholder="TICKER OR LINK" autocomplete="off" onfocus="this.select()" />  
     <button id="startBtn">СТАРТ</button>  
@@ -402,7 +366,6 @@ body { background: #000; font-family: monospace; font-size: 28px; color: #fff; p
 </div>  
 <input id="dexLink" readonly placeholder="DEX URL" onclick="this.select(); document.execCommand('copy');" />  
 <div id="status" style="font-size: 18px; margin-top: 5px; color: #444;"></div>  
-
 <script>  
 const exchangesOrder = ["Binance", "Bybit", "Gate", "Bitget", "BingX", "OKX", "Kucoin"];  
 let urlParams = new URLSearchParams(window.location.search);  
@@ -412,46 +375,28 @@ let chain = urlParams.get('chain');
 let addr = urlParams.get('addr');  
 let depositOpen = true;   
 let timer = null, blink = false;  
-
 const output = document.getElementById("output");  
 const input = document.getElementById("symbolInput");  
 const dexLink = document.getElementById("dexLink");  
 const statusEl = document.getElementById("status");  
-
-// --- LOGIC FOR URL INPUT ---
 const urlInput = document.getElementById("urlInput");
 if(urlInput) {
-    urlInput.addEventListener("keydown", function(event) {
-        if (event.key === "Enter") {
-            go();
-        }
-    });
+    urlInput.addEventListener("keydown", function(event) { if (event.key === "Enter") go(); });
 }
-
 function go() {
     let query = urlInput.value.trim();
     if (!query) return;
-
-    const isUrl = query.startsWith("http://") || 
-                  query.startsWith("https://") || 
-                  (query.includes(".") && !query.includes(" "));
-    
+    const isUrl = query.startsWith("http://") || query.startsWith("https://") || (query.includes(".") && !query.includes(" "));
     let targetUrl;
     if (isUrl) {
         targetUrl = query;
-        if (!targetUrl.startsWith("http://") && !targetUrl.startsWith("https://")) {
-            targetUrl = "https://" + targetUrl;
-        }
+        if (!targetUrl.startsWith("http://") && !targetUrl.startsWith("https://")) targetUrl = "https://" + targetUrl;
     } else {
         targetUrl = "https://www.google.com/search?q=" + encodeURIComponent(query);
     }
-    // Открываем в новом окне
     window.open(targetUrl, '_blank');
 }
-// ---------------------------
-
 function formatP(p) { return (p && p != 0) ? parseFloat(p).toString() : "0"; }  
-
 async function update() {  
     if (!symbol) return;  
     let dexPrice = 0;  
@@ -466,7 +411,6 @@ async function update() {
             }  
         } catch(e) {}  
     }  
-
     blink = !blink;  
     try {  
         const res = await fetch('/api/all?symbol=' + symbol + '&token=' + token);  
@@ -477,16 +421,13 @@ async function update() {
         }  
         const data = await res.json();  
         if(!data.ok) return;  
-
         let dotColorClass = depositOpen ? '' : 'closed';  
         let dot = blink ? '<span class="blink-dot '+dotColorClass+'">●</span>' : '○';  
-          
         let lines = [dot + ' ' + symbol + ' MEXC: ' + formatP(data.mexc)];  
         if (dexPrice > 0) {  
             let diff = ((dexPrice - data.mexc) / data.mexc * 100).toFixed(2);  
             lines.push('<span class="dex-row">◇ DEX     : ' + formatP(dexPrice) + ' (' + (diff > 0 ? "+" : "") + diff + '%)</span>');  
         }  
-
         let bestEx = null, maxSp = 0;  
         exchangesOrder.forEach(ex => {  
             let p = data.prices[ex];  
@@ -495,7 +436,6 @@ async function update() {
                 if (sp > maxSp) { maxSp = sp; bestEx = ex; }  
             }  
         });  
-
         exchangesOrder.forEach(ex => {  
             let p = data.prices[ex];  
             if (p > 0) {  
@@ -509,19 +449,12 @@ async function update() {
         statusEl.textContent = "Last: " + new Date().toLocaleTimeString();  
     } catch(e) {}  
 }  
-
 async function start() {  
     let val = input.value.trim();  
     if(!val) return;  
-    if (!token) {  
-        output.innerHTML = "<span style='color:red'>Доступ запрещён!</span>";  
-        return;  
-    }  
+    if (!token) { output.innerHTML = "<span style='color:red'>Доступ запрещён!</span>"; return; }  
     if(timer) clearInterval(timer);  
-    
-    // Здесь мы перезаписываем содержимое output, удаляя поле URL
     output.innerHTML = "Поиск...";  
-      
     if (val.includes("dexscreener.com")) {  
         try {  
             const parts = val.split('/');  
@@ -535,47 +468,29 @@ async function start() {
                 dexLink.value = dsData.pair.url;  
             }  
         } catch(e) { output.innerHTML = "Ошибка ссылки!"; return; }  
-    } else {  
-        symbol = val.toUpperCase();  
-    }  
-
+    } else { symbol = val.toUpperCase(); }  
     try {  
         const res = await fetch('/api/resolve?symbol=' + symbol + '&token=' + token);  
-        if (res.status === 403) {  
-            output.innerHTML = "<span style='color:red'>Доступ запрещён!</span>";  
-            return;  
-        }  
+        if (res.status === 403) { output.innerHTML = "<span style='color:red'>Доступ запрещён!</span>"; return; }  
         const d = await res.json();  
         if (d.ok) {   
-            chain = d.chain;   
-            addr = d.addr;   
-            dexLink.value = d.url || '';   
-            depositOpen = d.depositOpen;   
-        } else {  
-            depositOpen = true;  
-        }  
+            chain = d.chain; addr = d.addr; dexLink.value = d.url || ''; depositOpen = d.depositOpen;   
+        } else { depositOpen = true; }  
     } catch(e) {}  
-      
     const url = new URL(window.location);  
     url.searchParams.set('symbol', symbol);  
     if(chain) url.searchParams.set('chain', chain);  
     if(addr) url.searchParams.set('addr', addr);  
     window.history.replaceState({}, '', url);  
-      
     update();  
     timer = setInterval(update, 1000);  
 }  
-
 document.getElementById("startBtn").onclick = start;  
 document.getElementById("mexcBtn").onclick = function() {
     let val = input.value.trim().toUpperCase();
-    if(val) {
-        window.location.href = "mxcappscheme://kline?extra_page_name=其他&trade_pair=" + val + "_USDT&contract=1";
-    }
+    if(val) window.location.href = "mxcappscheme://kline?extra_page_name=其他&trade_pair=" + val + "_USDT&contract=1";
 };
-
 input.addEventListener("keypress", (e) => { if(e.key === "Enter") start(); });  
-
 if (urlParams.get('symbol')) start();  
 else if (!token) output.innerHTML = "<span style='color:red'>Доступ запрещён!</span>";  
 </script>  
@@ -585,4 +500,4 @@ else if (!token) output.innerHTML = "<span style='color:red'>Доступ зап
 });
 
 app.listen(CONFIG.PORT, () => console.log(`🚀 Server running on port ${CONFIG.PORT}`));
-                    
+                
