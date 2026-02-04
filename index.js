@@ -24,15 +24,15 @@ const EXCHANGES_ORDER = ["Binance", "Bybit", "Gate", "Bitget", "BingX", "OKX", "
  */
 const GLOBAL_PRICES = {};
 
-// Хелпер для безопасного обновления цены и нормализации тикеров
+// Хелпер для безопасного обновления цены
 const updatePrice = (symbol, exchange, price) => {
     if (!symbol || !price) return;
-    // Приводим все к единому виду (например, BTC)
+    // Приводим все к единому виду (BTC)
     const s = symbol.toUpperCase()
         .replace(/[-_]/g, '')     // Убираем тире и подчеркивания
         .replace('USDT', '')      // Убираем USDT
         .replace('SWAP', '')      // Убираем SWAP (OKX)
-        .replace('M', '');        // Убираем M (Kucoin XBTUSDTM)
+        .replace('M', '');        // Убираем M (Kucoin XBTUSDTM -> XBTUSDT)
         
     if (!GLOBAL_PRICES[s]) GLOBAL_PRICES[s] = {};
     GLOBAL_PRICES[s][exchange] = parseFloat(price);
@@ -43,10 +43,10 @@ const safeJson = (data) => {
 };
 
 /**
- * --- GLOBAL MONITORS (ФОНОВЫЕ ПРОЦЕССЫ) ---
+ * --- GLOBAL MONITORS ---
  */
 
-// 1. MEXC GLOBAL (WebSocket - Global Tickers)
+// 1. MEXC GLOBAL
 const initMexcGlobal = () => {
     let ws = null;
     const connect = () => {
@@ -59,9 +59,7 @@ const initMexcGlobal = () => {
             ws.on('message', (data) => {
                 const d = safeJson(data);
                 if (!d) return;
-                // Пинг-понг
                 if (d.method === 'ping') { ws.send(JSON.stringify({ "method": "pong" })); return; }
-                // Данные
                 if (d.channel === 'push.tickers' && d.data) {
                     const items = Array.isArray(d.data) ? d.data : [d.data];
                     items.forEach(i => updatePrice(i.symbol, 'MEXC', i.lastPrice));
@@ -74,7 +72,7 @@ const initMexcGlobal = () => {
     connect();
 };
 
-// 2. BINANCE GLOBAL (WebSocket - All Mini Tickers)
+// 2. BINANCE GLOBAL
 const initBinanceGlobal = () => {
     let ws = null;
     const connect = () => {
@@ -94,7 +92,7 @@ const initBinanceGlobal = () => {
     connect();
 };
 
-// 3. BYBIT GLOBAL (Polling - REST API)
+// 3. BYBIT GLOBAL
 const initBybitGlobal = () => {
     setInterval(async () => {
         try {
@@ -108,7 +106,7 @@ const initBybitGlobal = () => {
     }, 1500);
 };
 
-// 4. GATE GLOBAL (Polling - REST API)
+// 4. GATE GLOBAL
 const initGateGlobal = () => {
     setInterval(async () => {
         try {
@@ -122,7 +120,7 @@ const initGateGlobal = () => {
     }, 2000);
 };
 
-// 5. BITGET GLOBAL (Polling - REST API)
+// 5. BITGET GLOBAL
 const initBitgetGlobal = () => {
     setInterval(async () => {
         try {
@@ -136,7 +134,7 @@ const initBitgetGlobal = () => {
     }, 2000);
 };
 
-// 6. OKX GLOBAL (Polling - REST API)
+// 6. OKX GLOBAL
 const initOkxGlobal = () => {
     setInterval(async () => {
         try {
@@ -152,7 +150,7 @@ const initOkxGlobal = () => {
     }, 2000);
 };
 
-// 7. BINGX GLOBAL (Polling - REST API)
+// 7. BINGX GLOBAL
 const initBingxGlobal = () => {
     setInterval(async () => {
         try {
@@ -166,19 +164,24 @@ const initBingxGlobal = () => {
     }, 2000);
 };
 
-// 8. KUCOIN GLOBAL (Polling - REST API)
-// Добавили в фон, чтобы не тормозить запрос клиента
+// 8. KUCOIN GLOBAL (ИСПРАВЛЕНО)
 const initKucoinGlobal = () => {
     setInterval(async () => {
         try {
             if (!fetch) return;
-            const res = await fetch('https://api-futures.kucoin.com/api/v1/ticker/all');
+            // Правильный эндпоинт для всех тикеров фьючерсов
+            const res = await fetch('https://api-futures.kucoin.com/api/v1/allTickers');
             const d = await res.json();
             if (d.data && Array.isArray(d.data)) {
-                d.data.forEach(i => updatePrice(i.symbol, 'Kucoin', i.price));
+                d.data.forEach(i => {
+                    let sym = i.symbol;
+                    // Исправляем XBT на BTC для Кукоина
+                    if (sym.startsWith('XBT')) sym = sym.replace('XBT', 'BTC');
+                    updatePrice(sym, 'Kucoin', i.price);
+                });
             }
         } catch(e) {}
-    }, 2500); // Чуть реже, лимиты Kucoin строгие
+    }, 2000);
 };
 
 // ЗАПУСК ВСЕХ МОНИТОРОВ
@@ -198,7 +201,6 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static('public'));
 
-// Динамический импорт node-fetch
 let fetch;
 (async () => {
     fetch = (await import('node-fetch')).default;
@@ -211,7 +213,6 @@ const authMiddleware = (req, res, next) => {
     next();
 };
 
-// Mexc Utils
 const signMexc = (params) => {
     const queryString = Object.keys(params).sort().map(k => `${k}=${params[k]}`).join('&');
     return crypto.createHmac('sha256', CONFIG.MEXC.SECRET).update(queryString).digest('hex');
@@ -232,7 +233,6 @@ async function mexcPrivateRequest(path, params = {}) {
 
 // --- API ROUTES ---
 
-// 1. Резолвер адресов (нужен для DexScreener)
 app.get('/api/resolve', authMiddleware, async (req, res) => {
     const symbol = (req.query.symbol || '').toUpperCase();
     const data = await mexcPrivateRequest("/api/v3/capital/config/getall");
@@ -270,14 +270,11 @@ app.get('/api/resolve', authMiddleware, async (req, res) => {
     });
 });
 
-// 2. Получение всех цен
 app.get('/api/all', authMiddleware, async (req, res) => {
     const symbol = (req.query.symbol || '').toUpperCase().replace('USDT', '');
     if (!symbol) return res.json({ ok: false });
 
-    // Берем данные мгновенно из ГЛОБАЛЬНОГО кэша
     const marketData = GLOBAL_PRICES[symbol] || {};
-    
     const mexcPrice = marketData['MEXC'] || 0;
 
     const prices = {};
@@ -288,7 +285,6 @@ app.get('/api/all', authMiddleware, async (req, res) => {
     res.json({ ok: true, mexc: mexcPrice, prices });
 });
 
-// 3. Главная страница (Frontend)
 app.get('/', (req, res) => {
     const initialSymbol = (req.query.symbol || '').toUpperCase();
     res.send(`
@@ -465,4 +461,3 @@ else if (!token) output.innerHTML = "<span style='color:red'>Доступ зап
 });
 
 app.listen(CONFIG.PORT, () => console.log(`🚀 Server running on port ${CONFIG.PORT}`));
-                
