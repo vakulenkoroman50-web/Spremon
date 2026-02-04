@@ -20,23 +20,87 @@ const CONFIG = {
 const EXCHANGES_ORDER = ["Binance", "Bybit", "Gate", "Bitget", "BingX", "OKX", "Kucoin"];
 
 /**
- * WEBSOCKET MANAGER
+ * ГЛОБАЛЬНОЕ ХРАНИЛИЩЕ
  */
 let activeSymbol = null;
-let priceCache = {};
+let priceCache = {}; // Кэш для остальных бирж (текущая монета)
 let activeSockets = [];
 
-// Сброс кэша
-const resetCache = (exchange = null) => {
-    if (exchange) priceCache[exchange] = 0;
-    else EXCHANGES_ORDER.forEach(ex => priceCache[ex] = 0);
+// ГЛОБАЛЬНЫЙ КЭШ MEXC (Хранит цены ВСЕХ монет сразу, как в Python скрипте)
+let mexcGlobalPrices = {}; 
+
+const resetCache = () => {
+    EXCHANGES_ORDER.forEach(ex => priceCache[ex] = 0);
 };
 
 const safeJson = (data) => {
     try { return JSON.parse(data); } catch (e) { return null; }
 };
 
-// Генераторы подключений
+/**
+ * MEXC GLOBAL WEBSOCKET (Архитектура из Python скрипта)
+ * Подписывается один раз на sub.tickers и держит соединение вечно.
+ */
+let mexcWs = null;
+const initMexcGlobalWs = () => {
+    try {
+        if (mexcWs) {
+            try { mexcWs.terminate(); } catch (e) {}
+        }
+
+        console.log('[MEXC GLOBAL] Connecting...');
+        mexcWs = new WebSocket('wss://contract.mexc.com/edge');
+
+        mexcWs.on('open', () => {
+            console.log('[MEXC GLOBAL] Connected. Subscribing to ALL tickers...');
+            // ВАЖНО: Используем sub.tickers (все рынки), а не sub.ticker
+            mexcWs.send(JSON.stringify({ "method": "sub.tickers", "param": {} }));
+        });
+
+        mexcWs.on('message', (data) => {
+            const d = safeJson(data);
+            if (!d) return;
+
+            // 1. Обработка PING от сервера (как в Python: if method == 'ping' -> pong)
+            if (d.method === 'ping') {
+                mexcWs.send(JSON.stringify({ "method": "pong" }));
+                return;
+            }
+
+            // 2. Обработка данных (push.tickers приходит списком)
+            if (d.channel === 'push.tickers' && d.data) {
+                // d.data может быть массивом или объектом, проверяем
+                const items = Array.isArray(d.data) ? d.data : [d.data];
+                
+                items.forEach(item => {
+                    if (item.symbol && item.lastPrice) {
+                        // Сохраняем в глобальный объект: "BTC_USDT" -> 95000
+                        mexcGlobalPrices[item.symbol] = parseFloat(item.lastPrice);
+                    }
+                });
+            }
+        });
+
+        mexcWs.on('error', (err) => console.error('[MEXC GLOBAL Error]', err.message));
+        
+        mexcWs.on('close', () => {
+            console.log('[MEXC GLOBAL] Connection closed. Reconnecting in 3s...');
+            setTimeout(initMexcGlobalWs, 3000);
+        });
+
+    } catch (e) {
+        console.error('[MEXC CRITICAL]', e);
+        setTimeout(initMexcGlobalWs, 5000);
+    }
+};
+
+// Запускаем MEXC сразу при старте сервера
+initMexcGlobalWs();
+
+
+/**
+ * WEBSOCKETS ДЛЯ ОСТАЛЬНЫХ БИРЖ (Точечные подписки)
+ */
 const WS_CONNECTORS = {
     Binance: (symbol) => {
         const ws = new WebSocket(`wss://fstream.binance.com/ws/${symbol.toLowerCase()}usdt@aggTrade`);
@@ -55,6 +119,11 @@ const WS_CONNECTORS = {
             const d = safeJson(data);
             if (d && d.topic && d.data && d.data[0]) priceCache['Bybit'] = parseFloat(d.data[0].p);
         });
+        // Bybit требует пинг каждые 20 сек
+        const pingInt = setInterval(() => {
+            if(ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({"op":"ping"}));
+        }, 20000);
+        ws.on('close', () => clearInterval(pingInt));
         return ws;
     },
     Gate: (symbol) => {
@@ -123,57 +192,13 @@ const WS_CONNECTORS = {
     Kucoin: null 
 };
 
-// Специальный WS для MEXC
-let mexcWs = null;
-
-const startMexcWs = (symbol) => {
-    // БЕЗОПАСНОЕ ЗАКРЫТИЕ СТАРОГО СОКЕТА
-    if (mexcWs) {
-        try {
-            // ВАЖНО: Не делаем removeAllListeners, иначе ошибка при terminate крашнет сервер
-            // Вместо этого вешаем пустой обработчик, чтобы проглотить ошибку закрытия
-            mexcWs.on('error', () => {}); 
-            mexcWs.terminate();
-        } catch (e) {
-            console.error('[WS Error] Failed to terminate MEXC ws:', e.message);
-        }
-    }
-
-    try {
-        mexcWs = new WebSocket('wss://contract.mexc.com/edge');
-        
-        // ВАЖНО: Обработчик ошибок должен быть навешен сразу
-        mexcWs.on('error', (err) => {
-            // console.error('[WS Error] MEXC socket error:', err.message); 
-        });
-
-        mexcWs.on('open', () => {
-            try {
-                mexcWs.send(JSON.stringify({ "method": "sub.ticker", "params": { "symbol": `${symbol}_USDT` } }));
-            } catch(e) {}
-        });
-
-        mexcWs.on('message', (data) => {
-            const d = safeJson(data);
-            if (d && d.channel === 'push.ticker' && d.data) {
-                priceCache['MEXC'] = parseFloat(d.data.lastPrice);
-            }
-        });
-    } catch (e) {
-        console.error('Error creating MEXC socket:', e);
-    }
-};
-
 const switchSubscription = (newSymbol) => {
     if (!newSymbol || newSymbol === activeSymbol) return;
     
-    console.log(`[WS] Switching symbol: ${activeSymbol} -> ${newSymbol}`);
+    console.log(`[WS] Switching ALTS symbol: ${activeSymbol} -> ${newSymbol}`);
     
-    // Безопасное закрытие всех старых сокетов
     activeSockets.forEach(ws => {
         try {
-            // КРИТИЧЕСКИЙ FIX: Не удаляем слушателей. Добавляем глушилку ошибок и закрываем.
-            // Если сокет в статусе CONNECTING, terminate вызовет ошибку, которую поймает эта глушилка.
             ws.on('error', () => {}); 
             ws.terminate();
         } catch(e){}
@@ -183,28 +208,23 @@ const switchSubscription = (newSymbol) => {
     activeSymbol = newSymbol;
     resetCache(); 
 
-    // Запускаем новые
     Object.keys(WS_CONNECTORS).forEach(ex => {
         const connector = WS_CONNECTORS[ex];
         if (connector) {
             try {
                 const ws = connector(newSymbol);
-                // ВАЖНО: Глобальный перехват ошибок сокета
-                ws.on('error', (err) => {
-                    // console.error(`[WS Error] ${ex}:`, err.message);
-                });
+                ws.on('error', () => {});
                 activeSockets.push(ws);
             } catch (e) {
                 console.error(`Error connecting to ${ex}`, e);
             }
         }
     });
-
-    startMexcWs(newSymbol);
+    // MEXC здесь не трогаем, он работает глобально
 };
 
 /**
- * HTTP ADAPTERS
+ * HTTP FALLBACKS
  */
 const CEX_HTTP_ADAPTERS = {
     Kucoin: {
@@ -230,11 +250,11 @@ const authMiddleware = (req, res, next) => {
     next();
 };
 
+// ... MEXC Signature utilities (оставляем для /api/resolve) ...
 const signMexc = (params) => {
     const queryString = Object.keys(params).sort().map(k => `${k}=${params[k]}`).join('&');
     return crypto.createHmac('sha256', CONFIG.MEXC.SECRET).update(queryString).digest('hex');
 };
-
 async function mexcPrivateRequest(path, params = {}) {
     if (!CONFIG.MEXC.KEY || !CONFIG.MEXC.SECRET) return null;
     try {
@@ -247,15 +267,6 @@ async function mexcPrivateRequest(path, params = {}) {
         return await res.json();
     } catch (e) { return null; }
 }
-
-async function getMexcPriceHttp(symbol) {
-    try {
-        const res = await fetch(`${CONFIG.MEXC.FUTURES_URL}/api/v1/contract/ticker?symbol=${symbol}_USDT`);
-        const d = await res.json();
-        return parseFloat(d.data?.lastPrice) || 0;
-    } catch (e) { return 0; }
-}
-
 async function fetchExchangePriceHttp(exchange, symbol) {
     const adapter = CEX_HTTP_ADAPTERS[exchange];
     if (!adapter) return 0;
@@ -265,6 +276,8 @@ async function fetchExchangePriceHttp(exchange, symbol) {
         return parseFloat(adapter.parse(data)) || 0;
     } catch (e) { return 0; }
 }
+
+// --- API ENDPOINTS ---
 
 app.get('/api/resolve', authMiddleware, async (req, res) => {
     const symbol = (req.query.symbol || '').toUpperCase();
@@ -307,25 +320,27 @@ app.get('/api/all', authMiddleware, async (req, res) => {
     const symbol = (req.query.symbol || '').toUpperCase();
     if (!symbol) return res.json({ ok: false });
 
+    // 1. Если символ сменился, переключаем подписку на остальных биржах
     if (symbol !== activeSymbol) {
         switchSubscription(symbol);
-        const [mexcHttp, kucoinHttp] = await Promise.all([
-            getMexcPriceHttp(symbol),
-            fetchExchangePriceHttp('Kucoin', symbol)
-        ]);
-        priceCache['MEXC'] = mexcHttp;
-        if(kucoinHttp) priceCache['Kucoin'] = kucoinHttp;
     }
 
+    // 2. Kucoin (HTTP)
     const kucoinPrice = await fetchExchangePriceHttp('Kucoin', symbol);
     if (kucoinPrice) priceCache['Kucoin'] = kucoinPrice;
 
+    // 3. Собираем цены
     const prices = {};
     EXCHANGES_ORDER.forEach((ex) => { 
         prices[ex] = priceCache[ex] || 0; 
     });
 
-    res.json({ ok: true, mexc: priceCache['MEXC'] || 0, prices });
+    // 4. ДОСТАЕМ ЦЕНУ MEXC ИЗ ГЛОБАЛЬНОГО КЭША
+    // В памяти ключи хранятся как "BTC_USDT"
+    const mexcKey = `${symbol}_USDT`;
+    const mexcPrice = mexcGlobalPrices[mexcKey] || 0;
+
+    res.json({ ok: true, mexc: mexcPrice, prices });
 });
 
 app.get('/', (req, res) => {
