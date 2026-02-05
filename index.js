@@ -30,7 +30,7 @@ let ACTIVE_DEX_CONTRACT = null;
 let ACTIVE_DEX_CHAIN = null;    
 let ACTIVE_DEX_POOL = null;     
 let DEX_PRICE_CACHE = 0;        
-let DEX_SOURCE_CACHE = ''; // <--- Хранит источник цены (jup, gecko, screen)
+let DEX_SOURCE_CACHE = ''; 
 
 // Хелпер обновления цены CEX
 const updatePrice = (symbol, exchange, price) => {
@@ -77,7 +77,7 @@ const startDexPoller = () => {
                 const d = await res.json();
                 if (d.data && d.data[ACTIVE_DEX_CONTRACT]) {
                     DEX_PRICE_CACHE = parseFloat(d.data[ACTIVE_DEX_CONTRACT].price);
-                    DEX_SOURCE_CACHE = 'jup'; // <--- МЕТКА
+                    DEX_SOURCE_CACHE = 'jup'; 
                     return;
                 }
             } catch (e) {}
@@ -98,7 +98,7 @@ const startDexPoller = () => {
                     const d = await res.json();
                     if (d.data && d.data.attributes) {
                         DEX_PRICE_CACHE = parseFloat(d.data.attributes.base_token_price_usd);
-                        DEX_SOURCE_CACHE = 'gecko'; // <--- МЕТКА
+                        DEX_SOURCE_CACHE = 'gecko'; 
                         return;
                     }
                 }
@@ -116,7 +116,7 @@ const startDexPoller = () => {
                 });
                 
                 DEX_PRICE_CACHE = parseFloat(bestPair.priceUsd);
-                DEX_SOURCE_CACHE = ''; // <--- Пусто = DexScreener (стандарт)
+                DEX_SOURCE_CACHE = ''; 
                 
                 if (bestPair.pairAddress) ACTIVE_DEX_POOL = bestPair.pairAddress;
             }
@@ -163,7 +163,8 @@ const initBinanceGlobal = () => {
     const connect = () => {
         try {
             ws = new WebSocket('wss://fstream.binance.com/ws/!ticker@arr'); 
-            ws.on('open', () => console.log('[Binance] Connected Global');
+            // ИСПРАВЛЕНА СИНТАКСИЧЕСКАЯ ОШИБКА (добавлена скобка)
+            ws.on('open', () => console.log('[Binance] Connected Global'));
             ws.on('message', (data) => {
                 const arr = safeJson(data);
                 if (Array.isArray(arr)) {
@@ -355,7 +356,7 @@ app.get('/api/resolve', authMiddleware, async (req, res) => {
             ACTIVE_DEX_CHAIN = contractNet.netWork || null; 
             ACTIVE_DEX_POOL = null; 
             DEX_PRICE_CACHE = 0;
-            DEX_SOURCE_CACHE = ''; // Сброс источника
+            DEX_SOURCE_CACHE = ''; 
             
             dexUrl = `https://dexscreener.com/search?q=${newContract}`;
         }
@@ -386,7 +387,7 @@ app.get('/api/all', authMiddleware, async (req, res) => {
         ok: true, 
         mexc: mexcPrice, 
         dex: DEX_PRICE_CACHE,
-        dexSource: DEX_SOURCE_CACHE, // <-- Отправляем метку источника
+        dexSource: DEX_SOURCE_CACHE, 
         prices 
     });
 });
@@ -496,7 +497,6 @@ async function update() {
         if (dexPrice > 0) {  
             let diff = ((dexPrice - data.mexc) / data.mexc * 100).toFixed(2);  
             
-            // --- НОВАЯ ВИЗУАЛИЗАЦИЯ ИСТОЧНИКА ---
             let dexLabel = 'DEX     ';
             if (data.dexSource === 'jup') dexLabel = 'DEX (jup)';
             else if (data.dexSource === 'gecko') dexLabel = 'DEX (gecko)';
@@ -579,3 +579,4 @@ else if (!token) output.innerHTML = "<span style='color:red'>Доступ зап
 });
 
 app.listen(CONFIG.PORT, () => console.log(`🚀 Server running on port ${CONFIG.PORT}`));
+                         
