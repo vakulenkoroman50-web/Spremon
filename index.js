@@ -25,111 +25,45 @@ const EXCHANGES_ORDER = ["Binance", "Bybit", "Gate", "Bitget", "BingX", "OKX", "
 const GLOBAL_PRICES = {};
 let MEXC_CONFIG_CACHE = null;
 
-// Глобальные переменные для DEX
-let ACTIVE_DEX_CONTRACT = null; 
-let ACTIVE_DEX_CHAIN = null;    
-let ACTIVE_DEX_POOL = null;     
-let DEX_PRICE_CACHE = 0;        
-let DEX_SOURCE_CACHE = ''; 
-
-// Хелпер обновления цены CEX
+// --- ИСПРАВЛЕННАЯ ФУНКЦИЯ ОБНОВЛЕНИЯ ЦЕНЫ ---
 const updatePrice = (symbol, exchange, price) => {
     if (!symbol || !price) return;
-    const s = symbol.toUpperCase()
-        .replace(/[-_]/g, '')     
-        .replace('USDT', '')      
-        .replace('SWAP', '')      
-        .replace('M', '');        
-        
+    
+    let s = symbol.toUpperCase();
+
+    // 1. Специфичные фиксы для бирж (до очистки)
+    // KuCoin использует XBT вместо BTC
+    if (s.startsWith('XBT')) s = s.replace('XBT', 'BTC');
+
+    // 2. Удаляем разделители (- и _)
+    s = s.replace(/[-_]/g, '');
+
+    // 3. Удаляем суффиксы СТРОГО В КОНЦЕ СТРОКИ ($ означает конец)
+    // Порядок важен!
+    
+    // OKX шлет 'BTC-USDT-SWAP' -> 'BTCUSDTSWAP' -> удаляем 'SWAP' в конце
+    s = s.replace(/SWAP$/, '');
+
+    // KuCoin шлет 'BTCUSDTM' -> удаляем 'M' только если перед ним USDT
+    // Binance/Mexc шлют 'BTCUSDT'
+    // Регулярка: Ищем USDT, за которым может идти M, в конце строки
+    s = s.replace(/USDTM?$/, ''); 
+    
+    // На случай пар к USD
+    s = s.replace(/USD$/, '');
+
+    // Сохраняем
     if (!GLOBAL_PRICES[s]) GLOBAL_PRICES[s] = {};
     GLOBAL_PRICES[s][exchange] = parseFloat(price);
 };
+// ---------------------------------------------
 
 const safeJson = (data) => {
     try { return JSON.parse(data); } catch (e) { return null; }
 };
 
 /**
- * --- SMART DEX MONITORING ---
- */
-
-const GECKO_NETWORKS = {
-    'BSC(BEP20)': 'bsc',
-    'BNB Smart Chain(BEP20)': 'bsc',
-    'ETH': 'eth',
-    'ERC20': 'eth',
-    'Arbitrum One(ARB)': 'arbitrum',
-    'Polygon(MATIC)': 'polygon_pos',
-    'BASE': 'base',
-    'Optimism(OP)': 'optimism',
-    'Avalanche(AVAX)': 'avax',
-    'SOLANA': 'solana'
-};
-
-const startDexPoller = () => {
-    setInterval(async () => {
-        if (!ACTIVE_DEX_CONTRACT || !ACTIVE_DEX_CHAIN) return;
-
-        // 1. SOLANA SPECIAL (JUPITER API)
-        if (ACTIVE_DEX_CHAIN === 'solana') {
-            try {
-                const res = await fetch(`https://api.jup.ag/price/v2?ids=${ACTIVE_DEX_CONTRACT}`);
-                const d = await res.json();
-                if (d.data && d.data[ACTIVE_DEX_CONTRACT]) {
-                    DEX_PRICE_CACHE = parseFloat(d.data[ACTIVE_DEX_CONTRACT].price);
-                    DEX_SOURCE_CACHE = 'jup'; 
-                    return;
-                }
-            } catch (e) {}
-        }
-
-        // 2. GECKO TERMINAL (EVM + Fallback)
-        if (ACTIVE_DEX_POOL && ACTIVE_DEX_CHAIN !== 'solana') {
-            try {
-                let geckoNet = null;
-                for (const [key, val] of Object.entries(GECKO_NETWORKS)) {
-                     if (MEXC_CONFIG_CACHE) {
-                         if (key === ACTIVE_DEX_CHAIN) geckoNet = val;
-                     }
-                }
-                
-                if (geckoNet) {
-                    const res = await fetch(`https://api.geckoterminal.com/api/v2/networks/${geckoNet}/pools/${ACTIVE_DEX_POOL}`);
-                    const d = await res.json();
-                    if (d.data && d.data.attributes) {
-                        DEX_PRICE_CACHE = parseFloat(d.data.attributes.base_token_price_usd);
-                        DEX_SOURCE_CACHE = 'gecko'; 
-                        return;
-                    }
-                }
-            } catch(e) {}
-        }
-
-        // 3. DEXSCREENER (FALLBACK)
-        try {
-            const res = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${ACTIVE_DEX_CONTRACT}`);
-            const d = await res.json();
-            if (d.pairs && d.pairs.length > 0) {
-                let bestPair = d.pairs[0];
-                d.pairs.forEach(p => {
-                    if (parseFloat(p.volume?.h24 || 0) > parseFloat(bestPair.volume?.h24 || 0)) bestPair = p;
-                });
-                
-                DEX_PRICE_CACHE = parseFloat(bestPair.priceUsd);
-                DEX_SOURCE_CACHE = ''; 
-                
-                if (bestPair.pairAddress) ACTIVE_DEX_POOL = bestPair.pairAddress;
-            }
-        } catch (e) {}
-
-    }, 2000); 
-};
-
-startDexPoller();
-
-
-/**
- * --- GLOBAL MONITORS (CEX) ---
+ * --- GLOBAL MONITORS ---
  */
 // 1. MEXC GLOBAL
 const initMexcGlobal = () => {
@@ -163,7 +97,6 @@ const initBinanceGlobal = () => {
     const connect = () => {
         try {
             ws = new WebSocket('wss://fstream.binance.com/ws/!ticker@arr'); 
-            // ИСПРАВЛЕНА СИНТАКСИЧЕСКАЯ ОШИБКА (добавлена скобка)
             ws.on('open', () => console.log('[Binance] Connected Global'));
             ws.on('message', (data) => {
                 const arr = safeJson(data);
@@ -259,16 +192,14 @@ const initKucoinGlobal = () => {
             const d = await res.json();
             if (d.data && Array.isArray(d.data)) {
                 d.data.forEach(i => {
-                    let sym = i.symbol;
-                    if (sym.startsWith('XBT')) sym = sym.replace('XBT', 'BTC');
-                    updatePrice(sym, 'Kucoin', i.price);
+                    updatePrice(i.symbol, 'Kucoin', i.price);
                 });
             }
         } catch(e) {}
     }, 2000);
 };
 
-// ЗАПУСК
+// ЗАПУСК ВСЕХ МОНИТОРОВ
 initMexcGlobal();
 initBinanceGlobal();
 initBybitGlobal();
@@ -317,13 +248,15 @@ async function mexcPrivateRequest(path, params = {}) {
     } catch (e) { return null; }
 }
 
+// Кэширование конфига
 async function updateMexcConfigCache() {
     try {
         if (!fetch) return;
+        console.log('[CACHE] Updating MEXC config...');
         const data = await mexcPrivateRequest("/api/v3/capital/config/getall");
         if (data && Array.isArray(data)) {
             MEXC_CONFIG_CACHE = data;
-            console.log('[CACHE] MEXC config updated.');
+            console.log('[CACHE] MEXC config updated. Items:', data.length);
         }
     } catch (e) { console.error('[CACHE ERR]', e); }
 }
@@ -343,36 +276,40 @@ app.get('/api/resolve', authMiddleware, async (req, res) => {
     const tokenData = data.find(t => t.coin === symbol);
     if (!tokenData?.networkList) return res.json({ ok: false });
 
-    const networks = tokenData.networkList;
-    const depositOpen = networks.some(net => net.depositEnable);
-    const contractNet = networks.find(n => n.contract); 
+    const depositOpen = tokenData.networkList.some(net => net.depositEnable);
     
-    let dexUrl = '';
+    let bestPair = null;
+    const contracts = tokenData.networkList.filter(n => n.contract).map(n => n.contract);
     
-    if (contractNet) {
-        const newContract = contractNet.contract;
-        if (ACTIVE_DEX_CONTRACT !== newContract) {
-            ACTIVE_DEX_CONTRACT = newContract;
-            ACTIVE_DEX_CHAIN = contractNet.netWork || null; 
-            ACTIVE_DEX_POOL = null; 
-            DEX_PRICE_CACHE = 0;
-            DEX_SOURCE_CACHE = ''; 
-            
-            dexUrl = `https://dexscreener.com/search?q=${newContract}`;
-        }
-    }
+    await Promise.all(contracts.map(async (contract) => {
+        try {
+            const dsRes = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${contract}`);
+            const dsData = await dsRes.json();
+            if (dsData.pairs) {
+                dsData.pairs.forEach(pair => {
+                    if (!bestPair || (parseFloat(pair.volume?.h24 || 0) > parseFloat(bestPair.volume?.h24 || 0))) {
+                        bestPair = pair;
+                    }
+                });
+            }
+        } catch (e) {}
+    }));
 
     res.json({
         ok: true,
-        chain: ACTIVE_DEX_CHAIN,
-        addr: ACTIVE_DEX_CONTRACT,
-        url: dexUrl,
+        chain: bestPair?.chainId,
+        addr: bestPair?.pairAddress,
+        url: bestPair?.url,
         depositOpen
     });
 });
 
 app.get('/api/all', authMiddleware, async (req, res) => {
-    let symbol = (req.query.symbol || '').toUpperCase().replace('USDT', '');
+    // Безопасная нормализация запроса
+    let symbol = (req.query.symbol || '').toUpperCase();
+    // Просто убираем USDT, чтобы найти ключ в базе
+    symbol = symbol.replace('USDT', '');
+    
     if (!symbol) return res.json({ ok: false });
 
     const marketData = GLOBAL_PRICES[symbol] || {};
@@ -383,13 +320,7 @@ app.get('/api/all', authMiddleware, async (req, res) => {
         prices[ex] = marketData[ex] || 0;
     });
 
-    res.json({ 
-        ok: true, 
-        mexc: mexcPrice, 
-        dex: DEX_PRICE_CACHE,
-        dexSource: DEX_SOURCE_CACHE, 
-        prices 
-    });
+    res.json({ ok: true, mexc: mexcPrice, prices });
 });
 
 app.get('/', (req, res) => {
@@ -439,6 +370,8 @@ const exchangesOrder = ["Binance", "Bybit", "Gate", "Bitget", "BingX", "OKX", "K
 let urlParams = new URLSearchParams(window.location.search);  
 let symbol = urlParams.get('symbol')?.toUpperCase() || '';  
 let token = urlParams.get('token') || '';  
+let chain = urlParams.get('chain');  
+let addr = urlParams.get('addr');  
 let depositOpen = true;   
 let timer = null, blink = false;  
 const output = document.getElementById("output");  
@@ -463,10 +396,31 @@ function go() {
     window.open(targetUrl, '_blank');
 }
 function formatP(p) { return (p && p != 0) ? parseFloat(p).toString() : "0"; }  
-
 async function update() {  
     if (!symbol) return;  
-    
+
+    let dexPrice = 0;  
+    if (chain && addr) {  
+        try {  
+            const r = await fetch('https://api.dexscreener.com/latest/dex/pairs/' + chain + '/' + addr);  
+            const d = await r.json();  
+            if (d.pair) {  
+                dexPrice = parseFloat(d.pair.priceUsd);  
+                
+                let pStr = d.pair.priceUsd;
+                let sStr = symbol;
+                const maxLen = 18; 
+                if ((sStr.length + pStr.length + 2) > maxLen) {
+                    let spaceForName = maxLen - pStr.length - 2;
+                    if (spaceForName < 3) spaceForName = 3;
+                    sStr = sStr.substring(0, spaceForName);
+                }
+                document.title = sStr + ': ' + pStr;
+
+                dexLink.value = d.pair.url;  
+            }  
+        } catch(e) {}  
+    }  
     blink = !blink;  
     try {  
         const res = await fetch('/api/all?symbol=' + symbol + '&token=' + token);  
@@ -478,32 +432,25 @@ async function update() {
         const data = await res.json();  
         if(!data.ok) return;  
         
-        const dexPrice = parseFloat(data.dex || 0);
-
-        let pStr = dexPrice > 0 ? formatP(dexPrice) : (data.mexc ? formatP(data.mexc) : '...');
-        let sStr = symbol;
-        const maxLen = 18; 
-        if ((sStr.length + pStr.length + 2) > maxLen) {
-            let spaceForName = maxLen - pStr.length - 2;
-            if (spaceForName < 3) spaceForName = 3;
-            sStr = sStr.substring(0, spaceForName);
+        if (!dexPrice && data.mexc) {
+             let pStr = formatP(data.mexc);
+             let sStr = symbol;
+             const maxLen = 18; 
+             if ((sStr.length + pStr.length + 2) > maxLen) {
+                let spaceForName = maxLen - pStr.length - 2;
+                if (spaceForName < 3) spaceForName = 3;
+                sStr = sStr.substring(0, spaceForName);
+            }
+            document.title = sStr + ': ' + pStr;
         }
-        document.title = sStr + ': ' + pStr;
 
         let dotColorClass = depositOpen ? '' : 'closed';  
         let dot = blink ? '<span class="blink-dot '+dotColorClass+'">●</span>' : '○';  
         let lines = [dot + ' ' + symbol + ' MEXC: ' + formatP(data.mexc)];  
-        
         if (dexPrice > 0) {  
             let diff = ((dexPrice - data.mexc) / data.mexc * 100).toFixed(2);  
-            
-            let dexLabel = 'DEX     ';
-            if (data.dexSource === 'jup') dexLabel = 'DEX (jup)';
-            else if (data.dexSource === 'gecko') dexLabel = 'DEX (gecko)';
-            
-            lines.push('<span class="dex-row">◇ ' + dexLabel.padEnd(12, ' ') + ': ' + formatP(dexPrice) + ' (' + (diff > 0 ? "+" : "") + diff + '%)</span>');  
+            lines.push('<span class="dex-row">◇ DEX     : ' + formatP(dexPrice) + ' (' + (diff > 0 ? "+" : "") + diff + '%)</span>');  
         }  
-        
         let bestEx = null, maxSp = 0;  
         exchangesOrder.forEach(ex => {  
             let p = data.prices[ex];  
@@ -525,7 +472,6 @@ async function update() {
         statusEl.textContent = "Last: " + new Date().toLocaleTimeString();  
     } catch(e) {}  
 }  
-
 async function start() {  
     let val = input.value.trim();  
     if(!val) return;  
@@ -536,9 +482,19 @@ async function start() {
     
     if (val.includes("dexscreener.com")) {  
         try {  
-            output.innerHTML = "Введите ТИКЕР (например BTC) для лучшей работы!";
-            return;
-        } catch(e) {}
+            const parts = val.split('/');  
+            chain = parts[parts.length - 2];  
+            addr = parts[parts.length - 1].split('?')[0];  
+            fetch('https://api.dexscreener.com/latest/dex/pairs/' + chain + '/' + addr)
+                .then(r => r.json())
+                .then(dsData => {
+                     if (dsData.pair) {  
+                        symbol = dsData.pair.baseToken.symbol.toUpperCase();  
+                        input.value = symbol;  
+                        dexLink.value = dsData.pair.url;  
+                    } 
+                });
+        } catch(e) { output.innerHTML = "Ошибка ссылки!"; return; }  
     } else {  
         symbol = val.toUpperCase();  
     }  
@@ -555,14 +511,19 @@ async function start() {
         if (res.status === 403) return;  
         const d = await res.json();  
         if (d.ok) {   
+            chain = d.chain;   
+            addr = d.addr;   
             dexLink.value = d.url || '';   
             depositOpen = d.depositOpen;   
+            
+            if(chain) url.searchParams.set('chain', chain);  
+            if(addr) url.searchParams.set('addr', addr);  
+            window.history.replaceState({}, '', url);  
         } else {  
             depositOpen = true;  
         }  
     } catch(e) {}  
 }  
-
 document.getElementById("startBtn").onclick = start;  
 document.getElementById("mexcBtn").onclick = function() {
     let val = input.value.trim().toUpperCase();
@@ -579,4 +540,3 @@ else if (!token) output.innerHTML = "<span style='color:red'>Доступ зап
 });
 
 app.listen(CONFIG.PORT, () => console.log(`🚀 Server running on port ${CONFIG.PORT}`));
-                         
