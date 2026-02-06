@@ -27,7 +27,7 @@ let MEXC_CONFIG_CACHE = null;
 
 // Хранилище свечей: { "BTCUSDT": [{o, h, l, c}, ...] }
 const HISTORY_OHLC = {}; 
-// Текущая формируемая свеча: { "BTCUSDT": { o, h, l, c, lastMinute } }
+// Текущая формируемая свеча
 const CURRENT_CANDLES = {};
 
 // --- ФУНКЦИЯ ОБНОВЛЕНИЯ ЦЕНЫ ---
@@ -47,45 +47,35 @@ const updatePrice = (symbol, exchange, price) => {
     GLOBAL_PRICES[s][exchange] = p;
 };
 
-// --- МОДУЛЬ ИСТОРИИ (OHLC) ---
-// Запускаем каждую секунду, чтобы ловить High/Low внутри минуты
+// --- МОДУЛЬ ИСТОРИИ (OHLC - 17 МИНУТ) ---
 setInterval(() => {
     const now = new Date();
-    const currentMinute = Math.floor(now.getTime() / 60000); // Unix time в минутах
+    const currentMinute = Math.floor(now.getTime() / 60000); 
 
     Object.keys(GLOBAL_PRICES).forEach(symbol => {
-        // Берем цену MEXC (приоритет), либо Binance
         const prices = GLOBAL_PRICES[symbol];
         const price = prices['MEXC'] || prices['Binance'];
         
         if (!price) return;
 
-        // Инициализация текущей свечи, если её нет или началась новая минута
         if (!CURRENT_CANDLES[symbol] || CURRENT_CANDLES[symbol].lastMinute !== currentMinute) {
             
-            // Если была старая свеча - сохраняем её в историю
             if (CURRENT_CANDLES[symbol]) {
                 if (!HISTORY_OHLC[symbol]) HISTORY_OHLC[symbol] = [];
-                // Клонируем объект, чтобы разорвать ссылку
                 HISTORY_OHLC[symbol].push({ ...CURRENT_CANDLES[symbol] });
-                // Держим только последние 15-20 свечей
+                // Держим буфер чуть больше 17 (на всякий случай, например 20)
                 if (HISTORY_OHLC[symbol].length > 20) HISTORY_OHLC[symbol].shift();
             }
 
-            // Создаем новую свечу
             CURRENT_CANDLES[symbol] = {
-                o: price, // Open
-                h: price, // High
-                l: price, // Low
-                c: price, // Close
+                o: price, h: price, l: price, c: price,
                 lastMinute: currentMinute
             };
         } else {
-            // Обновляем текущую свечу внутри минуты
             const c = CURRENT_CANDLES[symbol];
-            if (price > c.h) c.h = price; // Обновили хай
-            if (price < c.l) c.l = price; // Обновили лоу
-            c.c = price; // Обновили цену закрытия (текущую)
+            if (price > c.h) c.h = price;
+            if (price < c.l) c.l = price;
+            c.c = price; 
         }
     });
 }, 1000);
@@ -272,22 +262,18 @@ app.get('/api/all', authMiddleware, async (req, res) => {
         prices[ex] = marketData[ex] || 0;
     });
 
-    // Формируем историю для графика
     let candles = HISTORY_OHLC[symbol] ? [...HISTORY_OHLC[symbol]] : [];
-    // Добавляем текущую "живую" свечу, если она есть
     if (CURRENT_CANDLES[symbol]) {
         candles.push(CURRENT_CANDLES[symbol]);
     }
-    // Ограничиваем 15 последними
-    if (candles.length > 15) candles = candles.slice(-15);
+    // Ограничиваем 17 последними (как запрошено)
+    if (candles.length > 17) candles = candles.slice(-17);
 
     res.json({ ok: true, mexc: mexcPrice, prices, candles });
 });
 
 app.get('/', (req, res) => {
-    // --- SERVER SIDE AUTH CHECK ---
     if (req.query.token !== CONFIG.SECRET_TOKEN) {
-        // Если токен не верен, отдаем просто текст
         return res.status(403).send("Доступ запрещён!");
     }
 
@@ -321,12 +307,12 @@ body { background: #000; font-family: monospace; font-size: 28px; color: #fff; p
 #chart-container {
     margin-top: 10px;
     width: 100%;
-    /* Ограничиваем ширину примерно по ширине инпутов + кнопок */
     max-width: 420px; 
-    height: 100px;
+    height: 300px; /* Увеличено в 3 раза */
     border: 1px solid #222;
     background: #050505;
     position: relative;
+    margin-bottom: 5px;
 }
 svg { width: 100%; height: 100%; display: block; }
 .candle-wick { stroke-width: 1; }
@@ -349,10 +335,10 @@ svg { width: 100%; height: 100%; display: block; }
     <button id="mexcBtn">MEXC</button>
 </div>  
 
+<div id="chart-container"></div>
+
 <input id="dexLink" readonly placeholder="DEX URL" onclick="this.select(); document.execCommand('copy');" />  
 <div id="status" style="font-size: 18px; margin-top: 5px; color: #444;"></div>  
-
-<div id="chart-container"></div>
 
 <script>  
 const exchangesOrder = ["Binance", "Bybit", "Gate", "Bitget", "BingX", "OKX", "Kucoin"];  
@@ -388,14 +374,12 @@ function go() {
 }
 function formatP(p) { return (p && p != 0) ? parseFloat(p).toString() : "0"; }  
 
-// --- РИСОВАНИЕ ГРАФИКА (SVG) ---
 function renderChart(candles) {
     if (!candles || candles.length < 2) {
         chartContainer.innerHTML = '';
         return;
     }
 
-    // Находим мин/макс диапазон
     let minPrice = Infinity;
     let maxPrice = -Infinity;
     candles.forEach(c => {
@@ -405,19 +389,18 @@ function renderChart(candles) {
 
     if (minPrice === Infinity) return;
 
-    // Отступ 5% сверху и снизу для красоты
     const range = maxPrice - minPrice;
     const padding = range * 0.1; 
     const plotMin = minPrice - padding;
     const plotMax = maxPrice + padding;
     const plotRange = plotMax - plotMin;
 
-    const w = 100; // Виртуальная ширина 100 единиц
-    const h = 100; // Виртуальная высота 100 единиц
+    const w = 100; 
+    const h = 100; 
     
-    // Ширина одной свечи (с отступами)
-    const candleWidth = w / 15; // Место под 15 свечей
-    const gap = 2; // Отступ между свечами
+    // Рассчитываем ширину для 17 свечей
+    const candleWidth = w / 17; 
+    const gap = 2; 
     const bodyWidth = candleWidth - gap;
 
     let svgHtml = '<svg viewBox="0 0 100 100" preserveAspectRatio="none">';
@@ -425,8 +408,6 @@ function renderChart(candles) {
     candles.forEach((c, index) => {
         const xCenter = (index * candleWidth) + (bodyWidth / 2);
         
-        // Координаты Y (инвертированы, т.к. 0 сверху)
-        // y = 100 - ((val - min) / range * 100)
         const yHigh = 100 - ((c.h - plotMin) / plotRange * 100);
         const yLow  = 100 - ((c.l - plotMin) / plotRange * 100);
         const yOpen = 100 - ((c.o - plotMin) / plotRange * 100);
@@ -435,13 +416,10 @@ function renderChart(candles) {
         const isGreen = c.c >= c.o;
         const colorClass = isGreen ? 'green' : 'red';
 
-        // Фитиль (линия от High до Low)
         svgHtml += \`<line x1="\${xCenter}" y1="\${yHigh}" x2="\${xCenter}" y2="\${yLow}" class="candle-wick \${colorClass}" />\`;
 
-        // Тело свечи
-        // SVG rect не умеет отрицательную высоту, поэтому вычисляем верх и высоту
         const rectY = Math.min(yOpen, yClose);
-        const rectH = Math.abs(yClose - yOpen) || 0.5; // Минимальная высота если open==close
+        const rectH = Math.abs(yClose - yOpen) || 0.5; 
         const rectX = xCenter - (bodyWidth / 2);
 
         svgHtml += \`<rect x="\${rectX}" y="\${rectY}" width="\${bodyWidth}" height="\${rectH}" class="candle-body \${colorClass}" />\`;
@@ -478,7 +456,7 @@ async function update() {
     try {  
         const res = await fetch('/api/all?symbol=' + symbol + '&token=' + token);  
         if (res.status === 403) {  
-            window.location.reload(); // Перезагрузка, чтобы сработал серверный чек
+            window.location.reload(); 
             return;  
         }  
         const data = await res.json();  
@@ -523,7 +501,6 @@ async function update() {
         output.innerHTML = lines.join("<br>");  
         statusEl.textContent = "Last: " + new Date().toLocaleTimeString();  
         
-        // Рисуем график
         if(data.candles) renderChart(data.candles);
 
     } catch(e) {}  
