@@ -307,7 +307,7 @@ body { background: #000; font-family: monospace; font-size: 28px; color: #fff; p
 #chart-container {
     margin-top: 10px;
     width: 100%;
-    max-width: 450px; 
+    max-width: 480px; 
     height: 300px; /* Увеличено в 3 раза */
     border: 1px solid #222;
     background: #050505;
