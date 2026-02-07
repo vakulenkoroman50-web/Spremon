@@ -319,10 +319,10 @@ svg { width: 100%; height: 100%; display: block; }
 .candle-body { stroke: none; }
 .green { stroke: #00ff00; fill: #00ff00; }
 .red { stroke: #ff0000; fill: #ff0000; }
-.chart-text { font-family: Arial, sans-serif; font-size: 10px; }
-.corner-label { fill: #888; font-size: 11px; font-weight: bold; }
-.vol-label { fill: #fff; font-size: 11px; font-weight: bold; }
-.peak-label { fill: #ffff00; font-size: 9px; }
+.chart-text { font-family: Arial, sans-serif; font-size: 8px; }
+.corner-label { fill: #888; font-size: 8px; font-weight: bold; }
+.vol-label { fill: #fff; font-size: 8px; font-weight: bold; }
+.peak-label { fill: #ffff00; font-size: 8px; }
 </style>
 </head>
 <body>
@@ -422,7 +422,7 @@ function renderChart(candles) {
     // Левый нижний: Минимальная цена
     svgHtml += \`<text x="1" y="98" class="chart-text corner-label">\${formatP(minPrice)}</text>\`;
     // Правый верхний: Всплеск в %
-    svgHtml += \`<text x="99" y="10" text-anchor="end" class="chart-text vol-label">Range: \${volatility}%</text>\`;
+    svgHtml += \`<text x="99" y="10" text-anchor="end" class="chart-text vol-label">\${volatility}%</text>\`;
 
     // --- ОТРИСОВКА СВЕЧЕЙ ---
     candles.forEach((c, index) => {
