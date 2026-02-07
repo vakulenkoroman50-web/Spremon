@@ -307,7 +307,7 @@ body { background: #000; font-family: monospace; font-size: 28px; color: #fff; p
 #chart-container {
     margin-top: 10px;
     width: 100%;
-    max-width: 480px; /* ШИРИНА 480PX */
+    max-width: 480px;
     height: 300px; 
     border: 1px solid #333;
     background: #050505;
@@ -320,9 +320,9 @@ svg { width: 100%; height: 100%; display: block; }
 .green { stroke: #00ff00; fill: #00ff00; }
 .red { stroke: #ff0000; fill: #ff0000; }
 .chart-text { font-family: Arial, sans-serif; font-size: 8px; }
-.corner-label { fill: #888; font-size: 8px; font-weight: bold; }
+.corner-label { fill: #ffff00; font-size: 8px; font-weight: bold; }
 .vol-label { fill: #fff; font-size: 8px; font-weight: bold; }
-.peak-label { fill: #ffff00; font-size: 8px; }
+.arrow-label { fill: #fff; font-size: 8px; font-weight: bold; }
 </style>
 </head>
 <body>
@@ -394,37 +394,32 @@ function renderChart(candles) {
 
     if (minPrice === Infinity) return;
 
-    // Расчет процента всплеска (Волатильность)
     let volatility = ((maxPrice - minPrice) / minPrice * 100).toFixed(2);
     
-    // Определяем отступы для отрисовки (10% сверху и снизу)
     const range = maxPrice - minPrice;
-    // Если range 0 (цена не менялась), делаем искусственный
     const safeRange = range === 0 ? maxPrice * 0.01 : range;
     const padding = safeRange * 0.1; 
     const plotMin = minPrice - padding;
     const plotMax = maxPrice + padding;
     const plotRange = plotMax - plotMin;
 
-    const w = 100; // SVG Width %
-    const h = 100; // SVG Height %
+    const w = 100; 
     
-    // Рассчитываем ширину для 20 свечей
     const candleWidth = w / 20; 
     const gap = 1.5; 
     const bodyWidth = candleWidth - gap;
 
     let svgHtml = '<svg viewBox="0 0 100 100" preserveAspectRatio="none">';
 
-    // --- МЕТКИ В УГЛАХ КОНТЕЙНЕРА ---
-    // Левый верхний: Максимальная цена
-    svgHtml += \`<text x="1" y="10" class="chart-text corner-label">\${formatP(maxPrice)}</text>\`;
-    // Левый нижний: Минимальная цена
-    svgHtml += \`<text x="1" y="98" class="chart-text corner-label">\${formatP(minPrice)}</text>\`;
-    // Правый верхний: Всплеск в %
-    svgHtml += \`<text x="99" y="10" text-anchor="end" class="chart-text vol-label">\${volatility}%</text>\`;
+    // --- УГЛОВЫЕ МЕТКИ (ЖЕЛТЫЕ, ПРИЖАТЫ) ---
+    // Левый верхний (Max)
+    svgHtml += \`<text x="0.5" y="7" class="chart-text corner-label">\${formatP(maxPrice)}</text>\`;
+    // Левый нижний (Min)
+    svgHtml += \`<text x="0.5" y="99" class="chart-text corner-label">\${formatP(minPrice)}</text>\`;
+    // Правый верхний (Vol)
+    svgHtml += \`<text x="99" y="7" text-anchor="end" class="chart-text vol-label">\${volatility}%</text>\`;
 
-    // --- ОТРИСОВКА СВЕЧЕЙ ---
+    // --- СВЕЧИ ---
     candles.forEach((c, index) => {
         const xCenter = (index * candleWidth) + (bodyWidth / 2);
         
@@ -445,14 +440,16 @@ function renderChart(candles) {
         const rectX = xCenter - (bodyWidth / 2);
         svgHtml += \`<rect x="\${rectX}" y="\${rectY}" width="\${bodyWidth}" height="\${rectH}" class="candle-body \${colorClass}" />\`;
 
-        // --- МЕТКИ НА ПИКОВЫХ СВЕЧАХ ---
-        // Если это глобальный максимум
+        // --- СТРЕЛКИ ВНУТРИ ТЕЛА ---
+        // Стрелка вверх в свече с Max
         if (c.h === maxPrice) {
-            svgHtml += \`<text x="\${xCenter}" y="\${yHigh - 2}" text-anchor="middle" class="chart-text peak-label">\${formatP(c.h)}</text>\`;
+            const arrowY = rectY + (rectH / 2) + 2; // +2 для центровки текста по вертикали (примерно)
+            svgHtml += \`<text x="\${xCenter}" y="\${arrowY}" text-anchor="middle" class="chart-text arrow-label">↑</text>\`;
         }
-        // Если это глобальный минимум (чуть смещаем вниз)
+        // Стрелка вниз в свече с Min
         if (c.l === minPrice) {
-            svgHtml += \`<text x="\${xCenter}" y="\${yLow + 8}" text-anchor="middle" class="chart-text peak-label">\${formatP(c.l)}</text>\`;
+            const arrowY = rectY + (rectH / 2) + 2;
+            svgHtml += \`<text x="\${xCenter}" y="\${arrowY}" text-anchor="middle" class="chart-text arrow-label">↓</text>\`;
         }
     });
 
@@ -602,3 +599,4 @@ if (urlParams.get('symbol')) start();
 });
 
 app.listen(CONFIG.PORT, () => console.log(`🚀 Server running on port ${CONFIG.PORT}`));
+                                
