@@ -322,7 +322,8 @@ svg { width: 100%; height: 100%; display: block; }
 .chart-text { font-family: Arial, sans-serif; font-size: 8px; }
 .corner-label { fill: #ffff00; font-size: 8px; font-weight: bold; }
 .vol-label { fill: #fff; font-size: 8px; font-weight: bold; }
-.arrow-label { fill: #fff; font-size: 8px; font-weight: bold; }
+/* Arrow label fill is set dynamically via JS now */
+.arrow-label { font-size: 8px; font-weight: bold; }
 </style>
 </head>
 <body>
@@ -374,7 +375,8 @@ function go() {
     } else {
         targetUrl = "https://www.google.com/search?q=" + encodeURIComponent(query);
     }
-    window.open(targetUrl, '_blank');
+    // ОТКРЫТИЕ В ТОМ ЖЕ ОКНЕ
+    window.location.href = targetUrl;
 }
 function formatP(p) { return (p && p != 0) ? parseFloat(p).toString() : "0"; }  
 
@@ -411,12 +413,9 @@ function renderChart(candles) {
 
     let svgHtml = '<svg viewBox="0 0 100 100" preserveAspectRatio="none">';
 
-    // --- УГЛОВЫЕ МЕТКИ (ЖЕЛТЫЕ, ПРИЖАТЫ) ---
-    // Левый верхний (Max)
+    // --- УГЛОВЫЕ МЕТКИ ---
     svgHtml += \`<text x="0.5" y="7" class="chart-text corner-label">\${formatP(maxPrice)}</text>\`;
-    // Левый нижний (Min)
     svgHtml += \`<text x="0.5" y="99" class="chart-text corner-label">\${formatP(minPrice)}</text>\`;
-    // Правый верхний (Vol)
     svgHtml += \`<text x="99" y="7" text-anchor="end" class="chart-text vol-label">\${volatility}%</text>\`;
 
     // --- СВЕЧИ ---
@@ -430,6 +429,8 @@ function renderChart(candles) {
 
         const isGreen = c.c >= c.o;
         const colorClass = isGreen ? 'green' : 'red';
+        // Цвет стрелки: Черный на зеленом, Белый на красном
+        const arrowColor = isGreen ? '#000000' : '#ffffff';
 
         // Фитиль
         svgHtml += \`<line x1="\${xCenter}" y1="\${yHigh}" x2="\${xCenter}" y2="\${yLow}" class="candle-wick \${colorClass}" />\`;
@@ -441,15 +442,13 @@ function renderChart(candles) {
         svgHtml += \`<rect x="\${rectX}" y="\${rectY}" width="\${bodyWidth}" height="\${rectH}" class="candle-body \${colorClass}" />\`;
 
         // --- СТРЕЛКИ ВНУТРИ ТЕЛА ---
-        // Стрелка вверх в свече с Max
         if (c.h === maxPrice) {
-            const arrowY = rectY + (rectH / 2) + 2; // +2 для центровки текста по вертикали (примерно)
-            svgHtml += \`<text x="\${xCenter}" y="\${arrowY}" text-anchor="middle" class="chart-text arrow-label">↑</text>\`;
+            const arrowY = rectY + (rectH / 2) + 2; 
+            svgHtml += \`<text x="\${xCenter}" y="\${arrowY}" fill="\${arrowColor}" text-anchor="middle" class="chart-text arrow-label">↑</text>\`;
         }
-        // Стрелка вниз в свече с Min
         if (c.l === minPrice) {
             const arrowY = rectY + (rectH / 2) + 2;
-            svgHtml += \`<text x="\${xCenter}" y="\${arrowY}" text-anchor="middle" class="chart-text arrow-label">↓</text>\`;
+            svgHtml += \`<text x="\${xCenter}" y="\${arrowY}" fill="\${arrowColor}" text-anchor="middle" class="chart-text arrow-label">↓</text>\`;
         }
     });
 
@@ -599,4 +598,3 @@ if (urlParams.get('symbol')) start();
 });
 
 app.listen(CONFIG.PORT, () => console.log(`🚀 Server running on port ${CONFIG.PORT}`));
-                                
