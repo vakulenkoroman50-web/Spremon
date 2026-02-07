@@ -31,7 +31,8 @@ const HISTORY_OHLC = {};
 const CURRENT_CANDLES = {};
 
 // --- ФУНКЦИЯ ОБНОВЛЕНИЯ ЦЕНЫ ---
-const updatePrice = (symbol, exchange, price) => {
+// Теперь принимает extraData для сохранения Fair Price от MEXC
+const updatePrice = (symbol, exchange, price, extraData = null) => {
     if (!symbol || !price) return;
     
     let s = symbol.toUpperCase();
@@ -45,6 +46,11 @@ const updatePrice = (symbol, exchange, price) => {
 
     if (!GLOBAL_PRICES[s]) GLOBAL_PRICES[s] = {};
     GLOBAL_PRICES[s][exchange] = p;
+
+    // Если это MEXC и есть fairPrice, сохраняем его отдельно
+    if (exchange === 'MEXC' && extraData && extraData.fairPrice) {
+        GLOBAL_PRICES[s]['MEXC_FAIR'] = parseFloat(extraData.fairPrice);
+    }
 };
 
 // --- МОДУЛЬ ИСТОРИИ (OHLC - 20 МИНУТ) ---
@@ -103,7 +109,8 @@ const initMexcGlobal = () => {
                 if (d.method === 'ping') { ws.send(JSON.stringify({ "method": "pong" })); return; }
                 if (d.channel === 'push.tickers' && d.data) {
                     const items = Array.isArray(d.data) ? d.data : [d.data];
-                    items.forEach(i => updatePrice(i.symbol, 'MEXC', i.lastPrice));
+                    // Передаем весь объект 'i', чтобы вытащить fairPrice внутри updatePrice
+                    items.forEach(i => updatePrice(i.symbol, 'MEXC', i.lastPrice, i));
                 }
             });
             ws.on('error', () => {});
@@ -256,11 +263,18 @@ app.get('/api/all', authMiddleware, async (req, res) => {
 
     const marketData = GLOBAL_PRICES[symbol] || {};
     const mexcPrice = marketData['MEXC'] || 0;
+    const mexcFair = marketData['MEXC_FAIR'] || 0; // Берем сохраненный Fair Price от MEXC
 
     const prices = {};
     EXCHANGES_ORDER.forEach(ex => {
         prices[ex] = marketData[ex] || 0;
     });
+
+    // Расчет гэпа в %: (MEXC_LAST - MEXC_FAIR) / MEXC_FAIR
+    let gapPercent = 0;
+    if (mexcPrice > 0 && mexcFair > 0) {
+        gapPercent = ((mexcPrice - mexcFair) / mexcFair) * 100;
+    }
 
     let candles = HISTORY_OHLC[symbol] ? [...HISTORY_OHLC[symbol]] : [];
     if (CURRENT_CANDLES[symbol]) {
@@ -269,7 +283,7 @@ app.get('/api/all', authMiddleware, async (req, res) => {
     // Ограничиваем 20 последними
     if (candles.length > 20) candles = candles.slice(-20);
 
-    res.json({ ok: true, mexc: mexcPrice, prices, candles });
+    res.json({ ok: true, mexc: mexcPrice, prices, candles, gap: gapPercent });
 });
 
 app.get('/', (req, res) => {
@@ -322,8 +336,8 @@ svg { width: 100%; height: 100%; display: block; }
 .chart-text { font-family: Arial, sans-serif; font-size: 8px; }
 .corner-label { fill: #ffff00; font-size: 8px; font-weight: bold; }
 .vol-label { fill: #fff; font-size: 8px; font-weight: bold; }
-/* Arrow label fill is set dynamically via JS now */
 .arrow-label { font-size: 8px; font-weight: bold; }
+.gap-label { font-size: 8px; font-weight: bold; }
 </style>
 </head>
 <body>
@@ -375,12 +389,11 @@ function go() {
     } else {
         targetUrl = "https://www.google.com/search?q=" + encodeURIComponent(query);
     }
-    // ОТКРЫТИЕ В ТОМ ЖЕ ОКНЕ
     window.location.href = targetUrl;
 }
 function formatP(p) { return (p && p != 0) ? parseFloat(p).toString() : "0"; }  
 
-function renderChart(candles) {
+function renderChart(candles, gap) {
     if (!candles || candles.length < 2) {
         chartContainer.innerHTML = '';
         return;
@@ -408,8 +421,8 @@ function renderChart(candles) {
     const w = 100; 
     
     const candleWidth = w / 20; 
-    const gap = 1.5; 
-    const bodyWidth = candleWidth - gap;
+    const gapC = 1.5; 
+    const bodyWidth = candleWidth - gapC;
 
     let svgHtml = '<svg viewBox="0 0 100 100" preserveAspectRatio="none">';
 
@@ -417,6 +430,11 @@ function renderChart(candles) {
     svgHtml += \`<text x="0.5" y="7" class="chart-text corner-label">\${formatP(maxPrice)}</text>\`;
     svgHtml += \`<text x="0.5" y="99" class="chart-text corner-label">\${formatP(minPrice)}</text>\`;
     svgHtml += \`<text x="99" y="7" text-anchor="end" class="chart-text vol-label">\${volatility}%</text>\`;
+
+    // --- GAP В ПРАВОМ НИЖНЕМ УГЛУ ---
+    let gapColor = gap >= 0 ? '#00ff00' : '#ff0000';
+    let gapSign = gap > 0 ? '+' : '';
+    svgHtml += \`<text x="99" y="99" text-anchor="end" fill="\${gapColor}" class="chart-text gap-label">GAP: \${gapSign}\${gap.toFixed(2)}%</text>\`;
 
     // --- СВЕЧИ ---
     candles.forEach((c, index) => {
@@ -429,7 +447,6 @@ function renderChart(candles) {
 
         const isGreen = c.c >= c.o;
         const colorClass = isGreen ? 'green' : 'red';
-        // Цвет стрелки: Черный на зеленом, Белый на красном
         const arrowColor = isGreen ? '#000000' : '#ffffff';
 
         // Фитиль
@@ -441,7 +458,7 @@ function renderChart(candles) {
         const rectX = xCenter - (bodyWidth / 2);
         svgHtml += \`<rect x="\${rectX}" y="\${rectY}" width="\${bodyWidth}" height="\${rectH}" class="candle-body \${colorClass}" />\`;
 
-        // --- СТРЕЛКИ ВНУТРИ ТЕЛА ---
+        // --- СТРЕЛКИ ---
         if (c.h === maxPrice) {
             const arrowY = rectY + (rectH / 2) + 2; 
             svgHtml += \`<text x="\${xCenter}" y="\${arrowY}" fill="\${arrowColor}" text-anchor="middle" class="chart-text arrow-label">↑</text>\`;
@@ -503,7 +520,19 @@ async function update() {
 
         let dotColorClass = depositOpen ? '' : 'closed';  
         let dot = blink ? '<span class="blink-dot '+dotColorClass+'">●</span>' : '○';  
-        let lines = [dot + ' ' + symbol + ' MEXC: ' + formatP(data.mexc)];  
+        
+        // --- ФОРМИРОВАНИЕ ПЕРВОЙ СТРОКИ (MEXC) ---
+        let mexcLine = dot + ' ' + symbol + ' MEXC: ' + formatP(data.mexc);
+        
+        // Добавляем GAP если он > 5% по модулю (Используем GAP от MEXC)
+        if (data.gap && Math.abs(data.gap) > 5) {
+            let gapColor = data.gap >= 0 ? '#00ff00' : '#ff0000';
+            let gapSign = data.gap > 0 ? '+' : '';
+            mexcLine += \` <span style="color:\${gapColor}">(\${gapSign}\${data.gap.toFixed(2)}%)</span>\`;
+        }
+
+        let lines = [mexcLine];  
+        
         if (dexPrice > 0) {  
             let diff = ((dexPrice - data.mexc) / data.mexc * 100).toFixed(2);  
             lines.push('<span class="dex-row">◇ DEX     : ' + formatP(dexPrice) + ' (' + (diff > 0 ? "+" : "") + diff + '%)</span>');  
@@ -528,7 +557,7 @@ async function update() {
         output.innerHTML = lines.join("<br>");  
         statusEl.textContent = "Last: " + new Date().toLocaleTimeString();  
         
-        if(data.candles) renderChart(data.candles);
+        if(data.candles) renderChart(data.candles, data.gap || 0);
 
     } catch(e) {}  
 }  
@@ -598,3 +627,4 @@ if (urlParams.get('symbol')) start();
 });
 
 app.listen(CONFIG.PORT, () => console.log(`🚀 Server running on port ${CONFIG.PORT}`));
+                  
