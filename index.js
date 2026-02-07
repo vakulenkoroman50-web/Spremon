@@ -47,7 +47,7 @@ const updatePrice = (symbol, exchange, price) => {
     GLOBAL_PRICES[s][exchange] = p;
 };
 
-// --- МОДУЛЬ ИСТОРИИ (OHLC - 17 МИНУТ) ---
+// --- МОДУЛЬ ИСТОРИИ (OHLC - 20 МИНУТ) ---
 setInterval(() => {
     const now = new Date();
     const currentMinute = Math.floor(now.getTime() / 60000); 
@@ -63,8 +63,8 @@ setInterval(() => {
             if (CURRENT_CANDLES[symbol]) {
                 if (!HISTORY_OHLC[symbol]) HISTORY_OHLC[symbol] = [];
                 HISTORY_OHLC[symbol].push({ ...CURRENT_CANDLES[symbol] });
-                // Держим буфер чуть больше 17 (на всякий случай, например 20)
-                if (HISTORY_OHLC[symbol].length > 20) HISTORY_OHLC[symbol].shift();
+                // Держим буфер с запасом (25), отдавать будем 20
+                if (HISTORY_OHLC[symbol].length > 25) HISTORY_OHLC[symbol].shift();
             }
 
             CURRENT_CANDLES[symbol] = {
@@ -266,8 +266,8 @@ app.get('/api/all', authMiddleware, async (req, res) => {
     if (CURRENT_CANDLES[symbol]) {
         candles.push(CURRENT_CANDLES[symbol]);
     }
-    // Ограничиваем 17 последними (как запрошено)
-    if (candles.length > 17) candles = candles.slice(-17);
+    // Ограничиваем 20 последними
+    if (candles.length > 20) candles = candles.slice(-20);
 
     res.json({ ok: true, mexc: mexcPrice, prices, candles });
 });
@@ -307,9 +307,9 @@ body { background: #000; font-family: monospace; font-size: 28px; color: #fff; p
 #chart-container {
     margin-top: 10px;
     width: 100%;
-    max-width: 480px; 
-    height: 300px; /* Увеличено в 3 раза */
-    border: 1px solid #222;
+    max-width: 480px; /* ШИРИНА 480PX */
+    height: 300px; 
+    border: 1px solid #333;
     background: #050505;
     position: relative;
     margin-bottom: 5px;
@@ -319,6 +319,10 @@ svg { width: 100%; height: 100%; display: block; }
 .candle-body { stroke: none; }
 .green { stroke: #00ff00; fill: #00ff00; }
 .red { stroke: #ff0000; fill: #ff0000; }
+.chart-text { font-family: Arial, sans-serif; font-size: 10px; }
+.corner-label { fill: #888; font-size: 11px; font-weight: bold; }
+.vol-label { fill: #fff; font-size: 11px; font-weight: bold; }
+.peak-label { fill: #ffff00; font-size: 9px; }
 </style>
 </head>
 <body>
@@ -382,6 +386,7 @@ function renderChart(candles) {
 
     let minPrice = Infinity;
     let maxPrice = -Infinity;
+    
     candles.forEach(c => {
         if(c.l < minPrice) minPrice = c.l;
         if(c.h > maxPrice) maxPrice = c.h;
@@ -389,22 +394,37 @@ function renderChart(candles) {
 
     if (minPrice === Infinity) return;
 
+    // Расчет процента всплеска (Волатильность)
+    let volatility = ((maxPrice - minPrice) / minPrice * 100).toFixed(2);
+    
+    // Определяем отступы для отрисовки (10% сверху и снизу)
     const range = maxPrice - minPrice;
-    const padding = range * 0.1; 
+    // Если range 0 (цена не менялась), делаем искусственный
+    const safeRange = range === 0 ? maxPrice * 0.01 : range;
+    const padding = safeRange * 0.1; 
     const plotMin = minPrice - padding;
     const plotMax = maxPrice + padding;
     const plotRange = plotMax - plotMin;
 
-    const w = 100; 
-    const h = 100; 
+    const w = 100; // SVG Width %
+    const h = 100; // SVG Height %
     
-    // Рассчитываем ширину для 17 свечей
-    const candleWidth = w / 17; 
-    const gap = 2; 
+    // Рассчитываем ширину для 20 свечей
+    const candleWidth = w / 20; 
+    const gap = 1.5; 
     const bodyWidth = candleWidth - gap;
 
     let svgHtml = '<svg viewBox="0 0 100 100" preserveAspectRatio="none">';
 
+    // --- МЕТКИ В УГЛАХ КОНТЕЙНЕРА ---
+    // Левый верхний: Максимальная цена
+    svgHtml += \`<text x="1" y="10" class="chart-text corner-label">\${formatP(maxPrice)}</text>\`;
+    // Левый нижний: Минимальная цена
+    svgHtml += \`<text x="1" y="98" class="chart-text corner-label">\${formatP(minPrice)}</text>\`;
+    // Правый верхний: Всплеск в %
+    svgHtml += \`<text x="99" y="10" text-anchor="end" class="chart-text vol-label">Range: \${volatility}%</text>\`;
+
+    // --- ОТРИСОВКА СВЕЧЕЙ ---
     candles.forEach((c, index) => {
         const xCenter = (index * candleWidth) + (bodyWidth / 2);
         
@@ -416,13 +436,24 @@ function renderChart(candles) {
         const isGreen = c.c >= c.o;
         const colorClass = isGreen ? 'green' : 'red';
 
+        // Фитиль
         svgHtml += \`<line x1="\${xCenter}" y1="\${yHigh}" x2="\${xCenter}" y2="\${yLow}" class="candle-wick \${colorClass}" />\`;
 
+        // Тело
         const rectY = Math.min(yOpen, yClose);
-        const rectH = Math.abs(yClose - yOpen) || 0.5; 
+        const rectH = Math.abs(yClose - yOpen) || 0.4; 
         const rectX = xCenter - (bodyWidth / 2);
-
         svgHtml += \`<rect x="\${rectX}" y="\${rectY}" width="\${bodyWidth}" height="\${rectH}" class="candle-body \${colorClass}" />\`;
+
+        // --- МЕТКИ НА ПИКОВЫХ СВЕЧАХ ---
+        // Если это глобальный максимум
+        if (c.h === maxPrice) {
+            svgHtml += \`<text x="\${xCenter}" y="\${yHigh - 2}" text-anchor="middle" class="chart-text peak-label">\${formatP(c.h)}</text>\`;
+        }
+        // Если это глобальный минимум (чуть смещаем вниз)
+        if (c.l === minPrice) {
+            svgHtml += \`<text x="\${xCenter}" y="\${yLow + 8}" text-anchor="middle" class="chart-text peak-label">\${formatP(c.l)}</text>\`;
+        }
     });
 
     svgHtml += '</svg>';
@@ -571,4 +602,3 @@ if (urlParams.get('symbol')) start();
 });
 
 app.listen(CONFIG.PORT, () => console.log(`🚀 Server running on port ${CONFIG.PORT}`));
-        
