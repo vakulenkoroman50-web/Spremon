@@ -290,9 +290,6 @@ body { background: #000; font-family: monospace; font-size: 28px; color: #fff; p
 #goBtn { padding: 10px 20px; font-size: 36px; cursor: pointer; background-color: #333; color: #fff; border: 1px solid #555; font-family: Arial, sans-serif; }
 #goBtn:hover { background-color: #888; }
 
-/* Flex container for the price row to prevent jumping */
-.price-row { display: flex; align-items: center; height: 32px; overflow: hidden; white-space: nowrap; }
-
 /* Chart Styles */
 #chart-container {
     margin-top: 10px;
@@ -405,7 +402,6 @@ function renderChart(candles, gap, sourceName) {
     let svgHtml = '<svg viewBox="0 0 100 100" preserveAspectRatio="none">';
 
     // --- WATERMARK (ИСТОЧНИК ДАННЫХ) ---
-    // Рисуем на заднем плане (в начале SVG)
     svgHtml += \`<text x="50" y="55" text-anchor="middle" dominant-baseline="middle" class="watermark">\${sourceName}</text>\`;
 
     // --- УГЛОВЫЕ МЕТКИ ---
@@ -413,9 +409,9 @@ function renderChart(candles, gap, sourceName) {
     svgHtml += \`<text x="0.5" y="99" class="chart-text corner-label">\${formatP(minPrice)}</text>\`;
     svgHtml += \`<text x="99" y="7" text-anchor="end" class="chart-text vol-label">\${volatility}%</text>\`;
 
-    // --- GAP В ПРАВОМ НИЖНЕМ УГЛУ ---
-    // Выводим только если источник MEXC и есть гэп
-    if (sourceName === 'MEXC' && gap) {
+    // --- GAP В ПРАВОМ НИЖНЕМ УГЛУ (ВСЕГДА, ЕСЛИ ЕСТЬ) ---
+    // Убрали проверку на 5% и проверку на sourceName. Если gap рассчитан - выводим.
+    if (gap !== undefined && gap !== null && !isNaN(gap)) {
         let gapColor = gap >= 0 ? '#00ff00' : '#ff0000';
         let gapSign = gap > 0 ? '+' : '';
         svgHtml += \`<text x="99" y="99" text-anchor="end" fill="\${gapColor}" class="chart-text gap-label">GAP: \${gapSign}\${gap.toFixed(2)}%</text>\`;
@@ -434,16 +430,13 @@ function renderChart(candles, gap, sourceName) {
         const colorClass = isGreen ? 'green' : 'red';
         const arrowColor = isGreen ? '#000000' : '#ffffff';
 
-        // Фитиль
         svgHtml += \`<line x1="\${xCenter}" y1="\${yHigh}" x2="\${xCenter}" y2="\${yLow}" class="candle-wick \${colorClass}" />\`;
 
-        // Тело
         const rectY = Math.min(yOpen, yClose);
         const rectH = Math.abs(yClose - yOpen) || 0.4; 
         const rectX = xCenter - (bodyWidth / 2);
         svgHtml += \`<rect x="\${rectX}" y="\${rectY}" width="\${bodyWidth}" height="\${rectH}" class="candle-body \${colorClass}" />\`;
 
-        // --- СТРЕЛКИ ---
         if (c.h === maxPrice) {
             const arrowY = rectY + (rectH / 2) + 2; 
             svgHtml += \`<text x="\${xCenter}" y="\${arrowY}" fill="\${arrowColor}" text-anchor="middle" class="chart-text arrow-label">↑</text>\`;
@@ -491,16 +484,14 @@ async function update() {
         const data = await res.json();  
         if(!data.ok) return;  
         
-        // --- ЛОГИКА ОТОБРАЖЕНИЯ ЦЕНЫ В СТРОКЕ ---
-        // Строка ВСЕГДА показывает MEXC (даже если 0), как ты просил.
+        // --- ЛОГИКА ОТОБРАЖЕНИЯ ЦЕНЫ ---
         let mainPrice = data.mexc;
         let showGap = true;
 
         if (!mainPrice || mainPrice == 0) {
-            showGap = false; // Нет цены MEXC -> нет гэпа
+            showGap = false; 
         }
         
-        // Обновляем заголовок, если нет DEX цены
         if (!dexPrice) {
              let pStr = formatP(mainPrice);
              let sStr = symbol;
@@ -515,31 +506,26 @@ async function update() {
 
         let dotColorClass = depositOpen ? '' : 'closed';  
         
-        // --- ФИКС ПУЛЬСАЦИИ ---
-        // Используем flex-контейнер .price-row
-        // Точка в отдельном span с фиксированным шрифтом и шириной
+        // --- ФОРМИРОВАНИЕ ТЕКСТА (Вернулись к <br>) ---
+        // Точка с фиксированной шириной и пробелом &nbsp;
         let dotSymbol = blink ? '<span class="'+dotColorClass+'">●</span>' : '○';
-        let dotHtml = '<span style="display:inline-block; width:20px; text-align:center; font-family:Arial, sans-serif; line-height:1;">' + dotSymbol + '</span>';
+        let dotHtml = '<span style="display:inline-block; width:15px; text-align:center; font-family:Arial, sans-serif; line-height:1;">' + dotSymbol + '</span>&nbsp;';
         
-        // Остальной текст
-        let textHtml = '<span>' + symbol + ' MEXC: ' + formatP(mainPrice) + '</span>';
+        // Первая строка: MEXC
+        let mexcLine = dotHtml + symbol + ' MEXC: ' + formatP(mainPrice);
         
         // Добавляем GAP если он > 5% и цена есть
         if (showGap && data.gap && Math.abs(data.gap) > 5) {
             let gapColor = data.gap >= 0 ? '#00ff00' : '#ff0000';
             let gapSign = data.gap > 0 ? '+' : '';
-            textHtml += \` <span style="color:\${gapColor}">(\${gapSign}\${data.gap.toFixed(2)}%)</span>\`;
+            mexcLine += \` <span style="color:\${gapColor}">(\${gapSign}\${data.gap.toFixed(2)}%)</span>\`;
         }
-        
-        // Собираем строку в Flex-контейнер
-        let mexcLine = '<div class="price-row">' + dotHtml + textHtml + '</div>';
-        
+
         let lines = [mexcLine];  
         
         if (dexPrice > 0) {  
             let diff = ((dexPrice - mainPrice) / mainPrice * 100).toFixed(2);  
-            // Для DEX тоже используем div, но можно и span
-            lines.push('<div class="price-row"><span class="dex-row">◇ DEX     : ' + formatP(dexPrice) + ' (' + (diff > 0 ? "+" : "") + diff + '%)</span></div>');  
+            lines.push('<span class="dex-row">◇ DEX     : ' + formatP(dexPrice) + ' (' + (diff > 0 ? "+" : "") + diff + '%)</span>');  
         }  
         let bestEx = null, maxSp = 0;  
         exchangesOrder.forEach(ex => {  
@@ -555,26 +541,22 @@ async function update() {
                 let diff = ((p - mainPrice) / mainPrice * 100).toFixed(2);  
                 let cls = (ex === bestEx) ? 'class="best"' : '';  
                 let mark = (ex === bestEx) ? '◆' : '◇';  
-                lines.push('<div class="price-row"><span ' + cls + '>' + mark + ' ' + ex.padEnd(8, ' ') + ': ' + formatP(p) + ' (' + (diff > 0 ? "+" : "") + diff + '%)</span></div>');  
+                lines.push('<span ' + cls + '>' + mark + ' ' + ex.padEnd(8, ' ') + ': ' + formatP(p) + ' (' + (diff > 0 ? "+" : "") + diff + '%)</span>');  
             }  
         });  
-        output.innerHTML = lines.join(""); // Убрал <br>, так как используем div
+        
+        output.innerHTML = lines.join("<br>"); // Вернули join по <br>
         statusEl.textContent = "Last: " + new Date().toLocaleTimeString();  
         
-        // --- ОПРЕДЕЛЕНИЕ ИСТОЧНИКА ДЛЯ ВОТЕРМАРКИ ---
+        // --- ИСТОЧНИК ---
         let sourceName = 'MEXC';
         if (mainPrice == 0) {
-             // Если на MEXC 0, ищем кого показывает график
-             // Логика простая: кто первый не ноль в списке, тот и источник для графика (так работает сервер)
              for (let ex of exchangesOrder) {
-                if (data.prices[ex] > 0) {
-                    sourceName = ex;
-                    break;
-                }
+                if (data.prices[ex] > 0) { sourceName = ex; break; }
              }
         }
 
-        if(data.candles) renderChart(data.candles, showGap ? (data.gap || 0) : 0, sourceName);
+        if(data.candles) renderChart(data.candles, data.gap, sourceName);
 
     } catch(e) {}  
 }  
