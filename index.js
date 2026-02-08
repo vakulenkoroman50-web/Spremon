@@ -31,7 +31,6 @@ const HISTORY_OHLC = {};
 const CURRENT_CANDLES = {};
 
 // --- ФУНКЦИЯ ОБНОВЛЕНИЯ ЦЕНЫ ---
-// Теперь принимает extraData для сохранения Fair Price от MEXC
 const updatePrice = (symbol, exchange, price, extraData = null) => {
     if (!symbol || !price) return;
     
@@ -47,7 +46,7 @@ const updatePrice = (symbol, exchange, price, extraData = null) => {
     if (!GLOBAL_PRICES[s]) GLOBAL_PRICES[s] = {};
     GLOBAL_PRICES[s][exchange] = p;
 
-    // Если это MEXC и есть fairPrice, сохраняем его отдельно
+    // Сохраняем Fair Price от MEXC для расчета гэпа
     if (exchange === 'MEXC' && extraData && extraData.fairPrice) {
         GLOBAL_PRICES[s]['MEXC_FAIR'] = parseFloat(extraData.fairPrice);
     }
@@ -69,7 +68,6 @@ setInterval(() => {
             if (CURRENT_CANDLES[symbol]) {
                 if (!HISTORY_OHLC[symbol]) HISTORY_OHLC[symbol] = [];
                 HISTORY_OHLC[symbol].push({ ...CURRENT_CANDLES[symbol] });
-                // Держим буфер с запасом (25), отдавать будем 20
                 if (HISTORY_OHLC[symbol].length > 25) HISTORY_OHLC[symbol].shift();
             }
 
@@ -109,7 +107,6 @@ const initMexcGlobal = () => {
                 if (d.method === 'ping') { ws.send(JSON.stringify({ "method": "pong" })); return; }
                 if (d.channel === 'push.tickers' && d.data) {
                     const items = Array.isArray(d.data) ? d.data : [d.data];
-                    // Передаем весь объект 'i', чтобы вытащить fairPrice внутри updatePrice
                     items.forEach(i => updatePrice(i.symbol, 'MEXC', i.lastPrice, i));
                 }
             });
@@ -263,14 +260,13 @@ app.get('/api/all', authMiddleware, async (req, res) => {
 
     const marketData = GLOBAL_PRICES[symbol] || {};
     const mexcPrice = marketData['MEXC'] || 0;
-    const mexcFair = marketData['MEXC_FAIR'] || 0; // Берем сохраненный Fair Price от MEXC
+    const mexcFair = marketData['MEXC_FAIR'] || 0; 
 
     const prices = {};
     EXCHANGES_ORDER.forEach(ex => {
         prices[ex] = marketData[ex] || 0;
     });
 
-    // Расчет гэпа в %: (MEXC_LAST - MEXC_FAIR) / MEXC_FAIR
     let gapPercent = 0;
     if (mexcPrice > 0 && mexcFair > 0) {
         gapPercent = ((mexcPrice - mexcFair) / mexcFair) * 100;
@@ -280,7 +276,6 @@ app.get('/api/all', authMiddleware, async (req, res) => {
     if (CURRENT_CANDLES[symbol]) {
         candles.push(CURRENT_CANDLES[symbol]);
     }
-    // Ограничиваем 20 последними
     if (candles.length > 20) candles = candles.slice(-20);
 
     res.json({ ok: true, mexc: mexcPrice, prices, candles, gap: gapPercent });
@@ -498,7 +493,8 @@ async function update() {
     }  
     blink = !blink;  
     try {  
-        const res = await fetch('/api/all?symbol=' + symbol + '&token=' + token);  
+        // !!! ИСПОЛЬЗУЕМ encodeURIComponent !!!
+        const res = await fetch('/api/all?symbol=' + encodeURIComponent(symbol) + '&token=' + token);  
         if (res.status === 403) {  
             window.location.reload(); 
             return;  
@@ -521,10 +517,8 @@ async function update() {
         let dotColorClass = depositOpen ? '' : 'closed';  
         let dot = blink ? '<span class="blink-dot '+dotColorClass+'">●</span>' : '○';  
         
-        // --- ФОРМИРОВАНИЕ ПЕРВОЙ СТРОКИ (MEXC) ---
         let mexcLine = dot + ' ' + symbol + ' MEXC: ' + formatP(data.mexc);
         
-        // Добавляем GAP если он > 5% по модулю (Используем GAP от MEXC)
         if (data.gap && Math.abs(data.gap) > 5) {
             let gapColor = data.gap >= 0 ? '#00ff00' : '#ff0000';
             let gapSign = data.gap > 0 ? '+' : '';
@@ -565,6 +559,9 @@ async function start() {
     let val = input.value.trim();  
     if(!val) return;  
     
+    // !!! СКРЫВАЕМ КЛАВИАТУРУ !!!
+    input.blur();
+
     if(timer) clearInterval(timer);  
     output.innerHTML = "Поиск...";  
     
@@ -595,7 +592,8 @@ async function start() {
     timer = setInterval(update, 1000);  
 
     try {  
-        const res = await fetch('/api/resolve?symbol=' + symbol + '&token=' + token);  
+        // !!! ИСПОЛЬЗУЕМ encodeURIComponent !!!
+        const res = await fetch('/api/resolve?symbol=' + encodeURIComponent(symbol) + '&token=' + token);  
         if (res.status === 403) return;  
         const d = await res.json();  
         if (d.ok) {   
@@ -617,7 +615,12 @@ document.getElementById("mexcBtn").onclick = function() {
     let val = input.value.trim().toUpperCase();
     if(val) window.location.href = "mxcappscheme://kline?extra_page_name=其他&trade_pair=" + val + "_USDT&contract=1";
 };
-input.addEventListener("keypress", (e) => { if(e.key === "Enter") start(); });  
+input.addEventListener("keypress", (e) => { 
+    if(e.key === "Enter") {
+        input.blur(); // !!! СКРЫВАЕМ КЛАВИАТУРУ !!!
+        start(); 
+    }
+});  
 
 if (urlParams.get('symbol')) start();  
 </script>  
@@ -627,4 +630,4 @@ if (urlParams.get('symbol')) start();
 });
 
 app.listen(CONFIG.PORT, () => console.log(`🚀 Server running on port ${CONFIG.PORT}`));
-                  
+                                    
