@@ -409,10 +409,11 @@ function renderChart(candles, gap, sourceName) {
     svgHtml += \`<text x="0.5" y="99" class="chart-text corner-label">\${formatP(minPrice)}</text>\`;
     svgHtml += \`<text x="99" y="7" text-anchor="end" class="chart-text vol-label">\${volatility}%</text>\`;
 
-    // --- GAP В ПРАВОМ НИЖНЕМ УГЛУ (ВСЕГДА, ЕСЛИ ЕСТЬ) ---
-    // Убрали проверку на 5% и проверку на sourceName. Если gap рассчитан - выводим.
+    // --- GAP В ПРАВОМ НИЖНЕМ УГЛУ ---
+    // Выводим ВСЕГДА, если значение gap рассчитано (даже если < 5%)
+    // Цвета инвертированы: (+) = RED, (-) = GREEN
     if (gap !== undefined && gap !== null && !isNaN(gap)) {
-        let gapColor = gap >= 0 ? '#00ff00' : '#ff0000';
+        let gapColor = gap >= 0 ? '#ff0000' : '#00ff00';
         let gapSign = gap > 0 ? '+' : '';
         svgHtml += \`<text x="99" y="99" text-anchor="end" fill="\${gapColor}" class="chart-text gap-label">GAP: \${gapSign}\${gap.toFixed(2)}%</text>\`;
     }
@@ -484,7 +485,6 @@ async function update() {
         const data = await res.json();  
         if(!data.ok) return;  
         
-        // --- ЛОГИКА ОТОБРАЖЕНИЯ ЦЕНЫ ---
         let mainPrice = data.mexc;
         let showGap = true;
 
@@ -506,17 +506,18 @@ async function update() {
 
         let dotColorClass = depositOpen ? '' : 'closed';  
         
-        // --- ФОРМИРОВАНИЕ ТЕКСТА (Вернулись к <br>) ---
-        // Точка с фиксированной шириной и пробелом &nbsp;
+        // --- ФОРМАТИРОВАНИЕ ЧЕРЕЗ BR ---
+        
         let dotSymbol = blink ? '<span class="'+dotColorClass+'">●</span>' : '○';
+        // Добавлен &nbsp; после точки
         let dotHtml = '<span style="display:inline-block; width:15px; text-align:center; font-family:Arial, sans-serif; line-height:1;">' + dotSymbol + '</span>&nbsp;';
         
-        // Первая строка: MEXC
         let mexcLine = dotHtml + symbol + ' MEXC: ' + formatP(mainPrice);
         
-        // Добавляем GAP если он > 5% и цена есть
+        // GAP в тексте (только если > 5%)
+        // Цвета инвертированы: (+) = RED, (-) = GREEN
         if (showGap && data.gap && Math.abs(data.gap) > 5) {
-            let gapColor = data.gap >= 0 ? '#00ff00' : '#ff0000';
+            let gapColor = data.gap >= 0 ? '#ff0000' : '#00ff00';
             let gapSign = data.gap > 0 ? '+' : '';
             mexcLine += \` <span style="color:\${gapColor}">(\${gapSign}\${data.gap.toFixed(2)}%)</span>\`;
         }
@@ -545,10 +546,9 @@ async function update() {
             }  
         });  
         
-        output.innerHTML = lines.join("<br>"); // Вернули join по <br>
+        output.innerHTML = lines.join("<br>"); // JOIN ЧЕРЕЗ <BR>
         statusEl.textContent = "Last: " + new Date().toLocaleTimeString();  
         
-        // --- ИСТОЧНИК ---
         let sourceName = 'MEXC';
         if (mainPrice == 0) {
              for (let ex of exchangesOrder) {
@@ -633,4 +633,4 @@ if (urlParams.get('symbol')) start();
 });
 
 app.listen(CONFIG.PORT, () => console.log(`🚀 Server running on port ${CONFIG.PORT}`));
-    
+                  
