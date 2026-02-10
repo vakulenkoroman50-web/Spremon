@@ -19,6 +19,7 @@ const CONFIG = {
 
 const EXCHANGES_ORDER = ["Binance", "Bybit", "Gate", "Bitget", "BingX", "OKX", "Kucoin"];
 const ALL_SOURCES = ["MEXC", ...EXCHANGES_ORDER];
+const TIMEFRAMES = ['1m', '15m', '1h'];
 
 /**
  * GLOBAL DATA CACHE
@@ -27,11 +28,12 @@ const GLOBAL_PRICES = {};
 const GLOBAL_FAIR = {};   
 let MEXC_CONFIG_CACHE = null;
 
-// Хранилище свечей
+// Структура: HISTORY_OHLC[symbol][exchange][timeframe] = [candle, ...]
 const HISTORY_OHLC = {}; 
+// Структура: CURRENT_CANDLES[symbol][exchange][timeframe] = { o, h, l, c, lastPeriod }
 const CURRENT_CANDLES = {};
 
-// --- ЕДИНАЯ ФУНКЦИЯ НОРМАЛИЗАЦИИ (СТАРАЯ НАДЕЖНАЯ) ---
+// --- ЕДИНАЯ ФУНКЦИЯ НОРМАЛИЗАЦИИ ---
 const normalizeSymbol = (s) => {
     if (!s) return null;
     return s.toUpperCase()
@@ -46,13 +48,11 @@ const updateData = (rawSymbol, exchange, price, fairPrice = null) => {
     const s = normalizeSymbol(rawSymbol);
     if (!s) return;
 
-    // Обновляем Last Price
     if (price && parseFloat(price) > 0) {
         if (!GLOBAL_PRICES[s]) GLOBAL_PRICES[s] = {};
         GLOBAL_PRICES[s][exchange] = parseFloat(price);
     }
 
-    // Обновляем Fair Price
     if (fairPrice && parseFloat(fairPrice) > 0) {
         if (!GLOBAL_FAIR[s]) GLOBAL_FAIR[s] = {};
         GLOBAL_FAIR[s][exchange] = parseFloat(fairPrice);
@@ -63,10 +63,17 @@ const safeJson = (data) => {
     try { return JSON.parse(data); } catch (e) { return null; }
 };
 
-// --- МОДУЛЬ ИСТОРИИ (OHLC) ---
+// --- МОДУЛЬ ИСТОРИИ (MULTI-TIMEFRAME) ---
 setInterval(() => {
     const now = new Date();
-    const currentMinute = Math.floor(now.getTime() / 60000); 
+    const timeMs = now.getTime();
+
+    // Рассчитываем текущие периоды для каждого ТФ
+    const periods = {
+        '1m': Math.floor(timeMs / 60000),
+        '15m': Math.floor(timeMs / (15 * 60000)),
+        '1h': Math.floor(timeMs / (60 * 60000))
+    };
 
     Object.keys(GLOBAL_PRICES).forEach(symbol => {
         const prices = GLOBAL_PRICES[symbol];
@@ -75,25 +82,38 @@ setInterval(() => {
             const price = prices[source];
             if (!price) return; 
 
+            // Инициализация структур
             if (!CURRENT_CANDLES[symbol]) CURRENT_CANDLES[symbol] = {};
+            if (!CURRENT_CANDLES[symbol][source]) CURRENT_CANDLES[symbol][source] = {};
+            
             if (!HISTORY_OHLC[symbol]) HISTORY_OHLC[symbol] = {};
+            if (!HISTORY_OHLC[symbol][source]) HISTORY_OHLC[symbol][source] = {};
 
-            if (!CURRENT_CANDLES[symbol][source] || CURRENT_CANDLES[symbol][source].lastMinute !== currentMinute) {
-                if (CURRENT_CANDLES[symbol][source]) {
-                    if (!HISTORY_OHLC[symbol][source]) HISTORY_OHLC[symbol][source] = [];
-                    HISTORY_OHLC[symbol][source].push({ ...CURRENT_CANDLES[symbol][source] });
-                    if (HISTORY_OHLC[symbol][source].length > 25) HISTORY_OHLC[symbol][source].shift();
+            // Обработка каждого таймфрейма отдельно
+            TIMEFRAMES.forEach(tf => {
+                const currentPeriod = periods[tf];
+                let currentCandle = CURRENT_CANDLES[symbol][source][tf];
+
+                // Если свечи нет или наступил новый период
+                if (!currentCandle || currentCandle.lastPeriod !== currentPeriod) {
+                    // Сохраняем старую (если была)
+                    if (currentCandle) {
+                        if (!HISTORY_OHLC[symbol][source][tf]) HISTORY_OHLC[symbol][source][tf] = [];
+                        HISTORY_OHLC[symbol][source][tf].push({ ...currentCandle });
+                        if (HISTORY_OHLC[symbol][source][tf].length > 25) HISTORY_OHLC[symbol][source][tf].shift();
+                    }
+                    // Создаем новую
+                    CURRENT_CANDLES[symbol][source][tf] = {
+                        o: price, h: price, l: price, c: price,
+                        lastPeriod: currentPeriod
+                    };
+                } else {
+                    // Обновляем текущую
+                    if (price > currentCandle.h) currentCandle.h = price;
+                    if (price < currentCandle.l) currentCandle.l = price;
+                    currentCandle.c = price; 
                 }
-                CURRENT_CANDLES[symbol][source] = {
-                    o: price, h: price, l: price, c: price,
-                    lastMinute: currentMinute
-                };
-            } else {
-                const c = CURRENT_CANDLES[symbol][source];
-                if (price > c.h) c.h = price;
-                if (price < c.l) c.l = price;
-                c.c = price; 
-            }
+            });
         });
     });
 }, 1000);
@@ -101,8 +121,6 @@ setInterval(() => {
 /**
  * --- MONITORS ---
  */
-
-// 1. MEXC GLOBAL (WS)
 const initMexcGlobal = () => {
     let ws = null;
     const connect = () => {
@@ -128,7 +146,6 @@ const initMexcGlobal = () => {
     connect();
 };
 
-// 2. BINANCE GLOBAL (WS + REST)
 const initBinanceGlobal = () => {
     let ws = null;
     const connect = () => {
@@ -144,7 +161,6 @@ const initBinanceGlobal = () => {
         } catch (e) { setTimeout(connect, 5000); }
     };
     connect();
-
     setInterval(async () => {
         try {
             if(!fetch) return;
@@ -155,7 +171,6 @@ const initBinanceGlobal = () => {
     }, 3000);
 };
 
-// 3. BYBIT
 const initBybitGlobal = () => {
     setInterval(async () => {
         try {
@@ -169,7 +184,6 @@ const initBybitGlobal = () => {
     }, 1500);
 };
 
-// 4. GATE
 const initGateGlobal = () => {
     setInterval(async () => {
         try {
@@ -183,7 +197,6 @@ const initGateGlobal = () => {
     }, 2000);
 };
 
-// 5. BITGET (ИСПРАВЛЕНО: markPrice вместо markPr)
 const initBitgetGlobal = () => {
     setInterval(async () => {
         try {
@@ -197,7 +210,6 @@ const initBitgetGlobal = () => {
     }, 2000);
 };
 
-// 6. OKX
 const initOkxGlobal = () => {
     setInterval(async () => {
         try {
@@ -217,43 +229,24 @@ const initOkxGlobal = () => {
     }, 4000);
 };
 
-// 7. BINGX (ДОБАВЛЕН ЗАПРОС premiumIndex для Mark Price)
 const initBingxGlobal = () => {
-    // Last Price
     setInterval(async () => {
         try {
             if (!fetch) return;
             const res = await fetch('https://open-api.bingx.com/openApi/swap/v2/quote/ticker');
             const d = await res.json();
-            if (d.data) {
-                d.data.forEach(i => updateData(i.symbol, 'BingX', i.lastPrice));
-            }
+            if (d.data) d.data.forEach(i => updateData(i.symbol, 'BingX', i.lastPrice));
         } catch(e) {}
     }, 2000);
-
-    // Mark Price (premiumIndex)
-    setInterval(async () => {
-        try {
-            if (!fetch) return;
-            const res = await fetch('https://open-api.bingx.com/openApi/swap/v2/quote/premiumIndex');
-            const d = await res.json();
-            if (d.data) {
-                d.data.forEach(i => updateData(i.symbol, 'BingX', null, i.markPrice));
-            }
-        } catch(e) {}
-    }, 4000);
 };
 
-// 8. KUCOIN
 const initKucoinGlobal = () => {
     setInterval(async () => {
         try {
             if (!fetch) return;
             const res = await fetch('https://api-futures.kucoin.com/api/v1/allTickers');
             const d = await res.json();
-            if (d.data && Array.isArray(d.data)) {
-                d.data.forEach(i => updateData(i.symbol, 'Kucoin', i.price));
-            }
+            if (d.data && Array.isArray(d.data)) d.data.forEach(i => updateData(i.symbol, 'Kucoin', i.price));
         } catch(e) {}
     }, 2000);
     setInterval(async () => {
@@ -357,13 +350,21 @@ app.get('/api/all', authMiddleware, async (req, res) => {
 
     const globalAverage = count > 0 ? sum / count : 0;
 
+    // Сбор свечей для всех ТФ
     const allCandles = {};
     ALL_SOURCES.forEach(source => {
-        let sourceCandles = [];
-        if (HISTORY_OHLC[symbol] && HISTORY_OHLC[symbol][source]) sourceCandles = [...HISTORY_OHLC[symbol][source]];
-        if (CURRENT_CANDLES[symbol] && CURRENT_CANDLES[symbol][source]) sourceCandles.push(CURRENT_CANDLES[symbol][source]);
-        if (sourceCandles.length > 20) sourceCandles = sourceCandles.slice(-20);
-        if (sourceCandles.length > 0) allCandles[source] = sourceCandles;
+        allCandles[source] = {};
+        TIMEFRAMES.forEach(tf => {
+            let sourceCandles = [];
+            if (HISTORY_OHLC[symbol] && HISTORY_OHLC[symbol][source] && HISTORY_OHLC[symbol][source][tf]) {
+                sourceCandles = [...HISTORY_OHLC[symbol][source][tf]];
+            }
+            if (CURRENT_CANDLES[symbol] && CURRENT_CANDLES[symbol][source] && CURRENT_CANDLES[symbol][source][tf]) {
+                sourceCandles.push(CURRENT_CANDLES[symbol][source][tf]);
+            }
+            if (sourceCandles.length > 20) sourceCandles = sourceCandles.slice(-20);
+            if (sourceCandles.length > 0) allCandles[source][tf] = sourceCandles;
+        });
     });
 
     res.json({ ok: true, mexc: mexcPrice, prices, fairPrices, allCandles, average: globalAverage });
@@ -389,7 +390,7 @@ body { background: #000; font-family: monospace; font-size: 28px; color: #fff; p
 #startBtn, #mexcBtn { font-family: monospace; font-size: 28px; background: #222; color: #fff; border: 1px solid #444; cursor: pointer; padding: 0 10px; }
 #dexLink { font-family: monospace; font-size: 16px; width: 100%; background: #111; color: #888; border: 1px solid #333; padding: 5px; cursor: pointer; margin-top: 5px; }
 .dex-row { color: #00ff00; }
-.best { color: #ffff00; } /* Yellow for max spread */
+.best { color: #ffff00; } 
 .closed { color: #ff0000 !important; }
 .blink-dot { animation: blink 1s infinite; display: inline-block; }
 @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
@@ -404,7 +405,7 @@ body { background: #000; font-family: monospace; font-size: 28px; color: #fff; p
 
 #chart-container {
     margin-top: 10px; width: 100%; max-width: 480px; height: 300px; 
-    border: 1px solid #333; background: #050505; position: relative; margin-bottom: 5px;
+    border: 1px solid #333; background: #050505; position: relative; margin-bottom: 5px; cursor: pointer;
 }
 #fair-price-display {
     margin-top: 2px; font-size: 14px; color: #888; text-align: right; max-width: 480px; font-family: Arial, sans-serif;
@@ -417,6 +418,7 @@ svg { width: 100%; height: 100%; display: block; }
 .chart-text { font-family: Arial, sans-serif; font-size: 8px; }
 .corner-label { fill: #ffff00; font-size: 8px; font-weight: bold; }
 .vol-label { fill: #fff; font-size: 8px; font-weight: bold; }
+.tf-label { fill: #ccc; font-size: 8px; font-weight: bold; }
 .arrow-label { font-size: 8px; font-weight: bold; }
 .gap-label { font-size: 8px; font-weight: bold; }
 .watermark { font-size: 30px; font-family: Arial, sans-serif; fill: #333; font-weight: bold; opacity: 0.6; }
@@ -434,7 +436,7 @@ svg { width: 100%; height: 100%; display: block; }
     <button id="startBtn">СТАРТ</button>  
     <button id="mexcBtn">MEXC</button>
 </div>  
-<div id="chart-container"></div>
+<div id="chart-container" onclick="switchTimeframe()"></div>
 <div id="fair-price-display"></div>
 <input id="dexLink" readonly placeholder="DEX URL" onclick="this.select(); document.execCommand('copy');" />  
 <div id="status" style="font-size: 18px; margin-top: 5px; color: #444;"></div>  
@@ -451,6 +453,9 @@ let timer = null, blink = false;
 
 let urlEx = urlParams.get('ex');
 let activeSource = 'MEXC'; 
+let activeTimeframe = '1m';
+const timeframes = ['1m', '15m', '1h'];
+
 if (urlEx) {
     let normalized = urlEx.trim().toLowerCase();
     for (let src of allSources) {
@@ -481,6 +486,13 @@ function go() {
 function setSource(source) {
     activeSource = source;
     manualSourceSelection = true;
+    update();
+}
+
+function switchTimeframe() {
+    let idx = timeframes.indexOf(activeTimeframe);
+    idx = (idx + 1) % timeframes.length;
+    activeTimeframe = timeframes[idx];
     update();
 }
 
@@ -519,7 +531,9 @@ function renderChart(candles, gap, sourceName) {
     svgHtml += \`<text x="50" y="55" text-anchor="middle" dominant-baseline="middle" class="watermark">\${sourceName}</text>\`;
     svgHtml += \`<text x="0.5" y="7" class="chart-text corner-label">\${formatP(maxPrice)}</text>\`;
     svgHtml += \`<text x="0.5" y="99" class="chart-text corner-label">\${formatP(minPrice)}</text>\`;
-    svgHtml += \`<text x="99" y="7" text-anchor="end" class="chart-text vol-label">\${volatility}%</text>\`;
+    
+    // Timeframe and Volatility label
+    svgHtml += \`<text x="99" y="7" text-anchor="end" class="chart-text vol-label">\${activeTimeframe} | \${volatility}%</text>\`;
 
     if (gap !== undefined && gap !== null && !isNaN(gap)) {
         let gapColor = gap >= 0 ? '#ff0000' : '#00ff00';
@@ -546,7 +560,7 @@ function renderChart(candles, gap, sourceName) {
         const rectX = xCenter - (bodyWidth / 2);
         svgHtml += \`<rect x="\${rectX}" y="\${rectY}" width="\${bodyWidth}" height="\${rectH}" class="candle-body \${colorClass}" />\`;
 
-        // СТРЕЛКИ ВНУТРИ ДИАПАЗОНА СВЕЧИ
+        // ARROWS INSIDE CANDLE ZONE
         if (c.h === maxPrice) svgHtml += \`<text x="\${xCenter}" y="\${yHigh + 8}" fill="\${arrowColor}" text-anchor="middle" class="chart-text arrow-label">↑</text>\`;
         if (c.l === minPrice) svgHtml += \`<text x="\${xCenter}" y="\${yLow - 2}" fill="\${arrowColor}" text-anchor="middle" class="chart-text arrow-label">↓</text>\`;
     });
@@ -595,7 +609,7 @@ async function update() {
         }
         if(!mainPrice) mainPrice = 0;
 
-        let activeFair = (data.fairPrices && data.fairPrices[activeSource]) ? data.fairPrices[activeSource] : 0;
+        let activeFair = (data.fairPrices && data.fairPrices[activeSource]) ? data.fairPrices[activeSource] : data.average;
         
         let chartGap = null;
         if (mainPrice > 0 && activeFair > 0) {
@@ -669,9 +683,12 @@ async function update() {
         output.innerHTML = lines.join("<br>"); 
         statusEl.textContent = "Last: " + new Date().toLocaleTimeString();  
         
-        let candlesToRender = (data.allCandles && data.allCandles[activeSource]) ? data.allCandles[activeSource] : [];
-        if(candlesToRender.length > 0) {
-            renderChart(candlesToRender, chartGap, activeSource);
+        let candles = (data.allCandles && data.allCandles[activeSource] && data.allCandles[activeSource][activeTimeframe]) 
+                      ? data.allCandles[activeSource][activeTimeframe] 
+                      : [];
+                      
+        if(candles.length > 0) {
+            renderChart(candles, chartGap, activeSource);
         } else {
              chartContainer.innerHTML = '';
         }
@@ -723,4 +740,4 @@ if (urlParams.get('symbol')) start();
 });
 
 app.listen(CONFIG.PORT, () => console.log(`🚀 Server running on port ${CONFIG.PORT}`));
-                                                                                       
+                                                       
