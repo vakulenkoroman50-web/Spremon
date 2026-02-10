@@ -25,11 +25,13 @@ const EXCHANGES_ORDER = ["Binance", "Bybit", "Gate", "Bitget", "BingX", "OKX", "
 const GLOBAL_PRICES = {};
 let MEXC_CONFIG_CACHE = null;
 
-// Хранилище свечей
+// Хранилище свечей: { "BTCUSDT": [{o, h, l, c}, ...] }
 const HISTORY_OHLC = {}; 
+// Текущая формируемая свеча
 const CURRENT_CANDLES = {};
 
 // --- ФУНКЦИЯ ОБНОВЛЕНИЯ ЦЕНЫ ---
+// Теперь принимает extraData для сохранения Fair Price от MEXC
 const updatePrice = (symbol, exchange, price, extraData = null) => {
     if (!symbol || !price) return;
     
@@ -45,7 +47,7 @@ const updatePrice = (symbol, exchange, price, extraData = null) => {
     if (!GLOBAL_PRICES[s]) GLOBAL_PRICES[s] = {};
     GLOBAL_PRICES[s][exchange] = p;
 
-    // Сохраняем Fair Price от MEXC
+    // Если это MEXC и есть fairPrice, сохраняем его отдельно
     if (exchange === 'MEXC' && extraData && extraData.fairPrice) {
         GLOBAL_PRICES[s]['MEXC_FAIR'] = parseFloat(extraData.fairPrice);
     }
@@ -58,23 +60,19 @@ setInterval(() => {
 
     Object.keys(GLOBAL_PRICES).forEach(symbol => {
         const prices = GLOBAL_PRICES[symbol];
-        
-        // Логика выбора цены для истории: MEXC -> Другие
-        let price = prices['MEXC'];
-        if (!price) {
-            for (let ex of EXCHANGES_ORDER) {
-                if (prices[ex]) { price = prices[ex]; break; }
-            }
-        }
+        const price = prices['MEXC'] || prices['Binance'];
         
         if (!price) return;
 
         if (!CURRENT_CANDLES[symbol] || CURRENT_CANDLES[symbol].lastMinute !== currentMinute) {
+            
             if (CURRENT_CANDLES[symbol]) {
                 if (!HISTORY_OHLC[symbol]) HISTORY_OHLC[symbol] = [];
                 HISTORY_OHLC[symbol].push({ ...CURRENT_CANDLES[symbol] });
+                // Держим буфер с запасом (25), отдавать будем 20
                 if (HISTORY_OHLC[symbol].length > 25) HISTORY_OHLC[symbol].shift();
             }
+
             CURRENT_CANDLES[symbol] = {
                 o: price, h: price, l: price, c: price,
                 lastMinute: currentMinute
@@ -95,6 +93,7 @@ const safeJson = (data) => {
 /**
  * --- GLOBAL MONITORS ---
  */
+// 1. MEXC GLOBAL
 const initMexcGlobal = () => {
     let ws = null;
     const connect = () => {
@@ -110,6 +109,7 @@ const initMexcGlobal = () => {
                 if (d.method === 'ping') { ws.send(JSON.stringify({ "method": "pong" })); return; }
                 if (d.channel === 'push.tickers' && d.data) {
                     const items = Array.isArray(d.data) ? d.data : [d.data];
+                    // Передаем весь объект 'i', чтобы вытащить fairPrice внутри updatePrice
                     items.forEach(i => updatePrice(i.symbol, 'MEXC', i.lastPrice, i));
                 }
             });
@@ -120,6 +120,7 @@ const initMexcGlobal = () => {
     connect();
 };
 
+// 2. BINANCE GLOBAL
 const initBinanceGlobal = () => {
     let ws = null;
     const connect = () => {
@@ -140,12 +141,36 @@ const initBinanceGlobal = () => {
 };
 
 // POLLERS
-const initBybitGlobal = () => { setInterval(async () => { try { if (!fetch) return; const res = await fetch('https://api.bybit.com/v5/market/tickers?category=linear'); const d = await res.json(); if (d.result && d.result.list) d.result.list.forEach(i => updatePrice(i.symbol, 'Bybit', i.lastPrice)); } catch(e) {} }, 1500); };
-const initGateGlobal = () => { setInterval(async () => { try { if (!fetch) return; const res = await fetch('https://api.gateio.ws/api/v4/futures/usdt/tickers'); const data = await res.json(); if (Array.isArray(data)) data.forEach(i => updatePrice(i.contract, 'Gate', i.last)); } catch(e) {} }, 2000); };
-const initBitgetGlobal = () => { setInterval(async () => { try { if (!fetch) return; const res = await fetch('https://api.bitget.com/api/v2/mix/market/tickers?productType=USDT-FUTURES'); const d = await res.json(); if (d.data) d.data.forEach(i => updatePrice(i.symbol, 'Bitget', i.lastPr)); } catch(e) {} }, 2000); };
-const initOkxGlobal = () => { setInterval(async () => { try { if (!fetch) return; const res = await fetch('https://www.okx.com/api/v5/market/tickers?instType=SWAP'); const d = await res.json(); if (d.data) d.data.forEach(i => { if (i.instId.endsWith('USDT-SWAP')) updatePrice(i.instId, 'OKX', i.last); }); } catch(e) {} }, 2000); };
-const initBingxGlobal = () => { setInterval(async () => { try { if (!fetch) return; const res = await fetch('https://open-api.bingx.com/openApi/swap/v2/quote/ticker'); const d = await res.json(); if (d.data) d.data.forEach(i => updatePrice(i.symbol, 'BingX', i.lastPrice)); } catch(e) {} }, 2000); };
-const initKucoinGlobal = () => { setInterval(async () => { try { if (!fetch) return; const res = await fetch('https://api-futures.kucoin.com/api/v1/allTickers'); const d = await res.json(); if (d.data && Array.isArray(d.data)) d.data.forEach(i => updatePrice(i.symbol, 'Kucoin', i.price)); } catch(e) {} }, 2000); };
+const initBybitGlobal = () => {
+    setInterval(async () => {
+        try { if (!fetch) return; const res = await fetch('https://api.bybit.com/v5/market/tickers?category=linear'); const d = await res.json(); if (d.result && d.result.list) d.result.list.forEach(i => updatePrice(i.symbol, 'Bybit', i.lastPrice)); } catch(e) {}
+    }, 1500);
+};
+const initGateGlobal = () => {
+    setInterval(async () => {
+        try { if (!fetch) return; const res = await fetch('https://api.gateio.ws/api/v4/futures/usdt/tickers'); const data = await res.json(); if (Array.isArray(data)) data.forEach(i => updatePrice(i.contract, 'Gate', i.last)); } catch(e) {}
+    }, 2000);
+};
+const initBitgetGlobal = () => {
+    setInterval(async () => {
+        try { if (!fetch) return; const res = await fetch('https://api.bitget.com/api/v2/mix/market/tickers?productType=USDT-FUTURES'); const d = await res.json(); if (d.data) d.data.forEach(i => updatePrice(i.symbol, 'Bitget', i.lastPr)); } catch(e) {}
+    }, 2000);
+};
+const initOkxGlobal = () => {
+    setInterval(async () => {
+        try { if (!fetch) return; const res = await fetch('https://www.okx.com/api/v5/market/tickers?instType=SWAP'); const d = await res.json(); if (d.data) d.data.forEach(i => { if (i.instId.endsWith('USDT-SWAP')) updatePrice(i.instId, 'OKX', i.last); }); } catch(e) {}
+    }, 2000);
+};
+const initBingxGlobal = () => {
+    setInterval(async () => {
+        try { if (!fetch) return; const res = await fetch('https://open-api.bingx.com/openApi/swap/v2/quote/ticker'); const d = await res.json(); if (d.data) d.data.forEach(i => updatePrice(i.symbol, 'BingX', i.lastPrice)); } catch(e) {}
+    }, 2000);
+};
+const initKucoinGlobal = () => {
+    setInterval(async () => {
+        try { if (!fetch) return; const res = await fetch('https://api-futures.kucoin.com/api/v1/allTickers'); const d = await res.json(); if (d.data && Array.isArray(d.data)) d.data.forEach(i => updatePrice(i.symbol, 'Kucoin', i.price)); } catch(e) {}
+    }, 2000);
+};
 
 initMexcGlobal();
 initBinanceGlobal();
@@ -238,13 +263,14 @@ app.get('/api/all', authMiddleware, async (req, res) => {
 
     const marketData = GLOBAL_PRICES[symbol] || {};
     const mexcPrice = marketData['MEXC'] || 0;
-    const mexcFair = marketData['MEXC_FAIR'] || 0; 
+    const mexcFair = marketData['MEXC_FAIR'] || 0; // Берем сохраненный Fair Price от MEXC
 
     const prices = {};
     EXCHANGES_ORDER.forEach(ex => {
         prices[ex] = marketData[ex] || 0;
     });
 
+    // Расчет гэпа в %: (MEXC_LAST - MEXC_FAIR) / MEXC_FAIR
     let gapPercent = 0;
     if (mexcPrice > 0 && mexcFair > 0) {
         gapPercent = ((mexcPrice - mexcFair) / mexcFair) * 100;
@@ -254,6 +280,7 @@ app.get('/api/all', authMiddleware, async (req, res) => {
     if (CURRENT_CANDLES[symbol]) {
         candles.push(CURRENT_CANDLES[symbol]);
     }
+    // Ограничиваем 20 последними
     if (candles.length > 20) candles = candles.slice(-20);
 
     res.json({ ok: true, mexc: mexcPrice, prices, candles, gap: gapPercent });
@@ -311,8 +338,6 @@ svg { width: 100%; height: 100%; display: block; }
 .vol-label { fill: #fff; font-size: 8px; font-weight: bold; }
 .arrow-label { font-size: 8px; font-weight: bold; }
 .gap-label { font-size: 8px; font-weight: bold; }
-/* Watermark Style */
-.watermark { font-size: 20px; font-family: Arial, sans-serif; fill: #444; font-weight: bold; opacity: 0.5; }
 </style>
 </head>
 <body>
@@ -368,7 +393,7 @@ function go() {
 }
 function formatP(p) { return (p && p != 0) ? parseFloat(p).toString() : "0"; }  
 
-function renderChart(candles, gap, sourceName) {
+function renderChart(candles, gap) {
     if (!candles || candles.length < 2) {
         chartContainer.innerHTML = '';
         return;
@@ -401,22 +426,15 @@ function renderChart(candles, gap, sourceName) {
 
     let svgHtml = '<svg viewBox="0 0 100 100" preserveAspectRatio="none">';
 
-    // --- WATERMARK (ИСТОЧНИК ДАННЫХ) ---
-    svgHtml += \`<text x="50" y="55" text-anchor="middle" dominant-baseline="middle" class="watermark">\${sourceName}</text>\`;
-
     // --- УГЛОВЫЕ МЕТКИ ---
     svgHtml += \`<text x="0.5" y="7" class="chart-text corner-label">\${formatP(maxPrice)}</text>\`;
     svgHtml += \`<text x="0.5" y="99" class="chart-text corner-label">\${formatP(minPrice)}</text>\`;
     svgHtml += \`<text x="99" y="7" text-anchor="end" class="chart-text vol-label">\${volatility}%</text>\`;
 
     // --- GAP В ПРАВОМ НИЖНЕМ УГЛУ ---
-    // Выводим ВСЕГДА, если значение gap рассчитано (даже если < 5%)
-    // Цвета инвертированы: (+) = RED, (-) = GREEN
-    if (gap !== undefined && gap !== null && !isNaN(gap)) {
-        let gapColor = gap >= 0 ? '#ff0000' : '#00ff00';
-        let gapSign = gap > 0 ? '+' : '';
-        svgHtml += \`<text x="99" y="99" text-anchor="end" fill="\${gapColor}" class="chart-text gap-label">GAP: \${gapSign}\${gap.toFixed(2)}%</text>\`;
-    }
+    let gapColor = gap >= 0 ? '#00ff00' : '#ff0000';
+    let gapSign = gap > 0 ? '+' : '';
+    svgHtml += \`<text x="99" y="99" text-anchor="end" fill="\${gapColor}" class="chart-text gap-label">GAP: \${gapSign}\${gap.toFixed(2)}%</text>\`;
 
     // --- СВЕЧИ ---
     candles.forEach((c, index) => {
@@ -431,13 +449,16 @@ function renderChart(candles, gap, sourceName) {
         const colorClass = isGreen ? 'green' : 'red';
         const arrowColor = isGreen ? '#000000' : '#ffffff';
 
+        // Фитиль
         svgHtml += \`<line x1="\${xCenter}" y1="\${yHigh}" x2="\${xCenter}" y2="\${yLow}" class="candle-wick \${colorClass}" />\`;
 
+        // Тело
         const rectY = Math.min(yOpen, yClose);
         const rectH = Math.abs(yClose - yOpen) || 0.4; 
         const rectX = xCenter - (bodyWidth / 2);
         svgHtml += \`<rect x="\${rectX}" y="\${rectY}" width="\${bodyWidth}" height="\${rectH}" class="candle-body \${colorClass}" />\`;
 
+        // --- СТРЕЛКИ ---
         if (c.h === maxPrice) {
             const arrowY = rectY + (rectH / 2) + 2; 
             svgHtml += \`<text x="\${xCenter}" y="\${arrowY}" fill="\${arrowColor}" text-anchor="middle" class="chart-text arrow-label">↑</text>\`;
@@ -477,7 +498,7 @@ async function update() {
     }  
     blink = !blink;  
     try {  
-        const res = await fetch('/api/all?symbol=' + encodeURIComponent(symbol) + '&token=' + token);  
+        const res = await fetch('/api/all?symbol=' + symbol + '&token=' + token);  
         if (res.status === 403) {  
             window.location.reload(); 
             return;  
@@ -485,15 +506,8 @@ async function update() {
         const data = await res.json();  
         if(!data.ok) return;  
         
-        let mainPrice = data.mexc;
-        let showGap = true;
-
-        if (!mainPrice || mainPrice == 0) {
-            showGap = false; 
-        }
-        
-        if (!dexPrice) {
-             let pStr = formatP(mainPrice);
+        if (!dexPrice && data.mexc) {
+             let pStr = formatP(data.mexc);
              let sStr = symbol;
              const maxLen = 18; 
              if ((sStr.length + pStr.length + 2) > maxLen) {
@@ -505,19 +519,14 @@ async function update() {
         }
 
         let dotColorClass = depositOpen ? '' : 'closed';  
+        let dot = blink ? '<span class="blink-dot '+dotColorClass+'">●</span>' : '○';  
         
-        // --- ФОРМАТИРОВАНИЕ ЧЕРЕЗ BR ---
+        // --- ФОРМИРОВАНИЕ ПЕРВОЙ СТРОКИ (MEXC) ---
+        let mexcLine = dot + ' ' + symbol + ' MEXC: ' + formatP(data.mexc);
         
-        let dotSymbol = blink ? '<span class="'+dotColorClass+'">●</span>' : '○';
-        // Добавлен &nbsp; после точки
-        let dotHtml = '<span style="display:inline-block; width:15px; text-align:center; font-family:Arial, sans-serif; line-height:1;">' + dotSymbol + '</span>&nbsp;';
-        
-        let mexcLine = dotHtml + symbol + ' MEXC: ' + formatP(mainPrice);
-        
-        // GAP в тексте (только если > 5%)
-        // Цвета инвертированы: (+) = RED, (-) = GREEN
-        if (showGap && data.gap && Math.abs(data.gap) > 5) {
-            let gapColor = data.gap >= 0 ? '#ff0000' : '#00ff00';
+        // Добавляем GAP если он > 5% по модулю (Используем GAP от MEXC)
+        if (data.gap && Math.abs(data.gap) > 5) {
+            let gapColor = data.gap >= 0 ? '#00ff00' : '#ff0000';
             let gapSign = data.gap > 0 ? '+' : '';
             mexcLine += \` <span style="color:\${gapColor}">(\${gapSign}\${data.gap.toFixed(2)}%)</span>\`;
         }
@@ -525,38 +534,30 @@ async function update() {
         let lines = [mexcLine];  
         
         if (dexPrice > 0) {  
-            let diff = ((dexPrice - mainPrice) / mainPrice * 100).toFixed(2);  
+            let diff = ((dexPrice - data.mexc) / data.mexc * 100).toFixed(2);  
             lines.push('<span class="dex-row">◇ DEX     : ' + formatP(dexPrice) + ' (' + (diff > 0 ? "+" : "") + diff + '%)</span>');  
         }  
         let bestEx = null, maxSp = 0;  
         exchangesOrder.forEach(ex => {  
             let p = data.prices[ex];  
             if (p > 0) {  
-                let sp = Math.abs((p - mainPrice) / mainPrice * 100);  
+                let sp = Math.abs((p - data.mexc) / data.mexc * 100);  
                 if (sp > maxSp) { maxSp = sp; bestEx = ex; }  
             }  
         });  
         exchangesOrder.forEach(ex => {  
             let p = data.prices[ex];  
             if (p > 0) {  
-                let diff = ((p - mainPrice) / mainPrice * 100).toFixed(2);  
+                let diff = ((p - data.mexc) / data.mexc * 100).toFixed(2);  
                 let cls = (ex === bestEx) ? 'class="best"' : '';  
                 let mark = (ex === bestEx) ? '◆' : '◇';  
                 lines.push('<span ' + cls + '>' + mark + ' ' + ex.padEnd(8, ' ') + ': ' + formatP(p) + ' (' + (diff > 0 ? "+" : "") + diff + '%)</span>');  
             }  
         });  
-        
-        output.innerHTML = lines.join("<br>"); // JOIN ЧЕРЕЗ <BR>
+        output.innerHTML = lines.join("<br>");  
         statusEl.textContent = "Last: " + new Date().toLocaleTimeString();  
         
-        let sourceName = 'MEXC';
-        if (mainPrice == 0) {
-             for (let ex of exchangesOrder) {
-                if (data.prices[ex] > 0) { sourceName = ex; break; }
-             }
-        }
-
-        if(data.candles) renderChart(data.candles, data.gap, sourceName);
+        if(data.candles) renderChart(data.candles, data.gap || 0);
 
     } catch(e) {}  
 }  
@@ -564,8 +565,6 @@ async function start() {
     let val = input.value.trim();  
     if(!val) return;  
     
-    input.blur();
-
     if(timer) clearInterval(timer);  
     output.innerHTML = "Поиск...";  
     
@@ -596,7 +595,7 @@ async function start() {
     timer = setInterval(update, 1000);  
 
     try {  
-        const res = await fetch('/api/resolve?symbol=' + encodeURIComponent(symbol) + '&token=' + token);  
+        const res = await fetch('/api/resolve?symbol=' + symbol + '&token=' + token);  
         if (res.status === 403) return;  
         const d = await res.json();  
         if (d.ok) {   
@@ -618,12 +617,7 @@ document.getElementById("mexcBtn").onclick = function() {
     let val = input.value.trim().toUpperCase();
     if(val) window.location.href = "mxcappscheme://kline?extra_page_name=其他&trade_pair=" + val + "_USDT&contract=1";
 };
-input.addEventListener("keypress", (e) => { 
-    if(e.key === "Enter") {
-        input.blur(); 
-        start(); 
-    }
-});  
+input.addEventListener("keypress", (e) => { if(e.key === "Enter") start(); });  
 
 if (urlParams.get('symbol')) start();  
 </script>  
