@@ -244,11 +244,6 @@ app.get('/api/all', authMiddleware, async (req, res) => {
         prices[ex] = marketData[ex] || 0;
     });
 
-    let gapPercent = 0;
-    if (mexcPrice > 0 && mexcFair > 0) {
-        gapPercent = ((mexcPrice - mexcFair) / mexcFair) * 100;
-    }
-
     const allCandles = {};
     ALL_SOURCES.forEach(source => {
         let sourceCandles = [];
@@ -265,7 +260,8 @@ app.get('/api/all', authMiddleware, async (req, res) => {
         }
     });
 
-    res.json({ ok: true, mexc: mexcPrice, prices, allCandles, gap: gapPercent });
+    // Отдаем чистый fair price, гэп считает клиент
+    res.json({ ok: true, mexc: mexcPrice, prices, allCandles, fair: mexcFair });
 });
 
 app.get('/', (req, res) => {
@@ -500,15 +496,9 @@ async function update() {
         const data = await res.json();  
         if(!data.ok) return;  
         
-        let mainPrice = data.mexc; // Это цена именно MEXC, для заголовка
-        
-        // --- БАЗОВАЯ ЦЕНА (от которой считаем спреды) ---
-        // Если activeSource == MEXC -> берем data.mexc
-        // Если activeSource == Binance -> берем data.prices['Binance']
-        let basePrice = (activeSource === 'MEXC') ? data.mexc : data.prices[activeSource];
-        if (!basePrice || basePrice == 0) basePrice = mainPrice; // Fallback
+        let mainPrice = data.mexc;
+        let fairPrice = data.fair || 0;
 
-        // Авто-переключение источника, только если ручного выбора не было
         if (!manualSourceSelection) {
             if (mainPrice > 0) activeSource = 'MEXC';
             else {
@@ -516,6 +506,22 @@ async function update() {
                     if (data.prices[ex] > 0) { activeSource = ex; break; }
                 }
             }
+        }
+        
+        // Цена "Активной" биржи (для расчетов GAP и Спредов)
+        let activePrice = (activeSource === 'MEXC') ? mainPrice : data.prices[activeSource];
+        if (!activePrice || activePrice == 0) activePrice = mainPrice;
+
+        // Расчет GAP для ГРАФИКА (относительно активной биржи)
+        let chartGap = 0;
+        if (activePrice > 0 && fairPrice > 0) {
+            chartGap = ((activePrice - fairPrice) / fairPrice) * 100;
+        }
+
+        // Расчет GAP для строки MEXC (всегда MEXC)
+        let mexcGap = 0;
+        if (mainPrice > 0 && fairPrice > 0) {
+            mexcGap = ((mainPrice - fairPrice) / fairPrice) * 100;
         }
         
         if (!dexPrice) {
@@ -541,30 +547,30 @@ async function update() {
         let mexcLine = dotHtml + mexcPart;
         
         // Спред для MEXC (если активен не MEXC)
-        if (activeSource !== 'MEXC' && basePrice > 0 && mainPrice > 0) {
-             let diff = ((mainPrice - basePrice) / basePrice * 100).toFixed(2);
+        if (activeSource !== 'MEXC' && activePrice > 0 && mainPrice > 0) {
+             let diff = ((mainPrice - activePrice) / activePrice * 100).toFixed(2);
              mexcLine += ' (' + (diff > 0 ? "+" : "") + diff + '%)';
         }
 
-        // GAP (Только если > 5% и цена есть, оставляем как "фишку" MEXC)
-        if (mainPrice > 0 && data.gap && Math.abs(data.gap) > 5) {
-            let gapColor = data.gap >= 0 ? '#ff0000' : '#00ff00';
-            let gapSign = data.gap > 0 ? '+' : '';
-            mexcLine += \` <span style="color:\${gapColor}">(\${gapSign}\${data.gap.toFixed(2)}%)</span>\`;
+        // GAP (Вывод в строке MEXC - это GAP MEXC, а не активной)
+        if (mainPrice > 0 && fairPrice > 0 && Math.abs(mexcGap) > 5) {
+            let gapColor = mexcGap >= 0 ? '#ff0000' : '#00ff00';
+            let gapSign = mexcGap > 0 ? '+' : '';
+            mexcLine += \` <span style="color:\${gapColor}">(\${gapSign}\${mexcGap.toFixed(2)}%)</span>\`;
         }
 
         let lines = [mexcLine];  
         
         if (dexPrice > 0) {  
-            // DEX спред считаем от basePrice (активной биржи)
-            let diff = ((dexPrice - basePrice) / basePrice * 100).toFixed(2);  
+            // DEX спред считаем от activePrice
+            let diff = ((dexPrice - activePrice) / activePrice * 100).toFixed(2);  
             lines.push('<span class="dex-row">◇ DEX     : ' + formatP(dexPrice) + ' (' + (diff > 0 ? "+" : "") + diff + '%)</span>');  
         }  
         let bestEx = null, maxSp = 0;  
         exchangesOrder.forEach(ex => {  
             let p = data.prices[ex];  
             if (p > 0) {  
-                let sp = Math.abs((p - basePrice) / basePrice * 100);  
+                let sp = Math.abs((p - activePrice) / activePrice * 100);  
                 if (sp > maxSp) { maxSp = sp; bestEx = ex; }  
             }  
         });  
@@ -572,7 +578,7 @@ async function update() {
         exchangesOrder.forEach(ex => {  
             let p = data.prices[ex];  
             if (p > 0) {  
-                let diff = ((p - basePrice) / basePrice * 100).toFixed(2);  
+                let diff = ((p - activePrice) / activePrice * 100).toFixed(2);  
                 let cls = (ex === bestEx) ? 'class="best"' : '';  
                 let mark = (ex === bestEx) ? '◆' : '◇';  
                 let activeClass = (activeSource === ex) ? 'exchange-active' : '';
@@ -587,7 +593,7 @@ async function update() {
         
         let candlesToRender = (data.allCandles && data.allCandles[activeSource]) ? data.allCandles[activeSource] : [];
         if(candlesToRender.length > 0) {
-            renderChart(candlesToRender, data.gap, activeSource);
+            renderChart(candlesToRender, chartGap, activeSource);
         } else {
              chartContainer.innerHTML = '';
         }
@@ -669,4 +675,4 @@ if (urlParams.get('symbol')) start();
 });
 
 app.listen(CONFIG.PORT, () => console.log(`🚀 Server running on port ${CONFIG.PORT}`));
-                    
+                
