@@ -25,66 +25,38 @@ const EXCHANGES_ORDER = ["Binance", "Bybit", "Gate", "Bitget", "BingX", "OKX", "
 const GLOBAL_PRICES = {};
 let MEXC_CONFIG_CACHE = null;
 
-// Хранилище свечей: { "BTCUSDT": [{o, h, l, c}, ...] }
-const HISTORY_OHLC = {}; 
-// Текущая формируемая свеча
-const CURRENT_CANDLES = {};
-
-// --- ФУНКЦИЯ ОБНОВЛЕНИЯ ЦЕНЫ ---
-// Теперь принимает extraData для сохранения Fair Price от MEXC
-const updatePrice = (symbol, exchange, price, extraData = null) => {
+// --- ИСПРАВЛЕННАЯ ФУНКЦИЯ ОБНОВЛЕНИЯ ЦЕНЫ ---
+const updatePrice = (symbol, exchange, price) => {
     if (!symbol || !price) return;
     
     let s = symbol.toUpperCase();
+
+    // 1. Специфичные фиксы для бирж (до очистки)
+    // KuCoin использует XBT вместо BTC
     if (s.startsWith('XBT')) s = s.replace('XBT', 'BTC');
+
+    // 2. Удаляем разделители (- и _)
     s = s.replace(/[-_]/g, '');
+
+    // 3. Удаляем суффиксы СТРОГО В КОНЦЕ СТРОКИ ($ означает конец)
+    // Порядок важен!
+    
+    // OKX шлет 'BTC-USDT-SWAP' -> 'BTCUSDTSWAP' -> удаляем 'SWAP' в конце
     s = s.replace(/SWAP$/, '');
+
+    // KuCoin шлет 'BTCUSDTM' -> удаляем 'M' только если перед ним USDT
+    // Binance/Mexc шлют 'BTCUSDT'
+    // Регулярка: Ищем USDT, за которым может идти M, в конце строки
     s = s.replace(/USDTM?$/, ''); 
+    
+    // На случай пар к USD
     s = s.replace(/USD$/, '');
 
-    const p = parseFloat(price);
-
+    // Сохраняем
     if (!GLOBAL_PRICES[s]) GLOBAL_PRICES[s] = {};
-    GLOBAL_PRICES[s][exchange] = p;
-
-    // Если это MEXC и есть fairPrice, сохраняем его отдельно
-    if (exchange === 'MEXC' && extraData && extraData.fairPrice) {
-        GLOBAL_PRICES[s]['MEXC_FAIR'] = parseFloat(extraData.fairPrice);
-    }
+    GLOBAL_PRICES[s][exchange] = parseFloat(price);
 };
-
-// --- МОДУЛЬ ИСТОРИИ (OHLC - 20 МИНУТ) ---
-setInterval(() => {
-    const now = new Date();
-    const currentMinute = Math.floor(now.getTime() / 60000); 
-
-    Object.keys(GLOBAL_PRICES).forEach(symbol => {
-        const prices = GLOBAL_PRICES[symbol];
-        const price = prices['MEXC'] || prices['Binance'];
-        
-        if (!price) return;
-
-        if (!CURRENT_CANDLES[symbol] || CURRENT_CANDLES[symbol].lastMinute !== currentMinute) {
-            
-            if (CURRENT_CANDLES[symbol]) {
-                if (!HISTORY_OHLC[symbol]) HISTORY_OHLC[symbol] = [];
-                HISTORY_OHLC[symbol].push({ ...CURRENT_CANDLES[symbol] });
-                // Держим буфер с запасом (25), отдавать будем 20
-                if (HISTORY_OHLC[symbol].length > 25) HISTORY_OHLC[symbol].shift();
-            }
-
-            CURRENT_CANDLES[symbol] = {
-                o: price, h: price, l: price, c: price,
-                lastMinute: currentMinute
-            };
-        } else {
-            const c = CURRENT_CANDLES[symbol];
-            if (price > c.h) c.h = price;
-            if (price < c.l) c.l = price;
-            c.c = price; 
-        }
-    });
-}, 1000);
+// ---------------------------------------------
 
 const safeJson = (data) => {
     try { return JSON.parse(data); } catch (e) { return null; }
@@ -109,8 +81,7 @@ const initMexcGlobal = () => {
                 if (d.method === 'ping') { ws.send(JSON.stringify({ "method": "pong" })); return; }
                 if (d.channel === 'push.tickers' && d.data) {
                     const items = Array.isArray(d.data) ? d.data : [d.data];
-                    // Передаем весь объект 'i', чтобы вытащить fairPrice внутри updatePrice
-                    items.forEach(i => updatePrice(i.symbol, 'MEXC', i.lastPrice, i));
+                    items.forEach(i => updatePrice(i.symbol, 'MEXC', i.lastPrice));
                 }
             });
             ws.on('error', () => {});
@@ -140,38 +111,95 @@ const initBinanceGlobal = () => {
     connect();
 };
 
-// POLLERS
+// 3. BYBIT GLOBAL
 const initBybitGlobal = () => {
     setInterval(async () => {
-        try { if (!fetch) return; const res = await fetch('https://api.bybit.com/v5/market/tickers?category=linear'); const d = await res.json(); if (d.result && d.result.list) d.result.list.forEach(i => updatePrice(i.symbol, 'Bybit', i.lastPrice)); } catch(e) {}
+        try {
+            if (!fetch) return;
+            const res = await fetch('https://api.bybit.com/v5/market/tickers?category=linear');
+            const d = await res.json();
+            if (d.result && d.result.list) {
+                d.result.list.forEach(i => updatePrice(i.symbol, 'Bybit', i.lastPrice));
+            }
+        } catch(e) {}
     }, 1500);
 };
+
+// 4. GATE GLOBAL
 const initGateGlobal = () => {
     setInterval(async () => {
-        try { if (!fetch) return; const res = await fetch('https://api.gateio.ws/api/v4/futures/usdt/tickers'); const data = await res.json(); if (Array.isArray(data)) data.forEach(i => updatePrice(i.contract, 'Gate', i.last)); } catch(e) {}
-    }, 2000);
-};
-const initBitgetGlobal = () => {
-    setInterval(async () => {
-        try { if (!fetch) return; const res = await fetch('https://api.bitget.com/api/v2/mix/market/tickers?productType=USDT-FUTURES'); const d = await res.json(); if (d.data) d.data.forEach(i => updatePrice(i.symbol, 'Bitget', i.lastPr)); } catch(e) {}
-    }, 2000);
-};
-const initOkxGlobal = () => {
-    setInterval(async () => {
-        try { if (!fetch) return; const res = await fetch('https://www.okx.com/api/v5/market/tickers?instType=SWAP'); const d = await res.json(); if (d.data) d.data.forEach(i => { if (i.instId.endsWith('USDT-SWAP')) updatePrice(i.instId, 'OKX', i.last); }); } catch(e) {}
-    }, 2000);
-};
-const initBingxGlobal = () => {
-    setInterval(async () => {
-        try { if (!fetch) return; const res = await fetch('https://open-api.bingx.com/openApi/swap/v2/quote/ticker'); const d = await res.json(); if (d.data) d.data.forEach(i => updatePrice(i.symbol, 'BingX', i.lastPrice)); } catch(e) {}
-    }, 2000);
-};
-const initKucoinGlobal = () => {
-    setInterval(async () => {
-        try { if (!fetch) return; const res = await fetch('https://api-futures.kucoin.com/api/v1/allTickers'); const d = await res.json(); if (d.data && Array.isArray(d.data)) d.data.forEach(i => updatePrice(i.symbol, 'Kucoin', i.price)); } catch(e) {}
+        try {
+            if (!fetch) return;
+            const res = await fetch('https://api.gateio.ws/api/v4/futures/usdt/tickers');
+            const data = await res.json();
+            if (Array.isArray(data)) {
+                data.forEach(i => updatePrice(i.contract, 'Gate', i.last));
+            }
+        } catch(e) {}
     }, 2000);
 };
 
+// 5. BITGET GLOBAL
+const initBitgetGlobal = () => {
+    setInterval(async () => {
+        try {
+            if (!fetch) return;
+            const res = await fetch('https://api.bitget.com/api/v2/mix/market/tickers?productType=USDT-FUTURES');
+            const d = await res.json();
+            if (d.data) {
+                d.data.forEach(i => updatePrice(i.symbol, 'Bitget', i.lastPr));
+            }
+        } catch(e) {}
+    }, 2000);
+};
+
+// 6. OKX GLOBAL
+const initOkxGlobal = () => {
+    setInterval(async () => {
+        try {
+            if (!fetch) return;
+            const res = await fetch('https://www.okx.com/api/v5/market/tickers?instType=SWAP');
+            const d = await res.json();
+            if (d.data) {
+                d.data.forEach(i => {
+                    if (i.instId.endsWith('USDT-SWAP')) updatePrice(i.instId, 'OKX', i.last);
+                });
+            }
+        } catch(e) {}
+    }, 2000);
+};
+
+// 7. BINGX GLOBAL
+const initBingxGlobal = () => {
+    setInterval(async () => {
+        try {
+            if (!fetch) return;
+            const res = await fetch('https://open-api.bingx.com/openApi/swap/v2/quote/ticker');
+            const d = await res.json();
+            if (d.data) {
+                d.data.forEach(i => updatePrice(i.symbol, 'BingX', i.lastPrice));
+            }
+        } catch(e) {}
+    }, 2000);
+};
+
+// 8. KUCOIN GLOBAL
+const initKucoinGlobal = () => {
+    setInterval(async () => {
+        try {
+            if (!fetch) return;
+            const res = await fetch('https://api-futures.kucoin.com/api/v1/allTickers');
+            const d = await res.json();
+            if (d.data && Array.isArray(d.data)) {
+                d.data.forEach(i => {
+                    updatePrice(i.symbol, 'Kucoin', i.price);
+                });
+            }
+        } catch(e) {}
+    }, 2000);
+};
+
+// ЗАПУСК ВСЕХ МОНИТОРОВ
 initMexcGlobal();
 initBinanceGlobal();
 initBybitGlobal();
@@ -180,6 +208,7 @@ initBitgetGlobal();
 initOkxGlobal();
 initBingxGlobal();
 initKucoinGlobal();
+
 
 // --- SERVER SETUP ---
 
@@ -219,27 +248,39 @@ async function mexcPrivateRequest(path, params = {}) {
     } catch (e) { return null; }
 }
 
+// Кэширование конфига
 async function updateMexcConfigCache() {
     try {
         if (!fetch) return;
+        console.log('[CACHE] Updating MEXC config...');
         const data = await mexcPrivateRequest("/api/v3/capital/config/getall");
-        if (data && Array.isArray(data)) MEXC_CONFIG_CACHE = data;
-    } catch (e) {}
+        if (data && Array.isArray(data)) {
+            MEXC_CONFIG_CACHE = data;
+            console.log('[CACHE] MEXC config updated. Items:', data.length);
+        }
+    } catch (e) { console.error('[CACHE ERR]', e); }
 }
 setInterval(updateMexcConfigCache, 60000);
+
 
 // --- API ROUTES ---
 
 app.get('/api/resolve', authMiddleware, async (req, res) => {
     const symbol = (req.query.symbol || '').toUpperCase();
+    
     let data = MEXC_CONFIG_CACHE;
     if (!data) data = await mexcPrivateRequest("/api/v3/capital/config/getall");
+    
     if (!data || !Array.isArray(data)) return res.json({ ok: false });
+
     const tokenData = data.find(t => t.coin === symbol);
     if (!tokenData?.networkList) return res.json({ ok: false });
+
     const depositOpen = tokenData.networkList.some(net => net.depositEnable);
+    
     let bestPair = null;
     const contracts = tokenData.networkList.filter(n => n.contract).map(n => n.contract);
+    
     await Promise.all(contracts.map(async (contract) => {
         try {
             const dsRes = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${contract}`);
@@ -253,44 +294,36 @@ app.get('/api/resolve', authMiddleware, async (req, res) => {
             }
         } catch (e) {}
     }));
-    res.json({ ok: true, chain: bestPair?.chainId, addr: bestPair?.pairAddress, url: bestPair?.url, depositOpen });
+
+    res.json({
+        ok: true,
+        chain: bestPair?.chainId,
+        addr: bestPair?.pairAddress,
+        url: bestPair?.url,
+        depositOpen
+    });
 });
 
 app.get('/api/all', authMiddleware, async (req, res) => {
+    // Безопасная нормализация запроса
     let symbol = (req.query.symbol || '').toUpperCase();
+    // Просто убираем USDT, чтобы найти ключ в базе
     symbol = symbol.replace('USDT', '');
+    
     if (!symbol) return res.json({ ok: false });
 
     const marketData = GLOBAL_PRICES[symbol] || {};
     const mexcPrice = marketData['MEXC'] || 0;
-    const mexcFair = marketData['MEXC_FAIR'] || 0; // Берем сохраненный Fair Price от MEXC
 
     const prices = {};
     EXCHANGES_ORDER.forEach(ex => {
         prices[ex] = marketData[ex] || 0;
     });
 
-    // Расчет гэпа в %: (MEXC_LAST - MEXC_FAIR) / MEXC_FAIR
-    let gapPercent = 0;
-    if (mexcPrice > 0 && mexcFair > 0) {
-        gapPercent = ((mexcPrice - mexcFair) / mexcFair) * 100;
-    }
-
-    let candles = HISTORY_OHLC[symbol] ? [...HISTORY_OHLC[symbol]] : [];
-    if (CURRENT_CANDLES[symbol]) {
-        candles.push(CURRENT_CANDLES[symbol]);
-    }
-    // Ограничиваем 20 последними
-    if (candles.length > 20) candles = candles.slice(-20);
-
-    res.json({ ok: true, mexc: mexcPrice, prices, candles, gap: gapPercent });
+    res.json({ ok: true, mexc: mexcPrice, prices });
 });
 
 app.get('/', (req, res) => {
-    if (req.query.token !== CONFIG.SECRET_TOKEN) {
-        return res.status(403).send("Доступ запрещён!");
-    }
-
     const initialSymbol = (req.query.symbol || '').toUpperCase();
     res.send(`
 <!DOCTYPE html>
@@ -302,7 +335,7 @@ app.get('/', (req, res) => {
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body { background: #000; font-family: monospace; font-size: 28px; color: #fff; padding: 10px; overflow: hidden; }
 #output { white-space: pre; line-height: 1.1; min-height: 280px; position: relative; }
-.control-row { display: flex; gap: 5px; margin-top: 0; flex-wrap: wrap; }
+.control-row { display: flex; gap: 5px; margin-top: 0; }
 #symbolInput { font-family: monospace; font-size: 28px; width: 100%; max-width: 280px; background: #000; color: #fff; border: 1px solid #444; }
 #startBtn { font-family: monospace; font-size: 28px; background: #222; color: #fff; border: 1px solid #444; cursor: pointer; padding: 0 10px; }
 #mexcBtn { font-family: monospace; font-size: 28px; background: #222; color: #fff; border: 1px solid #444; cursor: pointer; padding: 0 10px; }
@@ -316,28 +349,6 @@ body { background: #000; font-family: monospace; font-size: 28px; color: #fff; p
 #urlInput { width: 46%; padding: 10px; font-size: 36px; background-color: #222; color: #fff; border: 1px solid #444; outline: none; font-family: Arial, sans-serif; }
 #goBtn { padding: 10px 20px; font-size: 36px; cursor: pointer; background-color: #333; color: #fff; border: 1px solid #555; font-family: Arial, sans-serif; }
 #goBtn:hover { background-color: #888; }
-
-/* Chart Styles */
-#chart-container {
-    margin-top: 10px;
-    width: 100%;
-    max-width: 480px;
-    height: 300px; 
-    border: 1px solid #333;
-    background: #050505;
-    position: relative;
-    margin-bottom: 5px;
-}
-svg { width: 100%; height: 100%; display: block; }
-.candle-wick { stroke-width: 1; }
-.candle-body { stroke: none; }
-.green { stroke: #00ff00; fill: #00ff00; }
-.red { stroke: #ff0000; fill: #ff0000; }
-.chart-text { font-family: Arial, sans-serif; font-size: 8px; }
-.corner-label { fill: #ffff00; font-size: 8px; font-weight: bold; }
-.vol-label { fill: #fff; font-size: 8px; font-weight: bold; }
-.arrow-label { font-size: 8px; font-weight: bold; }
-.gap-label { font-size: 8px; font-weight: bold; }
 </style>
 </head>
 <body>
@@ -347,18 +358,13 @@ svg { width: 100%; height: 100%; display: block; }
         <button id="goBtn" onclick="go()">Go</button>
     </div>
 </div>
-
 <div class="control-row">  
     <input id="symbolInput" value="${initialSymbol}" placeholder="TICKER OR LINK" autocomplete="off" onfocus="this.select()" />  
     <button id="startBtn">СТАРТ</button>  
     <button id="mexcBtn">MEXC</button>
 </div>  
-
-<div id="chart-container"></div>
-
 <input id="dexLink" readonly placeholder="DEX URL" onclick="this.select(); document.execCommand('copy');" />  
 <div id="status" style="font-size: 18px; margin-top: 5px; color: #444;"></div>  
-
 <script>  
 const exchangesOrder = ["Binance", "Bybit", "Gate", "Bitget", "BingX", "OKX", "Kucoin"];  
 let urlParams = new URLSearchParams(window.location.search);  
@@ -373,8 +379,6 @@ const input = document.getElementById("symbolInput");
 const dexLink = document.getElementById("dexLink");  
 const statusEl = document.getElementById("status");  
 const urlInput = document.getElementById("urlInput");
-const chartContainer = document.getElementById("chart-container");
-
 if(urlInput) {
     urlInput.addEventListener("keydown", function(event) { if (event.key === "Enter") go(); });
 }
@@ -389,90 +393,9 @@ function go() {
     } else {
         targetUrl = "https://www.google.com/search?q=" + encodeURIComponent(query);
     }
-    window.location.href = targetUrl;
+    window.open(targetUrl, '_blank');
 }
 function formatP(p) { return (p && p != 0) ? parseFloat(p).toString() : "0"; }  
-
-function renderChart(candles, gap) {
-    if (!candles || candles.length < 2) {
-        chartContainer.innerHTML = '';
-        return;
-    }
-
-    let minPrice = Infinity;
-    let maxPrice = -Infinity;
-    
-    candles.forEach(c => {
-        if(c.l < minPrice) minPrice = c.l;
-        if(c.h > maxPrice) maxPrice = c.h;
-    });
-
-    if (minPrice === Infinity) return;
-
-    let volatility = ((maxPrice - minPrice) / minPrice * 100).toFixed(2);
-    
-    const range = maxPrice - minPrice;
-    const safeRange = range === 0 ? maxPrice * 0.01 : range;
-    const padding = safeRange * 0.1; 
-    const plotMin = minPrice - padding;
-    const plotMax = maxPrice + padding;
-    const plotRange = plotMax - plotMin;
-
-    const w = 100; 
-    
-    const candleWidth = w / 20; 
-    const gapC = 1.5; 
-    const bodyWidth = candleWidth - gapC;
-
-    let svgHtml = '<svg viewBox="0 0 100 100" preserveAspectRatio="none">';
-
-    // --- УГЛОВЫЕ МЕТКИ ---
-    svgHtml += \`<text x="0.5" y="7" class="chart-text corner-label">\${formatP(maxPrice)}</text>\`;
-    svgHtml += \`<text x="0.5" y="99" class="chart-text corner-label">\${formatP(minPrice)}</text>\`;
-    svgHtml += \`<text x="99" y="7" text-anchor="end" class="chart-text vol-label">\${volatility}%</text>\`;
-
-    // --- GAP В ПРАВОМ НИЖНЕМ УГЛУ ---
-    let gapColor = gap >= 0 ? '#00ff00' : '#ff0000';
-    let gapSign = gap > 0 ? '+' : '';
-    svgHtml += \`<text x="99" y="99" text-anchor="end" fill="\${gapColor}" class="chart-text gap-label">GAP: \${gapSign}\${gap.toFixed(2)}%</text>\`;
-
-    // --- СВЕЧИ ---
-    candles.forEach((c, index) => {
-        const xCenter = (index * candleWidth) + (bodyWidth / 2);
-        
-        const yHigh = 100 - ((c.h - plotMin) / plotRange * 100);
-        const yLow  = 100 - ((c.l - plotMin) / plotRange * 100);
-        const yOpen = 100 - ((c.o - plotMin) / plotRange * 100);
-        const yClose= 100 - ((c.c - plotMin) / plotRange * 100);
-
-        const isGreen = c.c >= c.o;
-        const colorClass = isGreen ? 'green' : 'red';
-        const arrowColor = isGreen ? '#000000' : '#ffffff';
-
-        // Фитиль
-        svgHtml += \`<line x1="\${xCenter}" y1="\${yHigh}" x2="\${xCenter}" y2="\${yLow}" class="candle-wick \${colorClass}" />\`;
-
-        // Тело
-        const rectY = Math.min(yOpen, yClose);
-        const rectH = Math.abs(yClose - yOpen) || 0.4; 
-        const rectX = xCenter - (bodyWidth / 2);
-        svgHtml += \`<rect x="\${rectX}" y="\${rectY}" width="\${bodyWidth}" height="\${rectH}" class="candle-body \${colorClass}" />\`;
-
-        // --- СТРЕЛКИ ---
-        if (c.h === maxPrice) {
-            const arrowY = rectY + (rectH / 2) + 2; 
-            svgHtml += \`<text x="\${xCenter}" y="\${arrowY}" fill="\${arrowColor}" text-anchor="middle" class="chart-text arrow-label">↑</text>\`;
-        }
-        if (c.l === minPrice) {
-            const arrowY = rectY + (rectH / 2) + 2;
-            svgHtml += \`<text x="\${xCenter}" y="\${arrowY}" fill="\${arrowColor}" text-anchor="middle" class="chart-text arrow-label">↓</text>\`;
-        }
-    });
-
-    svgHtml += '</svg>';
-    chartContainer.innerHTML = svgHtml;
-}
-
 async function update() {  
     if (!symbol) return;  
 
@@ -483,6 +406,7 @@ async function update() {
             const d = await r.json();  
             if (d.pair) {  
                 dexPrice = parseFloat(d.pair.priceUsd);  
+                
                 let pStr = d.pair.priceUsd;
                 let sStr = symbol;
                 const maxLen = 18; 
@@ -492,6 +416,7 @@ async function update() {
                     sStr = sStr.substring(0, spaceForName);
                 }
                 document.title = sStr + ': ' + pStr;
+
                 dexLink.value = d.pair.url;  
             }  
         } catch(e) {}  
@@ -500,7 +425,8 @@ async function update() {
     try {  
         const res = await fetch('/api/all?symbol=' + symbol + '&token=' + token);  
         if (res.status === 403) {  
-            window.location.reload(); 
+            output.innerHTML = "<span style='color:red'>Доступ запрещён!</span>";  
+            if(timer) clearInterval(timer);  
             return;  
         }  
         const data = await res.json();  
@@ -520,19 +446,7 @@ async function update() {
 
         let dotColorClass = depositOpen ? '' : 'closed';  
         let dot = blink ? '<span class="blink-dot '+dotColorClass+'">●</span>' : '○';  
-        
-        // --- ФОРМИРОВАНИЕ ПЕРВОЙ СТРОКИ (MEXC) ---
-        let mexcLine = dot + ' ' + symbol + ' MEXC: ' + formatP(data.mexc);
-        
-        // Добавляем GAP если он > 5% по модулю (Используем GAP от MEXC)
-        if (data.gap && Math.abs(data.gap) > 5) {
-            let gapColor = data.gap >= 0 ? '#00ff00' : '#ff0000';
-            let gapSign = data.gap > 0 ? '+' : '';
-            mexcLine += \` <span style="color:\${gapColor}">(\${gapSign}\${data.gap.toFixed(2)}%)</span>\`;
-        }
-
-        let lines = [mexcLine];  
-        
+        let lines = [dot + ' ' + symbol + ' MEXC: ' + formatP(data.mexc)];  
         if (dexPrice > 0) {  
             let diff = ((dexPrice - data.mexc) / data.mexc * 100).toFixed(2);  
             lines.push('<span class="dex-row">◇ DEX     : ' + formatP(dexPrice) + ' (' + (diff > 0 ? "+" : "") + diff + '%)</span>');  
@@ -556,14 +470,12 @@ async function update() {
         });  
         output.innerHTML = lines.join("<br>");  
         statusEl.textContent = "Last: " + new Date().toLocaleTimeString();  
-        
-        if(data.candles) renderChart(data.candles, data.gap || 0);
-
     } catch(e) {}  
 }  
 async function start() {  
     let val = input.value.trim();  
     if(!val) return;  
+    if (!token) { output.innerHTML = "<span style='color:red'>Доступ запрещён!</span>"; return; }  
     
     if(timer) clearInterval(timer);  
     output.innerHTML = "Поиск...";  
@@ -620,6 +532,7 @@ document.getElementById("mexcBtn").onclick = function() {
 input.addEventListener("keypress", (e) => { if(e.key === "Enter") start(); });  
 
 if (urlParams.get('symbol')) start();  
+else if (!token) output.innerHTML = "<span style='color:red'>Доступ запрещён!</span>";  
 </script>  
 </body>  
 </html>  
@@ -627,4 +540,3 @@ if (urlParams.get('symbol')) start();
 });
 
 app.listen(CONFIG.PORT, () => console.log(`🚀 Server running on port ${CONFIG.PORT}`));
-                  
