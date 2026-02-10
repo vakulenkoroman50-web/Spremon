@@ -20,51 +20,28 @@ const CONFIG = {
 const EXCHANGES_ORDER = ["Binance", "Bybit", "Gate", "Bitget", "BingX", "OKX", "Kucoin"];
 
 /**
- * GLOBAL DATA CACHE
+ * GLOBAL PRICE CACHE
+ * Структура: { "BTC": { Mexc: 100, Binance: 100.5, ... }, "ETH": { ... } }
  */
 const GLOBAL_PRICES = {};
-let MEXC_CONFIG_CACHE = null;
 
-// --- ИСПРАВЛЕННАЯ ФУНКЦИЯ ОБНОВЛЕНИЯ ЦЕНЫ ---
+// Хелпер для безопасного обновления цены
 const updatePrice = (symbol, exchange, price) => {
     if (!symbol || !price) return;
-    
-    let s = symbol.toUpperCase();
-
-    // 1. Специфичные фиксы для бирж (до очистки)
-    // KuCoin использует XBT вместо BTC
-    if (s.startsWith('XBT')) s = s.replace('XBT', 'BTC');
-
-    // 2. Удаляем разделители (- и _)
-    s = s.replace(/[-_]/g, '');
-
-    // 3. Удаляем суффиксы СТРОГО В КОНЦЕ СТРОКИ ($ означает конец)
-    // Порядок важен!
-    
-    // OKX шлет 'BTC-USDT-SWAP' -> 'BTCUSDTSWAP' -> удаляем 'SWAP' в конце
-    s = s.replace(/SWAP$/, '');
-
-    // KuCoin шлет 'BTCUSDTM' -> удаляем 'M' только если перед ним USDT
-    // Binance/Mexc шлют 'BTCUSDT'
-    // Регулярка: Ищем USDT, за которым может идти M, в конце строки
-    s = s.replace(/USDTM?$/, ''); 
-    
-    // На случай пар к USD
-    s = s.replace(/USD$/, '');
-
-    // Сохраняем
+    const s = symbol.toUpperCase().replace(/[-_]/g, '').replace('USDT', '').replace('SWAP', ''); // Нормализация к виду "BTC"
     if (!GLOBAL_PRICES[s]) GLOBAL_PRICES[s] = {};
     GLOBAL_PRICES[s][exchange] = parseFloat(price);
 };
-// ---------------------------------------------
 
 const safeJson = (data) => {
     try { return JSON.parse(data); } catch (e) { return null; }
 };
 
 /**
- * --- GLOBAL MONITORS ---
+ * --- GLOBAL WEBSOCKET MANAGERS ---
+ * Каждая функция открывает одно соединение на ВЕСЬ рынок сразу.
  */
+
 // 1. MEXC GLOBAL
 const initMexcGlobal = () => {
     let ws = null;
@@ -91,11 +68,12 @@ const initMexcGlobal = () => {
     connect();
 };
 
-// 2. BINANCE GLOBAL
+// 2. BINANCE GLOBAL (All Market Mini Tickers)
 const initBinanceGlobal = () => {
     let ws = null;
     const connect = () => {
         try {
+            // !miniTicker@arr - поток всех мини-тикеров (легче чем aggTrade)
             ws = new WebSocket('wss://fstream.binance.com/ws/!ticker@arr'); 
             ws.on('open', () => console.log('[Binance] Connected Global'));
             ws.on('message', (data) => {
@@ -113,9 +91,27 @@ const initBinanceGlobal = () => {
 
 // 3. BYBIT GLOBAL
 const initBybitGlobal = () => {
+    let ws = null;
+    const connect = () => {
+        try {
+            ws = new WebSocket('wss://stream.bybit.com/v5/public/linear');
+            ws.on('open', () => {
+                console.log('[Bybit] Connected Global');
+                // Bybit не дает подписаться на "ВСЁ" одной командой, нужно перечислять.
+                // Но у них есть топик "tickers" для всех. Пробуем получить топ.
+                // Хак: Bybit сложен для "всего рынка" через WS без перечисления.
+                // Для упрощения мы будем использовать их HTTP API в фоне раз в 1 сек для заполнения кэша, 
+                // так как подписка на 300+ пар через WS может упереться в лимиты сообщения.
+                // НО! Попробуем подписаться на самые популярные, если нужно.
+                // ВМЕСТО WS для Bybit Reliable Global лучше поллинг их Ticker Endpoint (очень быстрый)
+            });
+            // FALLBACK TO POLLING FOR BYBIT GLOBAL (Best practice for "All tickers" on Bybit if not filtering)
+        } catch (e) {}
+    };
+    // Bybit WebSocket All Tickers сложен в реализации (нужно разбивать на пачки).
+    // Сделаем быстрый Polling (раз в 1с), это для Bybit V5 очень эффективно.
     setInterval(async () => {
         try {
-            if (!fetch) return;
             const res = await fetch('https://api.bybit.com/v5/market/tickers?category=linear');
             const d = await res.json();
             if (d.result && d.result.list) {
@@ -127,37 +123,58 @@ const initBybitGlobal = () => {
 
 // 4. GATE GLOBAL
 const initGateGlobal = () => {
-    setInterval(async () => {
+    let ws = null;
+    const connect = () => {
         try {
-            if (!fetch) return;
-            const res = await fetch('https://api.gateio.ws/api/v4/futures/usdt/tickers');
-            const data = await res.json();
-            if (Array.isArray(data)) {
-                data.forEach(i => updatePrice(i.contract, 'Gate', i.last));
-            }
-        } catch(e) {}
-    }, 2000);
+            ws = new WebSocket('wss://fx-ws.gateio.ws/v4/ws/usdt');
+            ws.on('open', () => {
+                console.log('[Gate] Connected Global');
+                ws.send(JSON.stringify({ time: Date.now(), channel: "futures.tickers", event: "subscribe", payload: ["USDT"] }));
+            });
+            ws.on('message', (data) => {
+                const d = safeJson(data);
+                if (d && d.event === 'update' && d.result) {
+                    (Array.isArray(d.result) ? d.result : [d.result]).forEach(i => {
+                        updatePrice(i.contract, 'Gate', i.last);
+                    });
+                }
+            });
+            ws.on('error', () => {});
+            ws.on('close', () => setTimeout(connect, 3000));
+        } catch (e) { setTimeout(connect, 5000); }
+    };
+    connect();
 };
 
 // 5. BITGET GLOBAL
+// Bitget WS требует подписки по одному. Используем быстрый Polling для надежности "всего рынка".
 const initBitgetGlobal = () => {
     setInterval(async () => {
         try {
-            if (!fetch) return;
             const res = await fetch('https://api.bitget.com/api/v2/mix/market/tickers?productType=USDT-FUTURES');
             const d = await res.json();
             if (d.data) {
                 d.data.forEach(i => updatePrice(i.symbol, 'Bitget', i.lastPr));
             }
         } catch(e) {}
-    }, 2000);
+    }, 2000); // Раз в 2 сек (лимиты строже)
 };
 
 // 6. OKX GLOBAL
 const initOkxGlobal = () => {
+    let ws = null;
+    const connect = () => {
+        try {
+            ws = new WebSocket('wss://ws.okx.com:8443/ws/v5/public');
+            ws.on('open', () => {
+                console.log('[OKX] Connected Global');
+                // OKX требует перечисления. Подпишемся только на популярные или используем Polling.
+                // Для надежности берем Polling, т.к. "subscribe all" нет.
+            });
+        } catch (e) {}
+    };
     setInterval(async () => {
         try {
-            if (!fetch) return;
             const res = await fetch('https://www.okx.com/api/v5/market/tickers?instType=SWAP');
             const d = await res.json();
             if (d.data) {
@@ -169,11 +186,10 @@ const initOkxGlobal = () => {
     }, 2000);
 };
 
-// 7. BINGX GLOBAL
+// 7. BINGX GLOBAL (Polling, WS сложный для all tickers)
 const initBingxGlobal = () => {
     setInterval(async () => {
         try {
-            if (!fetch) return;
             const res = await fetch('https://open-api.bingx.com/openApi/swap/v2/quote/ticker');
             const d = await res.json();
             if (d.data) {
@@ -183,34 +199,24 @@ const initBingxGlobal = () => {
     }, 2000);
 };
 
-// 8. KUCOIN GLOBAL
-const initKucoinGlobal = () => {
-    setInterval(async () => {
-        try {
-            if (!fetch) return;
-            const res = await fetch('https://api-futures.kucoin.com/api/v1/allTickers');
-            const d = await res.json();
-            if (d.data && Array.isArray(d.data)) {
-                d.data.forEach(i => {
-                    updatePrice(i.symbol, 'Kucoin', i.price);
-                });
-            }
-        } catch(e) {}
-    }, 2000);
-};
-
 // ЗАПУСК ВСЕХ МОНИТОРОВ
 initMexcGlobal();
-initBinanceGlobal();
-initBybitGlobal();
-initGateGlobal();
-initBitgetGlobal();
-initOkxGlobal();
-initBingxGlobal();
-initKucoinGlobal();
+initBinanceGlobal(); // WS
+initBybitGlobal();   // Polling (hybrid)
+initGateGlobal();    // WS
+initBitgetGlobal();  // Polling
+initOkxGlobal();     // Polling
+initBingxGlobal();   // Polling
 
-
-// --- SERVER SETUP ---
+/**
+ * HTTP FALLBACKS
+ */
+const CEX_HTTP_ADAPTERS = {
+    Kucoin: {
+        url: (s) => `https://api-futures.kucoin.com/api/v1/ticker?symbol=${s === 'BTC' ? 'XBT' : s}USDTM`,
+        parse: (d) => d.data?.price
+    }
+};
 
 const app = express();
 app.use(cors());
@@ -220,7 +226,6 @@ app.use(express.static('public'));
 let fetch;
 (async () => {
     fetch = (await import('node-fetch')).default;
-    updateMexcConfigCache();
 })();
 
 const authMiddleware = (req, res, next) => {
@@ -248,28 +253,21 @@ async function mexcPrivateRequest(path, params = {}) {
     } catch (e) { return null; }
 }
 
-// Кэширование конфига
-async function updateMexcConfigCache() {
+async function fetchExchangePriceHttp(exchange, symbol) {
+    const adapter = CEX_HTTP_ADAPTERS[exchange];
+    if (!adapter) return 0;
     try {
-        if (!fetch) return;
-        console.log('[CACHE] Updating MEXC config...');
-        const data = await mexcPrivateRequest("/api/v3/capital/config/getall");
-        if (data && Array.isArray(data)) {
-            MEXC_CONFIG_CACHE = data;
-            console.log('[CACHE] MEXC config updated. Items:', data.length);
-        }
-    } catch (e) { console.error('[CACHE ERR]', e); }
+        const res = await fetch(adapter.url(symbol));
+        const data = await res.json();
+        return parseFloat(adapter.parse(data)) || 0;
+    } catch (e) { return 0; }
 }
-setInterval(updateMexcConfigCache, 60000);
 
-
-// --- API ROUTES ---
+// --- API ENDPOINTS ---
 
 app.get('/api/resolve', authMiddleware, async (req, res) => {
     const symbol = (req.query.symbol || '').toUpperCase();
-    
-    let data = MEXC_CONFIG_CACHE;
-    if (!data) data = await mexcPrivateRequest("/api/v3/capital/config/getall");
+    const data = await mexcPrivateRequest("/api/v3/capital/config/getall");
     
     if (!data || !Array.isArray(data)) return res.json({ ok: false });
 
@@ -305,19 +303,25 @@ app.get('/api/resolve', authMiddleware, async (req, res) => {
 });
 
 app.get('/api/all', authMiddleware, async (req, res) => {
-    // Безопасная нормализация запроса
-    let symbol = (req.query.symbol || '').toUpperCase();
-    // Просто убираем USDT, чтобы найти ключ в базе
-    symbol = symbol.replace('USDT', '');
-    
+    const symbol = (req.query.symbol || '').toUpperCase().replace('USDT', '');
     if (!symbol) return res.json({ ok: false });
 
+    // 1. Берем данные из ГЛОБАЛЬНОГО кэша
     const marketData = GLOBAL_PRICES[symbol] || {};
+    
     const mexcPrice = marketData['MEXC'] || 0;
 
+    // 2. Kucoin (Все еще HTTP, так как там сложный WS)
+    let kucoinPrice = marketData['Kucoin'];
+    if (!kucoinPrice) {
+        kucoinPrice = await fetchExchangePriceHttp('Kucoin', symbol);
+    }
+
+    // 3. Формируем ответ
     const prices = {};
     EXCHANGES_ORDER.forEach(ex => {
-        prices[ex] = marketData[ex] || 0;
+        if (ex === 'Kucoin') prices[ex] = kucoinPrice;
+        else prices[ex] = marketData[ex] || 0;
     });
 
     res.json({ ok: true, mexc: mexcPrice, prices });
@@ -398,7 +402,6 @@ function go() {
 function formatP(p) { return (p && p != 0) ? parseFloat(p).toString() : "0"; }  
 async function update() {  
     if (!symbol) return;  
-
     let dexPrice = 0;  
     if (chain && addr) {  
         try {  
@@ -406,17 +409,7 @@ async function update() {
             const d = await r.json();  
             if (d.pair) {  
                 dexPrice = parseFloat(d.pair.priceUsd);  
-                
-                let pStr = d.pair.priceUsd;
-                let sStr = symbol;
-                const maxLen = 18; 
-                if ((sStr.length + pStr.length + 2) > maxLen) {
-                    let spaceForName = maxLen - pStr.length - 2;
-                    if (spaceForName < 3) spaceForName = 3;
-                    sStr = sStr.substring(0, spaceForName);
-                }
-                document.title = sStr + ': ' + pStr;
-
+                document.title = symbol + ': ' + d.pair.priceUsd;  
                 dexLink.value = d.pair.url;  
             }  
         } catch(e) {}  
@@ -431,19 +424,6 @@ async function update() {
         }  
         const data = await res.json();  
         if(!data.ok) return;  
-        
-        if (!dexPrice && data.mexc) {
-             let pStr = formatP(data.mexc);
-             let sStr = symbol;
-             const maxLen = 18; 
-             if ((sStr.length + pStr.length + 2) > maxLen) {
-                let spaceForName = maxLen - pStr.length - 2;
-                if (spaceForName < 3) spaceForName = 3;
-                sStr = sStr.substring(0, spaceForName);
-            }
-            document.title = sStr + ': ' + pStr;
-        }
-
         let dotColorClass = depositOpen ? '' : 'closed';  
         let dot = blink ? '<span class="blink-dot '+dotColorClass+'">●</span>' : '○';  
         let lines = [dot + ' ' + symbol + ' MEXC: ' + formatP(data.mexc)];  
@@ -476,53 +456,37 @@ async function start() {
     let val = input.value.trim();  
     if(!val) return;  
     if (!token) { output.innerHTML = "<span style='color:red'>Доступ запрещён!</span>"; return; }  
-    
     if(timer) clearInterval(timer);  
     output.innerHTML = "Поиск...";  
-    
     if (val.includes("dexscreener.com")) {  
         try {  
             const parts = val.split('/');  
             chain = parts[parts.length - 2];  
             addr = parts[parts.length - 1].split('?')[0];  
-            fetch('https://api.dexscreener.com/latest/dex/pairs/' + chain + '/' + addr)
-                .then(r => r.json())
-                .then(dsData => {
-                     if (dsData.pair) {  
-                        symbol = dsData.pair.baseToken.symbol.toUpperCase();  
-                        input.value = symbol;  
-                        dexLink.value = dsData.pair.url;  
-                    } 
-                });
+            const dsRes = await fetch('https://api.dexscreener.com/latest/dex/pairs/' + chain + '/' + addr);  
+            const dsData = await dsRes.json();  
+            if (dsData.pair) {  
+                symbol = dsData.pair.baseToken.symbol.toUpperCase();  
+                input.value = symbol;  
+                dexLink.value = dsData.pair.url;  
+            }  
         } catch(e) { output.innerHTML = "Ошибка ссылки!"; return; }  
-    } else {  
-        symbol = val.toUpperCase();  
-    }  
-
-    const url = new URL(window.location);  
-    url.searchParams.set('symbol', symbol);  
-    window.history.replaceState({}, '', url);  
-
-    update();  
-    timer = setInterval(update, 1000);  
-
+    } else { symbol = val.toUpperCase(); }  
     try {  
         const res = await fetch('/api/resolve?symbol=' + symbol + '&token=' + token);  
-        if (res.status === 403) return;  
+        if (res.status === 403) { output.innerHTML = "<span style='color:red'>Доступ запрещён!</span>"; return; }  
         const d = await res.json();  
         if (d.ok) {   
-            chain = d.chain;   
-            addr = d.addr;   
-            dexLink.value = d.url || '';   
-            depositOpen = d.depositOpen;   
-            
-            if(chain) url.searchParams.set('chain', chain);  
-            if(addr) url.searchParams.set('addr', addr);  
-            window.history.replaceState({}, '', url);  
-        } else {  
-            depositOpen = true;  
-        }  
+            chain = d.chain; addr = d.addr; dexLink.value = d.url || ''; depositOpen = d.depositOpen;   
+        } else { depositOpen = true; }  
     } catch(e) {}  
+    const url = new URL(window.location);  
+    url.searchParams.set('symbol', symbol);  
+    if(chain) url.searchParams.set('chain', chain);  
+    if(addr) url.searchParams.set('addr', addr);  
+    window.history.replaceState({}, '', url);  
+    update();  
+    timer = setInterval(update, 1000);  
 }  
 document.getElementById("startBtn").onclick = start;  
 document.getElementById("mexcBtn").onclick = function() {
@@ -530,13 +494,13 @@ document.getElementById("mexcBtn").onclick = function() {
     if(val) window.location.href = "mxcappscheme://kline?extra_page_name=其他&trade_pair=" + val + "_USDT&contract=1";
 };
 input.addEventListener("keypress", (e) => { if(e.key === "Enter") start(); });  
-
 if (urlParams.get('symbol')) start();  
 else if (!token) output.innerHTML = "<span style='color:red'>Доступ запрещён!</span>";  
 </script>  
 </body>  
 </html>  
-    `); 
+    `);
 });
 
 app.listen(CONFIG.PORT, () => console.log(`🚀 Server running on port ${CONFIG.PORT}`));
+    
