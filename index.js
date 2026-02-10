@@ -18,7 +18,6 @@ const CONFIG = {
 };
 
 const EXCHANGES_ORDER = ["Binance", "Bybit", "Gate", "Bitget", "BingX", "OKX", "Kucoin"];
-// Полный список источников (MEXC теперь тут)
 const ALL_SOURCES = ["MEXC", ...EXCHANGES_ORDER];
 
 /**
@@ -32,19 +31,14 @@ let MEXC_CONFIG_CACHE = null;
 const HISTORY_OHLC = {}; 
 const CURRENT_CANDLES = {};
 
-// --- УТИЛИТА НОРМАЛИЗАЦИИ СИМВОЛА (СТАБИЛЬНАЯ) ---
-const normalizeSymbol = (s) => {
-    if (!s) return null;
-    let sym = s.toUpperCase();
-    // KuCoin fix
-    if (sym.startsWith('XBT')) sym = sym.replace('XBT', 'BTC');
-    // Удаляем разделители
-    sym = sym.replace(/[-_]/g, '');
-    // Удаляем суффиксы
-    sym = sym.replace(/SWAP$/, '');
-    sym = sym.replace(/USDTM?$/, ''); 
-    sym = sym.replace(/USD$/, '');
-    return sym;
+// --- СТАРЫЙ НАДЕЖНЫЙ ПАРСЕР (ИЗ ПЕРВОЙ ВЕРСИИ) ---
+const normalizeSymbol = (symbol) => {
+    if (!symbol) return null;
+    return symbol.toUpperCase()
+        .replace(/[-_]/g, '')     
+        .replace('USDT', '')      
+        .replace('SWAP', '')      
+        .replace('M', ''); 
 };
 
 // --- ФУНКЦИЯ ОБНОВЛЕНИЯ ДАННЫХ ---
@@ -63,10 +57,6 @@ const updateData = (rawSymbol, exchange, price, fairPrice = null) => {
         if (!GLOBAL_FAIR[s]) GLOBAL_FAIR[s] = {};
         GLOBAL_FAIR[s][exchange] = parseFloat(fairPrice);
     }
-};
-
-const safeJson = (data) => {
-    try { return JSON.parse(data); } catch (e) { return null; }
 };
 
 // --- МОДУЛЬ ИСТОРИИ (OHLC) ---
@@ -109,11 +99,15 @@ setInterval(() => {
     });
 }, 1000);
 
+const safeJson = (data) => {
+    try { return JSON.parse(data); } catch (e) { return null; }
+};
+
 /**
- * --- MONITORS (ПОЛНЫЕ ВЕРСИИ) ---
+ * --- MONITORS (СТАРЫЕ НАДЕЖНЫЕ ВЕРСИИ) ---
  */
 
-// 1. MEXC GLOBAL (WS)
+// 1. MEXC GLOBAL
 const initMexcGlobal = () => {
     let ws = null;
     const connect = () => {
@@ -139,9 +133,8 @@ const initMexcGlobal = () => {
     connect();
 };
 
-// 2. BINANCE GLOBAL (WS + REST)
+// 2. BINANCE GLOBAL
 const initBinanceGlobal = () => {
-    // WS Last Price
     let ws = null;
     const connect = () => {
         try {
@@ -149,15 +142,17 @@ const initBinanceGlobal = () => {
             ws.on('open', () => console.log('[Binance] Connected'));
             ws.on('message', (data) => {
                 const arr = safeJson(data);
-                if (Array.isArray(arr)) arr.forEach(i => updateData(i.s, 'Binance', i.c));
+                if (Array.isArray(arr)) {
+                    arr.forEach(i => updateData(i.s, 'Binance', i.c));
+                }
             });
             ws.on('error', () => {});
             ws.on('close', () => setTimeout(connect, 3000));
         } catch (e) { setTimeout(connect, 5000); }
     };
     connect();
-
-    // REST Mark Price
+    
+    // Доп запрос для Mark Price
     setInterval(async () => {
         try {
             if(!fetch) return;
@@ -212,16 +207,19 @@ const initBitgetGlobal = () => {
 
 // 6. OKX
 const initOkxGlobal = () => {
-    // Last
     setInterval(async () => {
         try {
             if (!fetch) return;
             const res = await fetch('https://www.okx.com/api/v5/market/tickers?instType=SWAP');
             const d = await res.json();
-            if (d.data) d.data.forEach(i => { if (i.instId.endsWith('USDT-SWAP')) updateData(i.instId, 'OKX', i.last); });
+            if (d.data) {
+                d.data.forEach(i => {
+                    if (i.instId.endsWith('USDT-SWAP')) updateData(i.instId, 'OKX', i.last);
+                });
+            }
         } catch(e) {}
     }, 2000);
-    // Mark
+    // Mark Price
     setInterval(async () => {
         try {
             if (!fetch) return;
@@ -248,13 +246,18 @@ const initBingxGlobal = () => {
 
 // 8. KUCOIN
 const initKucoinGlobal = () => {
-    // Last
     setInterval(async () => {
         try {
             if (!fetch) return;
             const res = await fetch('https://api-futures.kucoin.com/api/v1/allTickers');
             const d = await res.json();
-            if (d.data && Array.isArray(d.data)) d.data.forEach(i => updateData(i.symbol, 'Kucoin', i.price));
+            if (d.data && Array.isArray(d.data)) {
+                d.data.forEach(i => {
+                    let sym = i.symbol;
+                    if (sym.startsWith('XBT')) sym = sym.replace('XBT', 'BTC');
+                    updateData(sym, 'Kucoin', i.price);
+                });
+            }
         } catch(e) {}
     }, 2000);
     // Mark
@@ -338,13 +341,17 @@ app.get('/api/resolve', authMiddleware, async (req, res) => {
 });
 
 app.get('/api/all', authMiddleware, async (req, res) => {
+    // ВАЖНО: Используем ту же нормализацию, что и при записи данных!
     let symbol = (req.query.symbol || '').toUpperCase();
-    symbol = symbol.replace('USDT', '');
+    if(symbol.endsWith('USDT')) symbol = symbol.replace('USDT', '');
+    
     if (!symbol) return res.json({ ok: false });
 
     const marketData = GLOBAL_PRICES[symbol] || {};
     const fairData = GLOBAL_FAIR[symbol] || {};
     
+    const mexcPrice = marketData['MEXC'] || 0;
+
     const prices = {};
     const fairPrices = {};
     let sum = 0; let count = 0;
@@ -367,7 +374,7 @@ app.get('/api/all', authMiddleware, async (req, res) => {
         if (sourceCandles.length > 0) allCandles[source] = sourceCandles;
     });
 
-    res.json({ ok: true, prices, fairPrices, allCandles, average: globalAverage });
+    res.json({ ok: true, mexc: mexcPrice, prices, fairPrices, allCandles, average: globalAverage });
 });
 
 app.get('/', (req, res) => {
@@ -401,7 +408,6 @@ body { background: #000; font-family: monospace; font-size: 28px; color: #fff; p
 
 .exchange-link { cursor: pointer; text-decoration: none; color: inherit; }
 .exchange-link:hover { text-decoration: underline; }
-/* Фон активной биржи */
 .exchange-active { background-color: #333; } 
 
 #chart-container {
@@ -725,4 +731,4 @@ if (urlParams.get('symbol')) start();
 });
 
 app.listen(CONFIG.PORT, () => console.log(`🚀 Server running on port ${CONFIG.PORT}`));
-            
+    
