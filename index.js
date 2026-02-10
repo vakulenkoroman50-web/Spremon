@@ -20,19 +20,19 @@ const CONFIG = {
 const EXCHANGES_ORDER = ["Binance", "Bybit", "Gate", "Bitget", "BingX", "OKX", "Kucoin"];
 
 /**
- * GLOBAL PRICE CACHE
+ * GLOBAL DATA CACHE
  */
 const GLOBAL_PRICES = {};
+let MEXC_CONFIG_CACHE = null; // Кэш тяжелого конфига монет
 
-// Хелпер для безопасного обновления цены
+// Хелпер обновления цены
 const updatePrice = (symbol, exchange, price) => {
     if (!symbol || !price) return;
-    // Приводим все к единому виду (BTC)
     const s = symbol.toUpperCase()
-        .replace(/[-_]/g, '')     // Убираем тире и подчеркивания
-        .replace('USDT', '')      // Убираем USDT
-        .replace('SWAP', '')      // Убираем SWAP (OKX)
-        .replace('M', '');        // Убираем M (Kucoin XBTUSDTM -> XBTUSDT)
+        .replace(/[-_]/g, '')     
+        .replace('USDT', '')      
+        .replace('SWAP', '')      
+        .replace('M', '');        
         
     if (!GLOBAL_PRICES[s]) GLOBAL_PRICES[s] = {};
     GLOBAL_PRICES[s][exchange] = parseFloat(price);
@@ -45,7 +45,6 @@ const safeJson = (data) => {
 /**
  * --- GLOBAL MONITORS ---
  */
-
 // 1. MEXC GLOBAL
 const initMexcGlobal = () => {
     let ws = null;
@@ -164,18 +163,16 @@ const initBingxGlobal = () => {
     }, 2000);
 };
 
-// 8. KUCOIN GLOBAL (ИСПРАВЛЕНО)
+// 8. KUCOIN GLOBAL
 const initKucoinGlobal = () => {
     setInterval(async () => {
         try {
             if (!fetch) return;
-            // Правильный эндпоинт для всех тикеров фьючерсов
             const res = await fetch('https://api-futures.kucoin.com/api/v1/allTickers');
             const d = await res.json();
             if (d.data && Array.isArray(d.data)) {
                 d.data.forEach(i => {
                     let sym = i.symbol;
-                    // Исправляем XBT на BTC для Кукоина
                     if (sym.startsWith('XBT')) sym = sym.replace('XBT', 'BTC');
                     updatePrice(sym, 'Kucoin', i.price);
                 });
@@ -194,6 +191,7 @@ initOkxGlobal();
 initBingxGlobal();
 initKucoinGlobal();
 
+
 // --- SERVER SETUP ---
 
 const app = express();
@@ -204,6 +202,8 @@ app.use(express.static('public'));
 let fetch;
 (async () => {
     fetch = (await import('node-fetch')).default;
+    // Запускаем обновление кэша конфига сразу после старта
+    updateMexcConfigCache();
 })();
 
 const authMiddleware = (req, res, next) => {
@@ -231,11 +231,33 @@ async function mexcPrivateRequest(path, params = {}) {
     } catch (e) { return null; }
 }
 
+// --- НОВАЯ СИСТЕМА КЭШИРОВАНИЯ КОНФИГА ---
+async function updateMexcConfigCache() {
+    try {
+        if (!fetch) return;
+        console.log('[CACHE] Updating MEXC config...');
+        const data = await mexcPrivateRequest("/api/v3/capital/config/getall");
+        if (data && Array.isArray(data)) {
+            MEXC_CONFIG_CACHE = data;
+            console.log('[CACHE] MEXC config updated. Items:', data.length);
+        }
+    } catch (e) { console.error('[CACHE ERR]', e); }
+}
+// Обновляем конфиг раз в 60 секунд (чтобы не тянуть 5мб каждый запрос)
+setInterval(updateMexcConfigCache, 60000);
+
+
 // --- API ROUTES ---
 
 app.get('/api/resolve', authMiddleware, async (req, res) => {
     const symbol = (req.query.symbol || '').toUpperCase();
-    const data = await mexcPrivateRequest("/api/v3/capital/config/getall");
+    
+    // ИСПОЛЬЗУЕМ КЭШ ВМЕСТО ЗАПРОСА
+    let data = MEXC_CONFIG_CACHE;
+    if (!data) {
+        // Если кэш пуст (первый старт), делаем прямой запрос
+        data = await mexcPrivateRequest("/api/v3/capital/config/getall");
+    }
     
     if (!data || !Array.isArray(data)) return res.json({ ok: false });
 
@@ -247,6 +269,7 @@ app.get('/api/resolve', authMiddleware, async (req, res) => {
     let bestPair = null;
     const contracts = tokenData.networkList.filter(n => n.contract).map(n => n.contract);
     
+    // Этот этап самый долгий (DexScreener), но он выполняется параллельно с отображением цен на фронте
     await Promise.all(contracts.map(async (contract) => {
         try {
             const dsRes = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${contract}`);
@@ -308,8 +331,8 @@ body { background: #000; font-family: monospace; font-size: 28px; color: #fff; p
 .blink-dot { animation: blink 1s infinite; display: inline-block; }
 @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
 .url-search-container { display: flex; gap: 5px; align-items: center; font-family: Arial, sans-serif; margin-top: 20px; }
-#urlInput { width: 46%; padding: 10px; font-size: 37px; background-color: #222; color: #fff; border: 1px solid #444; outline: none; font-family: Arial, sans-serif; }
-#goBtn { padding: 10px 20px; font-size: 37px; cursor: pointer; background-color: #333; color: #fff; border: 1px solid #555; font-family: Arial, sans-serif; }
+#urlInput { width: 46%; padding: 10px; font-size: 36px; background-color: #222; color: #fff; border: 1px solid #444; outline: none; font-family: Arial, sans-serif; }
+#goBtn { padding: 10px 20px; font-size: 36px; cursor: pointer; background-color: #333; color: #fff; border: 1px solid #555; font-family: Arial, sans-serif; }
 #goBtn:hover { background-color: #888; }
 </style>
 </head>
@@ -360,6 +383,14 @@ function go() {
 function formatP(p) { return (p && p != 0) ? parseFloat(p).toString() : "0"; }  
 async function update() {  
     if (!symbol) return;  
+    
+    // Обновляем заголовок даже если нет DEX
+    if (symbol) {
+         // --- ЛОГИКА ОБРЕЗКИ ЗАГОЛОВКА ---
+         // Пытаемся получить цену MEXC для заголовка, если DEX еще нет
+         // (данные берутся из следующего fetch)
+    }
+
     let dexPrice = 0;  
     if (chain && addr) {  
         try {  
@@ -367,7 +398,17 @@ async function update() {
             const d = await r.json();  
             if (d.pair) {  
                 dexPrice = parseFloat(d.pair.priceUsd);  
-                document.title = symbol + ': ' + d.pair.priceUsd;  
+                
+                let pStr = d.pair.priceUsd;
+                let sStr = symbol;
+                const maxLen = 18; 
+                if ((sStr.length + pStr.length + 2) > maxLen) {
+                    let spaceForName = maxLen - pStr.length - 2;
+                    if (spaceForName < 3) spaceForName = 3;
+                    sStr = sStr.substring(0, spaceForName);
+                }
+                document.title = sStr + ': ' + pStr;
+
                 dexLink.value = d.pair.url;  
             }  
         } catch(e) {}  
@@ -382,6 +423,20 @@ async function update() {
         }  
         const data = await res.json();  
         if(!data.ok) return;  
+        
+        // Если DEX нет, показываем цену MEXC в заголовке
+        if (!dexPrice && data.mexc) {
+             let pStr = formatP(data.mexc);
+             let sStr = symbol;
+             const maxLen = 18; 
+             if ((sStr.length + pStr.length + 2) > maxLen) {
+                let spaceForName = maxLen - pStr.length - 2;
+                if (spaceForName < 3) spaceForName = 3;
+                sStr = sStr.substring(0, spaceForName);
+            }
+            document.title = sStr + ': ' + pStr;
+        }
+
         let dotColorClass = depositOpen ? '' : 'closed';  
         let dot = blink ? '<span class="blink-dot '+dotColorClass+'">●</span>' : '○';  
         let lines = [dot + ' ' + symbol + ' MEXC: ' + formatP(data.mexc)];  
@@ -414,37 +469,63 @@ async function start() {
     let val = input.value.trim();  
     if(!val) return;  
     if (!token) { output.innerHTML = "<span style='color:red'>Доступ запрещён!</span>"; return; }  
+    
+    // Сброс и подготовка
     if(timer) clearInterval(timer);  
     output.innerHTML = "Поиск...";  
+    
+    // 1. Быстрая обработка ввода
     if (val.includes("dexscreener.com")) {  
         try {  
             const parts = val.split('/');  
             chain = parts[parts.length - 2];  
             addr = parts[parts.length - 1].split('?')[0];  
-            const dsRes = await fetch('https://api.dexscreener.com/latest/dex/pairs/' + chain + '/' + addr);  
-            const dsData = await dsRes.json();  
-            if (dsData.pair) {  
-                symbol = dsData.pair.baseToken.symbol.toUpperCase();  
-                input.value = symbol;  
-                dexLink.value = dsData.pair.url;  
-            }  
+            // Запускаем DexScreener запрос, но не ждем его для старта таймера
+            fetch('https://api.dexscreener.com/latest/dex/pairs/' + chain + '/' + addr)
+                .then(r => r.json())
+                .then(dsData => {
+                     if (dsData.pair) {  
+                        symbol = dsData.pair.baseToken.symbol.toUpperCase();  
+                        input.value = symbol;  
+                        dexLink.value = dsData.pair.url;  
+                    } 
+                });
         } catch(e) { output.innerHTML = "Ошибка ссылки!"; return; }  
-    } else { symbol = val.toUpperCase(); }  
-    try {  
-        const res = await fetch('/api/resolve?symbol=' + symbol + '&token=' + token);  
-        if (res.status === 403) { output.innerHTML = "<span style='color:red'>Доступ запрещён!</span>"; return; }  
-        const d = await res.json();  
-        if (d.ok) {   
-            chain = d.chain; addr = d.addr; dexLink.value = d.url || ''; depositOpen = d.depositOpen;   
-        } else { depositOpen = true; }  
-    } catch(e) {}  
+    } else {  
+        symbol = val.toUpperCase();  
+    }  
+
+    // 2. ОБНОВЛЕНИЕ URL МГНОВЕННО
     const url = new URL(window.location);  
     url.searchParams.set('symbol', symbol);  
-    if(chain) url.searchParams.set('chain', chain);  
-    if(addr) url.searchParams.set('addr', addr);  
     window.history.replaceState({}, '', url);  
+
+    // 3. ЗАПУСК МОНИТОРИНГА ЦЕН (Не ждем DexScreener/MEXC Config)
+    // Цены с бирж появятся сразу же
     update();  
     timer = setInterval(update, 1000);  
+
+    // 4. ФОНОВОЕ ПОЛУЧЕНИЕ ИНФЫ О DEX И ДЕПОЗИТЕ
+    // Это самая долгая часть (2-3 сек). Она выполнится в фоне и обновит переменные.
+    // Когда она закончит, следующий тик update() сам подхватит DEX цену и цвет индикатора.
+    try {  
+        const res = await fetch('/api/resolve?symbol=' + symbol + '&token=' + token);  
+        if (res.status === 403) return;  
+        const d = await res.json();  
+        if (d.ok) {   
+            chain = d.chain;   
+            addr = d.addr;   
+            dexLink.value = d.url || '';   
+            depositOpen = d.depositOpen;   
+            
+            // Обновляем URL еще раз, если появились chain/addr
+            if(chain) url.searchParams.set('chain', chain);  
+            if(addr) url.searchParams.set('addr', addr);  
+            window.history.replaceState({}, '', url);  
+        } else {  
+            depositOpen = true;  
+        }  
+    } catch(e) {}  
 }  
 document.getElementById("startBtn").onclick = start;  
 document.getElementById("mexcBtn").onclick = function() {
@@ -452,12 +533,14 @@ document.getElementById("mexcBtn").onclick = function() {
     if(val) window.location.href = "mxcappscheme://kline?extra_page_name=其他&trade_pair=" + val + "_USDT&contract=1";
 };
 input.addEventListener("keypress", (e) => { if(e.key === "Enter") start(); });  
+
+// Если открыли по ссылке - стартуем сразу
 if (urlParams.get('symbol')) start();  
 else if (!token) output.innerHTML = "<span style='color:red'>Доступ запрещён!</span>";  
 </script>  
 </body>  
 </html>  
-    `);
-});
+    `); // Закрываем кавычку HTML-строки
+}); // Закрываем функцию app.get
 
 app.listen(CONFIG.PORT, () => console.log(`🚀 Server running on port ${CONFIG.PORT}`));
