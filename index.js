@@ -18,6 +18,8 @@ const CONFIG = {
 };
 
 const EXCHANGES_ORDER = ["Binance", "Bybit", "Gate", "Bitget", "BingX", "OKX", "Kucoin"];
+// Полный список для итерации (включая MEXC)
+const ALL_SOURCES = ["MEXC", ...EXCHANGES_ORDER];
 
 /**
  * GLOBAL DATA CACHE
@@ -25,8 +27,9 @@ const EXCHANGES_ORDER = ["Binance", "Bybit", "Gate", "Bitget", "BingX", "OKX", "
 const GLOBAL_PRICES = {};
 let MEXC_CONFIG_CACHE = null;
 
-// Хранилище свечей
+// Хранилище свечей: { "BTCUSDT": { "MEXC": [...], "Binance": [...] } }
 const HISTORY_OHLC = {}; 
+// Текущая свеча: { "BTCUSDT": { "MEXC": {o,h,l,c}, ... } }
 const CURRENT_CANDLES = {};
 
 // --- ФУНКЦИЯ ОБНОВЛЕНИЯ ЦЕНЫ ---
@@ -51,7 +54,7 @@ const updatePrice = (symbol, exchange, price, extraData = null) => {
     }
 };
 
-// --- МОДУЛЬ ИСТОРИИ (OHLC - 20 МИНУТ) ---
+// --- МОДУЛЬ ИСТОРИИ (OHLC - 20 МИНУТ ДЛЯ ВСЕХ БИРЖ) ---
 setInterval(() => {
     const now = new Date();
     const currentMinute = Math.floor(now.getTime() / 60000); 
@@ -59,32 +62,38 @@ setInterval(() => {
     Object.keys(GLOBAL_PRICES).forEach(symbol => {
         const prices = GLOBAL_PRICES[symbol];
         
-        // Логика выбора цены для истории: MEXC -> Другие
-        let price = prices['MEXC'];
-        if (!price) {
-            for (let ex of EXCHANGES_ORDER) {
-                if (prices[ex]) { price = prices[ex]; break; }
-            }
-        }
-        
-        if (!price) return;
+        // Пробегаем по ВСЕМ биржам и пишем историю для каждой
+        ALL_SOURCES.forEach(source => {
+            const price = prices[source];
+            if (!price) return; // Если цены нет, пропускаем
 
-        if (!CURRENT_CANDLES[symbol] || CURRENT_CANDLES[symbol].lastMinute !== currentMinute) {
-            if (CURRENT_CANDLES[symbol]) {
-                if (!HISTORY_OHLC[symbol]) HISTORY_OHLC[symbol] = [];
-                HISTORY_OHLC[symbol].push({ ...CURRENT_CANDLES[symbol] });
-                if (HISTORY_OHLC[symbol].length > 25) HISTORY_OHLC[symbol].shift();
+            // Инициализация структур
+            if (!CURRENT_CANDLES[symbol]) CURRENT_CANDLES[symbol] = {};
+            if (!HISTORY_OHLC[symbol]) HISTORY_OHLC[symbol] = {};
+
+            // Логика смены минуты
+            if (!CURRENT_CANDLES[symbol][source] || CURRENT_CANDLES[symbol][source].lastMinute !== currentMinute) {
+                // Сохраняем старую
+                if (CURRENT_CANDLES[symbol][source]) {
+                    if (!HISTORY_OHLC[symbol][source]) HISTORY_OHLC[symbol][source] = [];
+                    HISTORY_OHLC[symbol][source].push({ ...CURRENT_CANDLES[symbol][source] });
+                    // Лимит 25 свечей
+                    if (HISTORY_OHLC[symbol][source].length > 25) HISTORY_OHLC[symbol][source].shift();
+                }
+
+                // Новая свеча
+                CURRENT_CANDLES[symbol][source] = {
+                    o: price, h: price, l: price, c: price,
+                    lastMinute: currentMinute
+                };
+            } else {
+                // Обновление текущей
+                const c = CURRENT_CANDLES[symbol][source];
+                if (price > c.h) c.h = price;
+                if (price < c.l) c.l = price;
+                c.c = price; 
             }
-            CURRENT_CANDLES[symbol] = {
-                o: price, h: price, l: price, c: price,
-                lastMinute: currentMinute
-            };
-        } else {
-            const c = CURRENT_CANDLES[symbol];
-            if (price > c.h) c.h = price;
-            if (price < c.l) c.l = price;
-            c.c = price; 
-        }
+        });
     });
 }, 1000);
 
@@ -139,7 +148,6 @@ const initBinanceGlobal = () => {
     connect();
 };
 
-// POLLERS
 const initBybitGlobal = () => { setInterval(async () => { try { if (!fetch) return; const res = await fetch('https://api.bybit.com/v5/market/tickers?category=linear'); const d = await res.json(); if (d.result && d.result.list) d.result.list.forEach(i => updatePrice(i.symbol, 'Bybit', i.lastPrice)); } catch(e) {} }, 1500); };
 const initGateGlobal = () => { setInterval(async () => { try { if (!fetch) return; const res = await fetch('https://api.gateio.ws/api/v4/futures/usdt/tickers'); const data = await res.json(); if (Array.isArray(data)) data.forEach(i => updatePrice(i.contract, 'Gate', i.last)); } catch(e) {} }, 2000); };
 const initBitgetGlobal = () => { setInterval(async () => { try { if (!fetch) return; const res = await fetch('https://api.bitget.com/api/v2/mix/market/tickers?productType=USDT-FUTURES'); const d = await res.json(); if (d.data) d.data.forEach(i => updatePrice(i.symbol, 'Bitget', i.lastPr)); } catch(e) {} }, 2000); };
@@ -250,13 +258,27 @@ app.get('/api/all', authMiddleware, async (req, res) => {
         gapPercent = ((mexcPrice - mexcFair) / mexcFair) * 100;
     }
 
-    let candles = HISTORY_OHLC[symbol] ? [...HISTORY_OHLC[symbol]] : [];
-    if (CURRENT_CANDLES[symbol]) {
-        candles.push(CURRENT_CANDLES[symbol]);
-    }
-    if (candles.length > 20) candles = candles.slice(-20);
+    // Собираем историю ПО ВСЕМ биржам для этого символа
+    // Ответ: { "MEXC": [...], "Binance": [...], ... }
+    const allCandles = {};
+    ALL_SOURCES.forEach(source => {
+        let sourceCandles = [];
+        if (HISTORY_OHLC[symbol] && HISTORY_OHLC[symbol][source]) {
+            sourceCandles = [...HISTORY_OHLC[symbol][source]];
+        }
+        // Добавляем текущую
+        if (CURRENT_CANDLES[symbol] && CURRENT_CANDLES[symbol][source]) {
+            sourceCandles.push(CURRENT_CANDLES[symbol][source]);
+        }
+        // Срез 20
+        if (sourceCandles.length > 20) sourceCandles = sourceCandles.slice(-20);
+        
+        if (sourceCandles.length > 0) {
+            allCandles[source] = sourceCandles;
+        }
+    });
 
-    res.json({ ok: true, mexc: mexcPrice, prices, candles, gap: gapPercent });
+    res.json({ ok: true, mexc: mexcPrice, prices, allCandles, gap: gapPercent });
 });
 
 app.get('/', (req, res) => {
@@ -290,7 +312,11 @@ body { background: #000; font-family: monospace; font-size: 28px; color: #fff; p
 #goBtn { padding: 10px 20px; font-size: 36px; cursor: pointer; background-color: #333; color: #fff; border: 1px solid #555; font-family: Arial, sans-serif; }
 #goBtn:hover { background-color: #888; }
 
-/* Chart Styles */
+/* Styles for interactive list */
+.exchange-link { cursor: pointer; text-decoration: none; color: inherit; }
+.exchange-link:hover { text-decoration: underline; }
+.exchange-active { background-color: #333; border-radius: 4px; } /* Highlight active source */
+
 #chart-container {
     margin-top: 10px;
     width: 100%;
@@ -311,8 +337,7 @@ svg { width: 100%; height: 100%; display: block; }
 .vol-label { fill: #fff; font-size: 8px; font-weight: bold; }
 .arrow-label { font-size: 8px; font-weight: bold; }
 .gap-label { font-size: 8px; font-weight: bold; }
-/* Watermark Style */
-.watermark { font-size: 20px; font-family: Arial, sans-serif; fill: #444; font-weight: bold; opacity: 0.5; }
+.watermark { font-size: 30px; font-family: Arial, sans-serif; fill: #333; font-weight: bold; opacity: 0.6; }
 </style>
 </head>
 <body>
@@ -343,6 +368,11 @@ let chain = urlParams.get('chain');
 let addr = urlParams.get('addr');  
 let depositOpen = true;   
 let timer = null, blink = false;  
+// Переменная для хранения выбранного источника графика (по умолчанию MEXC)
+let activeSource = 'MEXC';
+// Флаг ручного выбора (если пользователь сам кликнул, не переключаем автоматически)
+let manualSourceSelection = false;
+
 const output = document.getElementById("output");  
 const input = document.getElementById("symbolInput");  
 const dexLink = document.getElementById("dexLink");  
@@ -366,6 +396,14 @@ function go() {
     }
     window.location.href = targetUrl;
 }
+
+// Функция смены источника при клике
+function setSource(source) {
+    activeSource = source;
+    manualSourceSelection = true; // Запоминаем, что пользователь выбрал сам
+    update(); // Моментальное обновление
+}
+
 function formatP(p) { return (p && p != 0) ? parseFloat(p).toString() : "0"; }  
 
 function renderChart(candles, gap, sourceName) {
@@ -401,7 +439,7 @@ function renderChart(candles, gap, sourceName) {
 
     let svgHtml = '<svg viewBox="0 0 100 100" preserveAspectRatio="none">';
 
-    // --- WATERMARK (ИСТОЧНИК ДАННЫХ) ---
+    // --- WATERMARK ---
     svgHtml += \`<text x="50" y="55" text-anchor="middle" dominant-baseline="middle" class="watermark">\${sourceName}</text>\`;
 
     // --- УГЛОВЫЕ МЕТКИ ---
@@ -409,9 +447,7 @@ function renderChart(candles, gap, sourceName) {
     svgHtml += \`<text x="0.5" y="99" class="chart-text corner-label">\${formatP(minPrice)}</text>\`;
     svgHtml += \`<text x="99" y="7" text-anchor="end" class="chart-text vol-label">\${volatility}%</text>\`;
 
-    // --- GAP В ПРАВОМ НИЖНЕМ УГЛУ ---
-    // Выводим ВСЕГДА, если значение gap рассчитано (даже если < 5%)
-    // Цвета инвертированы: (+) = RED, (-) = GREEN
+    // --- GAP ---
     if (gap !== undefined && gap !== null && !isNaN(gap)) {
         let gapColor = gap >= 0 ? '#ff0000' : '#00ff00';
         let gapSign = gap > 0 ? '+' : '';
@@ -491,6 +527,18 @@ async function update() {
         if (!mainPrice || mainPrice == 0) {
             showGap = false; 
         }
+
+        // Авто-переключение источника, ТОЛЬКО если пользователь не выбрал вручную
+        if (!manualSourceSelection) {
+            if (mainPrice > 0) {
+                activeSource = 'MEXC';
+            } else {
+                // Если на MEXC 0, ищем первого доступного
+                for (let ex of exchangesOrder) {
+                    if (data.prices[ex] > 0) { activeSource = ex; break; }
+                }
+            }
+        }
         
         if (!dexPrice) {
              let pStr = formatP(mainPrice);
@@ -506,16 +554,16 @@ async function update() {
 
         let dotColorClass = depositOpen ? '' : 'closed';  
         
-        // --- ФОРМАТИРОВАНИЕ ЧЕРЕЗ BR ---
-        
+        // --- ФОРМИРОВАНИЕ HTML ---
         let dotSymbol = blink ? '<span class="'+dotColorClass+'">●</span>' : '○';
-        // Добавлен &nbsp; после точки
         let dotHtml = '<span style="display:inline-block; width:15px; text-align:center; font-family:Arial, sans-serif; line-height:1;">' + dotSymbol + '</span>&nbsp;';
         
-        let mexcLine = dotHtml + symbol + ' MEXC: ' + formatP(mainPrice);
+        // MEXC Line (Кликабельна)
+        let activeClassMexc = (activeSource === 'MEXC') ? 'exchange-active' : '';
+        let mexcPart = '<span class="exchange-link '+activeClassMexc+'" onclick="setSource(\\'MEXC\\')">' + symbol + ' MEXC</span>: ' + formatP(mainPrice);
         
-        // GAP в тексте (только если > 5%)
-        // Цвета инвертированы: (+) = RED, (-) = GREEN
+        let mexcLine = dotHtml + mexcPart;
+        
         if (showGap && data.gap && Math.abs(data.gap) > 5) {
             let gapColor = data.gap >= 0 ? '#ff0000' : '#00ff00';
             let gapSign = data.gap > 0 ? '+' : '';
@@ -536,27 +584,33 @@ async function update() {
                 if (sp > maxSp) { maxSp = sp; bestEx = ex; }  
             }  
         });  
+        
+        // Остальные биржи
         exchangesOrder.forEach(ex => {  
             let p = data.prices[ex];  
             if (p > 0) {  
                 let diff = ((p - mainPrice) / mainPrice * 100).toFixed(2);  
                 let cls = (ex === bestEx) ? 'class="best"' : '';  
                 let mark = (ex === bestEx) ? '◆' : '◇';  
-                lines.push('<span ' + cls + '>' + mark + ' ' + ex.padEnd(8, ' ') + ': ' + formatP(p) + ' (' + (diff > 0 ? "+" : "") + diff + '%)</span>');  
+                
+                // Добавляем класс активности и onclick
+                let activeClass = (activeSource === ex) ? 'exchange-active' : '';
+                let nameHtml = '<span class="exchange-link '+activeClass+'" onclick="setSource(\\''+ex+'\\')">' + ex.padEnd(8, ' ') + '</span>';
+                
+                lines.push('<span ' + cls + '>' + mark + ' ' + nameHtml + ': ' + formatP(p) + ' (' + (diff > 0 ? "+" : "") + diff + '%)</span>');  
             }  
         });  
         
-        output.innerHTML = lines.join("<br>"); // JOIN ЧЕРЕЗ <BR>
+        output.innerHTML = lines.join("<br>"); 
         statusEl.textContent = "Last: " + new Date().toLocaleTimeString();  
         
-        let sourceName = 'MEXC';
-        if (mainPrice == 0) {
-             for (let ex of exchangesOrder) {
-                if (data.prices[ex] > 0) { sourceName = ex; break; }
-             }
+        // Рендер графика для activeSource
+        let candlesToRender = (data.allCandles && data.allCandles[activeSource]) ? data.allCandles[activeSource] : [];
+        if(candlesToRender.length > 0) {
+            renderChart(candlesToRender, data.gap, activeSource);
+        } else {
+             chartContainer.innerHTML = '';
         }
-
-        if(data.candles) renderChart(data.candles, data.gap, sourceName);
 
     } catch(e) {}  
 }  
@@ -565,6 +619,10 @@ async function start() {
     if(!val) return;  
     
     input.blur();
+    
+    // Сброс выбора при новом поиске
+    manualSourceSelection = false;
+    activeSource = 'MEXC';
 
     if(timer) clearInterval(timer);  
     output.innerHTML = "Поиск...";  
@@ -633,4 +691,4 @@ if (urlParams.get('symbol')) start();
 });
 
 app.listen(CONFIG.PORT, () => console.log(`🚀 Server running on port ${CONFIG.PORT}`));
-                  
+            
