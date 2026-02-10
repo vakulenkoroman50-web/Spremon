@@ -18,7 +18,6 @@ const CONFIG = {
 };
 
 const EXCHANGES_ORDER = ["Binance", "Bybit", "Gate", "Bitget", "BingX", "OKX", "Kucoin"];
-// Полный список для итерации (включая MEXC)
 const ALL_SOURCES = ["MEXC", ...EXCHANGES_ORDER];
 
 /**
@@ -27,9 +26,8 @@ const ALL_SOURCES = ["MEXC", ...EXCHANGES_ORDER];
 const GLOBAL_PRICES = {};
 let MEXC_CONFIG_CACHE = null;
 
-// Хранилище свечей: { "BTCUSDT": { "MEXC": [...], "Binance": [...] } }
+// Хранилище свечей
 const HISTORY_OHLC = {}; 
-// Текущая свеча: { "BTCUSDT": { "MEXC": {o,h,l,c}, ... } }
 const CURRENT_CANDLES = {};
 
 // --- ФУНКЦИЯ ОБНОВЛЕНИЯ ЦЕНЫ ---
@@ -62,32 +60,25 @@ setInterval(() => {
     Object.keys(GLOBAL_PRICES).forEach(symbol => {
         const prices = GLOBAL_PRICES[symbol];
         
-        // Пробегаем по ВСЕМ биржам и пишем историю для каждой
         ALL_SOURCES.forEach(source => {
             const price = prices[source];
-            if (!price) return; // Если цены нет, пропускаем
+            if (!price) return; 
 
-            // Инициализация структур
             if (!CURRENT_CANDLES[symbol]) CURRENT_CANDLES[symbol] = {};
             if (!HISTORY_OHLC[symbol]) HISTORY_OHLC[symbol] = {};
 
-            // Логика смены минуты
             if (!CURRENT_CANDLES[symbol][source] || CURRENT_CANDLES[symbol][source].lastMinute !== currentMinute) {
-                // Сохраняем старую
                 if (CURRENT_CANDLES[symbol][source]) {
                     if (!HISTORY_OHLC[symbol][source]) HISTORY_OHLC[symbol][source] = [];
                     HISTORY_OHLC[symbol][source].push({ ...CURRENT_CANDLES[symbol][source] });
-                    // Лимит 25 свечей
                     if (HISTORY_OHLC[symbol][source].length > 25) HISTORY_OHLC[symbol][source].shift();
                 }
 
-                // Новая свеча
                 CURRENT_CANDLES[symbol][source] = {
                     o: price, h: price, l: price, c: price,
                     lastMinute: currentMinute
                 };
             } else {
-                // Обновление текущей
                 const c = CURRENT_CANDLES[symbol][source];
                 if (price > c.h) c.h = price;
                 if (price < c.l) c.l = price;
@@ -258,19 +249,15 @@ app.get('/api/all', authMiddleware, async (req, res) => {
         gapPercent = ((mexcPrice - mexcFair) / mexcFair) * 100;
     }
 
-    // Собираем историю ПО ВСЕМ биржам для этого символа
-    // Ответ: { "MEXC": [...], "Binance": [...], ... }
     const allCandles = {};
     ALL_SOURCES.forEach(source => {
         let sourceCandles = [];
         if (HISTORY_OHLC[symbol] && HISTORY_OHLC[symbol][source]) {
             sourceCandles = [...HISTORY_OHLC[symbol][source]];
         }
-        // Добавляем текущую
         if (CURRENT_CANDLES[symbol] && CURRENT_CANDLES[symbol][source]) {
             sourceCandles.push(CURRENT_CANDLES[symbol][source]);
         }
-        // Срез 20
         if (sourceCandles.length > 20) sourceCandles = sourceCandles.slice(-20);
         
         if (sourceCandles.length > 0) {
@@ -312,10 +299,9 @@ body { background: #000; font-family: monospace; font-size: 28px; color: #fff; p
 #goBtn { padding: 10px 20px; font-size: 36px; cursor: pointer; background-color: #333; color: #fff; border: 1px solid #555; font-family: Arial, sans-serif; }
 #goBtn:hover { background-color: #888; }
 
-/* Styles for interactive list */
 .exchange-link { cursor: pointer; text-decoration: none; color: inherit; }
 .exchange-link:hover { text-decoration: underline; }
-.exchange-active { background-color: #333; border-radius: 4px; } /* Highlight active source */
+.exchange-active { background-color: #333; border-radius: 4px; } 
 
 #chart-container {
     margin-top: 10px;
@@ -368,9 +354,7 @@ let chain = urlParams.get('chain');
 let addr = urlParams.get('addr');  
 let depositOpen = true;   
 let timer = null, blink = false;  
-// Переменная для хранения выбранного источника графика (по умолчанию MEXC)
 let activeSource = 'MEXC';
-// Флаг ручного выбора (если пользователь сам кликнул, не переключаем автоматически)
 let manualSourceSelection = false;
 
 const output = document.getElementById("output");  
@@ -397,11 +381,10 @@ function go() {
     window.location.href = targetUrl;
 }
 
-// Функция смены источника при клике
 function setSource(source) {
     activeSource = source;
-    manualSourceSelection = true; // Запоминаем, что пользователь выбрал сам
-    update(); // Моментальное обновление
+    manualSourceSelection = true;
+    update();
 }
 
 function formatP(p) { return (p && p != 0) ? parseFloat(p).toString() : "0"; }  
@@ -439,22 +422,18 @@ function renderChart(candles, gap, sourceName) {
 
     let svgHtml = '<svg viewBox="0 0 100 100" preserveAspectRatio="none">';
 
-    // --- WATERMARK ---
     svgHtml += \`<text x="50" y="55" text-anchor="middle" dominant-baseline="middle" class="watermark">\${sourceName}</text>\`;
 
-    // --- УГЛОВЫЕ МЕТКИ ---
     svgHtml += \`<text x="0.5" y="7" class="chart-text corner-label">\${formatP(maxPrice)}</text>\`;
     svgHtml += \`<text x="0.5" y="99" class="chart-text corner-label">\${formatP(minPrice)}</text>\`;
     svgHtml += \`<text x="99" y="7" text-anchor="end" class="chart-text vol-label">\${volatility}%</text>\`;
 
-    // --- GAP ---
     if (gap !== undefined && gap !== null && !isNaN(gap)) {
         let gapColor = gap >= 0 ? '#ff0000' : '#00ff00';
         let gapSign = gap > 0 ? '+' : '';
         svgHtml += \`<text x="99" y="99" text-anchor="end" fill="\${gapColor}" class="chart-text gap-label">GAP: \${gapSign}\${gap.toFixed(2)}%</text>\`;
     }
 
-    // --- СВЕЧИ ---
     candles.forEach((c, index) => {
         const xCenter = (index * candleWidth) + (bodyWidth / 2);
         
@@ -521,19 +500,18 @@ async function update() {
         const data = await res.json();  
         if(!data.ok) return;  
         
-        let mainPrice = data.mexc;
-        let showGap = true;
+        let mainPrice = data.mexc; // Это цена именно MEXC, для заголовка
+        
+        // --- БАЗОВАЯ ЦЕНА (от которой считаем спреды) ---
+        // Если activeSource == MEXC -> берем data.mexc
+        // Если activeSource == Binance -> берем data.prices['Binance']
+        let basePrice = (activeSource === 'MEXC') ? data.mexc : data.prices[activeSource];
+        if (!basePrice || basePrice == 0) basePrice = mainPrice; // Fallback
 
-        if (!mainPrice || mainPrice == 0) {
-            showGap = false; 
-        }
-
-        // Авто-переключение источника, ТОЛЬКО если пользователь не выбрал вручную
+        // Авто-переключение источника, только если ручного выбора не было
         if (!manualSourceSelection) {
-            if (mainPrice > 0) {
-                activeSource = 'MEXC';
-            } else {
-                // Если на MEXC 0, ищем первого доступного
+            if (mainPrice > 0) activeSource = 'MEXC';
+            else {
                 for (let ex of exchangesOrder) {
                     if (data.prices[ex] > 0) { activeSource = ex; break; }
                 }
@@ -554,17 +532,22 @@ async function update() {
 
         let dotColorClass = depositOpen ? '' : 'closed';  
         
-        // --- ФОРМИРОВАНИЕ HTML ---
         let dotSymbol = blink ? '<span class="'+dotColorClass+'">●</span>' : '○';
         let dotHtml = '<span style="display:inline-block; width:15px; text-align:center; font-family:Arial, sans-serif; line-height:1;">' + dotSymbol + '</span>&nbsp;';
         
-        // MEXC Line (Кликабельна)
         let activeClassMexc = (activeSource === 'MEXC') ? 'exchange-active' : '';
         let mexcPart = '<span class="exchange-link '+activeClassMexc+'" onclick="setSource(\\'MEXC\\')">' + symbol + ' MEXC</span>: ' + formatP(mainPrice);
         
         let mexcLine = dotHtml + mexcPart;
         
-        if (showGap && data.gap && Math.abs(data.gap) > 5) {
+        // Спред для MEXC (если активен не MEXC)
+        if (activeSource !== 'MEXC' && basePrice > 0 && mainPrice > 0) {
+             let diff = ((mainPrice - basePrice) / basePrice * 100).toFixed(2);
+             mexcLine += ' (' + (diff > 0 ? "+" : "") + diff + '%)';
+        }
+
+        // GAP (Только если > 5% и цена есть, оставляем как "фишку" MEXC)
+        if (mainPrice > 0 && data.gap && Math.abs(data.gap) > 5) {
             let gapColor = data.gap >= 0 ? '#ff0000' : '#00ff00';
             let gapSign = data.gap > 0 ? '+' : '';
             mexcLine += \` <span style="color:\${gapColor}">(\${gapSign}\${data.gap.toFixed(2)}%)</span>\`;
@@ -573,27 +556,25 @@ async function update() {
         let lines = [mexcLine];  
         
         if (dexPrice > 0) {  
-            let diff = ((dexPrice - mainPrice) / mainPrice * 100).toFixed(2);  
+            // DEX спред считаем от basePrice (активной биржи)
+            let diff = ((dexPrice - basePrice) / basePrice * 100).toFixed(2);  
             lines.push('<span class="dex-row">◇ DEX     : ' + formatP(dexPrice) + ' (' + (diff > 0 ? "+" : "") + diff + '%)</span>');  
         }  
         let bestEx = null, maxSp = 0;  
         exchangesOrder.forEach(ex => {  
             let p = data.prices[ex];  
             if (p > 0) {  
-                let sp = Math.abs((p - mainPrice) / mainPrice * 100);  
+                let sp = Math.abs((p - basePrice) / basePrice * 100);  
                 if (sp > maxSp) { maxSp = sp; bestEx = ex; }  
             }  
         });  
         
-        // Остальные биржи
         exchangesOrder.forEach(ex => {  
             let p = data.prices[ex];  
             if (p > 0) {  
-                let diff = ((p - mainPrice) / mainPrice * 100).toFixed(2);  
+                let diff = ((p - basePrice) / basePrice * 100).toFixed(2);  
                 let cls = (ex === bestEx) ? 'class="best"' : '';  
                 let mark = (ex === bestEx) ? '◆' : '◇';  
-                
-                // Добавляем класс активности и onclick
                 let activeClass = (activeSource === ex) ? 'exchange-active' : '';
                 let nameHtml = '<span class="exchange-link '+activeClass+'" onclick="setSource(\\''+ex+'\\')">' + ex.padEnd(8, ' ') + '</span>';
                 
@@ -604,7 +585,6 @@ async function update() {
         output.innerHTML = lines.join("<br>"); 
         statusEl.textContent = "Last: " + new Date().toLocaleTimeString();  
         
-        // Рендер графика для activeSource
         let candlesToRender = (data.allCandles && data.allCandles[activeSource]) ? data.allCandles[activeSource] : [];
         if(candlesToRender.length > 0) {
             renderChart(candlesToRender, data.gap, activeSource);
@@ -619,8 +599,6 @@ async function start() {
     if(!val) return;  
     
     input.blur();
-    
-    // Сброс выбора при новом поиске
     manualSourceSelection = false;
     activeSource = 'MEXC';
 
@@ -691,4 +669,4 @@ if (urlParams.get('symbol')) start();
 });
 
 app.listen(CONFIG.PORT, () => console.log(`🚀 Server running on port ${CONFIG.PORT}`));
-            
+                    
