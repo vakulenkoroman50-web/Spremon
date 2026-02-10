@@ -31,8 +31,7 @@ let MEXC_CONFIG_CACHE = null;
 const HISTORY_OHLC = {}; 
 const CURRENT_CANDLES = {};
 
-// --- ЕДИНАЯ ФУНКЦИЯ НОРМАЛИЗАЦИИ (ИЗ ТВОЕЙ РАБОЧЕЙ ВЕРСИИ) ---
-// Используется и при записи, и при чтении
+// --- ЕДИНАЯ ФУНКЦИЯ НОРМАЛИЗАЦИИ ---
 const normalizeSymbol = (s) => {
     if (!s) return null;
     return s.toUpperCase()
@@ -305,8 +304,7 @@ async function updateMexcConfigCache() {
 }
 setInterval(updateMexcConfigCache, 60000);
 
-// --- API ROUTES ---
-
+// --- API ---
 app.get('/api/resolve', authMiddleware, async (req, res) => {
     const symbol = (req.query.symbol || '').toUpperCase();
     let data = MEXC_CONFIG_CACHE;
@@ -382,6 +380,7 @@ app.get('/', (req, res) => {
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body { background: #000; font-family: monospace; font-size: 28px; color: #fff; padding: 10px; overflow: hidden; }
+/* Strict monospace */
 #output { white-space: pre; line-height: 1.1; min-height: 280px; position: relative; font-family: monospace; }
 .control-row { display: flex; gap: 5px; margin-top: 0; flex-wrap: wrap; }
 #symbolInput { font-family: monospace; font-size: 28px; width: 100%; max-width: 280px; background: #000; color: #fff; border: 1px solid #444; }
@@ -486,7 +485,6 @@ function setSource(source) {
 function formatP(p) { return (p && p != 0) ? parseFloat(p).toString() : "0"; }  
 
 function renderChart(candles, gap, sourceName) {
-    // ВАЖНО: Разрешаем рисовать даже 1 свечу
     if (!candles || candles.length === 0) {
         chartContainer.innerHTML = '';
         return;
@@ -496,7 +494,6 @@ function renderChart(candles, gap, sourceName) {
         if(c.l < minPrice) minPrice = c.l;
         if(c.h > maxPrice) maxPrice = c.h;
     });
-    // Защита от нулевого диапазона
     if (minPrice === Infinity) return;
 
     let volatility = 0;
@@ -504,8 +501,7 @@ function renderChart(candles, gap, sourceName) {
     
     let range = maxPrice - minPrice;
     if (range === 0) {
-        // Если цена не двигалась, создаем искусственный диапазон, чтобы не делить на 0
-        range = maxPrice * 0.001; 
+        range = maxPrice * 0.001 || 0.001; 
         minPrice = maxPrice - (range/2);
         maxPrice = maxPrice + (range/2);
     }
@@ -541,7 +537,6 @@ function renderChart(candles, gap, sourceName) {
 
         svgHtml += \`<line x1="\${xCenter}" y1="\${yHigh}" x2="\${xCenter}" y2="\${yLow}" class="candle-wick \${colorClass}" />\`;
         
-        // Высота тела минимум 0.2, чтобы видно было доджи
         const rawRectH = Math.abs(yClose - yOpen);
         const rectH = rawRectH < 0.2 ? 0.2 : rawRectH;
         
@@ -549,11 +544,11 @@ function renderChart(candles, gap, sourceName) {
         const rectX = xCenter - (bodyWidth / 2);
         svgHtml += \`<rect x="\${rectX}" y="\${rectY}" width="\${bodyWidth}" height="\${rectH}" class="candle-body \${colorClass}" />\`;
 
-        // Стрелки (только если > 2 свечей, чтобы не мелькало на одной)
-        if (candles.length > 2) {
-            if (c.h === maxPrice) svgHtml += \`<text x="\${xCenter}" y="\${yHigh - 2}" fill="\${arrowColor}" text-anchor="middle" class="chart-text arrow-label">↑</text>\`;
-            if (c.l === minPrice) svgHtml += \`<text x="\${xCenter}" y="\${yLow + 8}" fill="\${arrowColor}" text-anchor="middle" class="chart-text arrow-label">↓</text>\`;
-        }
+        // STRELKI INSIDE THE CANDLE RANGE (NOT OVERLAPPING CORNER TEXT)
+        // High Arrow: Drawn at yHigh + 8 (Inside the top of candle zone)
+        if (c.h === maxPrice) svgHtml += \`<text x="\${xCenter}" y="\${yHigh + 8}" fill="\${arrowColor}" text-anchor="middle" class="chart-text arrow-label">↑</text>\`;
+        // Low Arrow: Drawn at yLow - 2 (Inside the bottom of candle zone)
+        if (c.l === minPrice) svgHtml += \`<text x="\${xCenter}" y="\${yLow - 2}" fill="\${arrowColor}" text-anchor="middle" class="chart-text arrow-label">↓</text>\`;
     });
     svgHtml += '</svg>';
     chartContainer.innerHTML = svgHtml;
@@ -728,4 +723,4 @@ if (urlParams.get('symbol')) start();
 });
 
 app.listen(CONFIG.PORT, () => console.log(`🚀 Server running on port ${CONFIG.PORT}`));
-                                                                                
+    
