@@ -31,7 +31,7 @@ let MEXC_CONFIG_CACHE = null;
 const HISTORY_OHLC = {}; 
 const CURRENT_CANDLES = {};
 
-// --- НОРМАЛИЗАЦИЯ (СТАРЫЙ НАДЕЖНЫЙ МЕТОД) ---
+// --- ЕДИНАЯ ФУНКЦИЯ НОРМАЛИЗАЦИИ (СТАРАЯ НАДЕЖНАЯ) ---
 const normalizeSymbol = (s) => {
     if (!s) return null;
     return s.toUpperCase()
@@ -52,7 +52,7 @@ const updateData = (rawSymbol, exchange, price, fairPrice = null) => {
         GLOBAL_PRICES[s][exchange] = parseFloat(price);
     }
 
-    // Обновляем Fair Price (Только если пришла > 0)
+    // Обновляем Fair Price
     if (fairPrice && parseFloat(fairPrice) > 0) {
         if (!GLOBAL_FAIR[s]) GLOBAL_FAIR[s] = {};
         GLOBAL_FAIR[s][exchange] = parseFloat(fairPrice);
@@ -102,7 +102,7 @@ setInterval(() => {
  * --- MONITORS ---
  */
 
-// 1. MEXC (WS)
+// 1. MEXC GLOBAL (WS)
 const initMexcGlobal = () => {
     let ws = null;
     const connect = () => {
@@ -128,7 +128,7 @@ const initMexcGlobal = () => {
     connect();
 };
 
-// 2. BINANCE (WS + REST)
+// 2. BINANCE GLOBAL (WS + REST)
 const initBinanceGlobal = () => {
     let ws = null;
     const connect = () => {
@@ -144,6 +144,7 @@ const initBinanceGlobal = () => {
         } catch (e) { setTimeout(connect, 5000); }
     };
     connect();
+
     setInterval(async () => {
         try {
             if(!fetch) return;
@@ -182,7 +183,7 @@ const initGateGlobal = () => {
     }, 2000);
 };
 
-// 5. BITGET (markPr)
+// 5. BITGET (ИСПРАВЛЕНО: markPrice вместо markPr)
 const initBitgetGlobal = () => {
     setInterval(async () => {
         try {
@@ -190,7 +191,7 @@ const initBitgetGlobal = () => {
             const res = await fetch('https://api.bitget.com/api/v2/mix/market/tickers?productType=USDT-FUTURES');
             const d = await res.json();
             if (d.data) {
-                d.data.forEach(i => updateData(i.symbol, 'Bitget', i.lastPr, i.markPr));
+                d.data.forEach(i => updateData(i.symbol, 'Bitget', i.lastPr, i.markPrice));
             }
         } catch(e) {}
     }, 2000);
@@ -216,19 +217,31 @@ const initOkxGlobal = () => {
     }, 4000);
 };
 
-// 7. BINGX (ТОЛЬКО Last Price)
+// 7. BINGX (ДОБАВЛЕН ЗАПРОС premiumIndex для Mark Price)
 const initBingxGlobal = () => {
+    // Last Price
     setInterval(async () => {
         try {
             if (!fetch) return;
             const res = await fetch('https://open-api.bingx.com/openApi/swap/v2/quote/ticker');
             const d = await res.json();
             if (d.data) {
-                // BingX не отдает markPrice в этом эндпоинте, поэтому передаем только lastPrice
                 d.data.forEach(i => updateData(i.symbol, 'BingX', i.lastPrice));
             }
         } catch(e) {}
     }, 2000);
+
+    // Mark Price (premiumIndex)
+    setInterval(async () => {
+        try {
+            if (!fetch) return;
+            const res = await fetch('https://open-api.bingx.com/openApi/swap/v2/quote/premiumIndex');
+            const d = await res.json();
+            if (d.data) {
+                d.data.forEach(i => updateData(i.symbol, 'BingX', null, i.markPrice));
+            }
+        } catch(e) {}
+    }, 4000);
 };
 
 // 8. KUCOIN
@@ -333,11 +346,16 @@ app.get('/api/all', authMiddleware, async (req, res) => {
 
     const prices = {};
     const fairPrices = {};
+    let sum = 0; let count = 0;
 
     ALL_SOURCES.forEach(source => {
-        prices[source] = marketData[source] || 0;
+        let p = marketData[source] || 0;
+        prices[source] = p;
         fairPrices[source] = fairData[source] || 0;
+        if (p > 0) { sum += p; count++; }
     });
+
+    const globalAverage = count > 0 ? sum / count : 0;
 
     const allCandles = {};
     ALL_SOURCES.forEach(source => {
@@ -348,7 +366,7 @@ app.get('/api/all', authMiddleware, async (req, res) => {
         if (sourceCandles.length > 0) allCandles[source] = sourceCandles;
     });
 
-    res.json({ ok: true, mexc: mexcPrice, prices, fairPrices, allCandles });
+    res.json({ ok: true, mexc: mexcPrice, prices, fairPrices, allCandles, average: globalAverage });
 });
 
 app.get('/', (req, res) => {
@@ -529,9 +547,7 @@ function renderChart(candles, gap, sourceName) {
         svgHtml += \`<rect x="\${rectX}" y="\${rectY}" width="\${bodyWidth}" height="\${rectH}" class="candle-body \${colorClass}" />\`;
 
         // СТРЕЛКИ ВНУТРИ ДИАПАЗОНА СВЕЧИ
-        // High: yHigh - это верхняя точка (min Y). +8 смещает ВНИЗ (внутрь свечи)
         if (c.h === maxPrice) svgHtml += \`<text x="\${xCenter}" y="\${yHigh + 8}" fill="\${arrowColor}" text-anchor="middle" class="chart-text arrow-label">↑</text>\`;
-        // Low: yLow - это нижняя точка (max Y). -2 смещает ВВЕРХ (внутрь свечи)
         if (c.l === minPrice) svgHtml += \`<text x="\${xCenter}" y="\${yLow - 2}" fill="\${arrowColor}" text-anchor="middle" class="chart-text arrow-label">↓</text>\`;
     });
     svgHtml += '</svg>';
@@ -566,24 +582,24 @@ async function update() {
         const data = await res.json();  
         if(!data.ok) return;  
         
-        let activePrice = data.prices[activeSource];
+        let mainPrice = data.prices[activeSource];
         
         if (!manualSourceSelection) {
-            if (!activePrice || activePrice == 0) {
+            if (!mainPrice || mainPrice == 0) {
                 if(data.prices['MEXC'] > 0) activeSource = 'MEXC';
                 else {
                     for (let ex of allSources) { if (data.prices[ex] > 0) { activeSource = ex; break; } }
                 }
-                activePrice = data.prices[activeSource];
+                mainPrice = data.prices[activeSource];
             }
         }
-        if(!activePrice) activePrice = 0;
+        if(!mainPrice) mainPrice = 0;
 
         let activeFair = (data.fairPrices && data.fairPrices[activeSource]) ? data.fairPrices[activeSource] : 0;
         
         let chartGap = null;
-        if (activePrice > 0 && activeFair > 0) {
-            chartGap = ((activePrice - activeFair) / activeFair) * 100;
+        if (mainPrice > 0 && activeFair > 0) {
+            chartGap = ((mainPrice - activeFair) / activeFair) * 100;
         }
 
         if (activeFair > 0) {
@@ -595,7 +611,7 @@ async function update() {
             fairPriceDisplay.innerHTML = '';
         }
         
-        if (!dexPrice) document.title = symbol + ': ' + formatP(activePrice);
+        if (!dexPrice) document.title = symbol + ': ' + formatP(mainPrice);
 
         let lines = [];
         
@@ -604,8 +620,8 @@ async function update() {
         let dotHtml = '<span style="display:inline-block; width:15px; text-align:center; font-family:Arial, sans-serif; line-height:1;">' + dotSymbol + '</span>&nbsp;';
         
         let dexDiffHtml = '';
-        if (dexPrice > 0 && activePrice > 0) {
-            let diff = ((dexPrice - activePrice) / activePrice * 100).toFixed(2);
+        if (dexPrice > 0 && mainPrice > 0) {
+            let diff = ((dexPrice - mainPrice) / mainPrice * 100).toFixed(2);
             dexDiffHtml = ' (' + (diff > 0 ? "+" : "") + diff + '%)';
         }
         lines.push(dotHtml + symbol + ' DEX: ' + formatP(dexPrice) + '<span class="dex-row">' + dexDiffHtml + '</span>');
@@ -613,8 +629,8 @@ async function update() {
         let bestEx = null, maxSp = 0;
         allSources.forEach(ex => {
             let p = data.prices[ex];
-            if (p > 0 && activePrice > 0) {
-                let sp = Math.abs((p - activePrice) / activePrice * 100);
+            if (p > 0 && mainPrice > 0) {
+                let sp = Math.abs((p - mainPrice) / mainPrice * 100);
                 if (sp > maxSp) { maxSp = sp; bestEx = ex; }
             }
         });
@@ -640,8 +656,8 @@ async function update() {
                         tailHtml = \` <span style="color:\${gColor}">(\${gSign}\${chartGap.toFixed(2)}%)</span>\`;
                     }
                 } else {
-                    if (activePrice > 0) {
-                        let diff = ((p - activePrice) / activePrice * 100).toFixed(2);
+                    if (mainPrice > 0) {
+                        let diff = ((p - mainPrice) / mainPrice * 100).toFixed(2);
                         tailHtml = ' (' + (diff > 0 ? "+" : "") + diff + '%)';
                     }
                 }
@@ -707,4 +723,4 @@ if (urlParams.get('symbol')) start();
 });
 
 app.listen(CONFIG.PORT, () => console.log(`🚀 Server running on port ${CONFIG.PORT}`));
-            
+                                                                                       
