@@ -23,36 +23,45 @@ const ALL_SOURCES = ["MEXC", ...EXCHANGES_ORDER];
 /**
  * GLOBAL DATA CACHE
  */
-const GLOBAL_PRICES = {};
+const GLOBAL_PRICES = {}; // { "BTC": { "MEXC": 100, "Binance": 100.1 } }
+const GLOBAL_FAIR = {};   // { "BTC": { "MEXC": 100.05, "Binance": 100.12 } }
 let MEXC_CONFIG_CACHE = null;
 
 // Хранилище свечей
 const HISTORY_OHLC = {}; 
 const CURRENT_CANDLES = {};
 
-// --- ФУНКЦИЯ ОБНОВЛЕНИЯ ЦЕНЫ ---
-const updatePrice = (symbol, exchange, price, extraData = null) => {
-    if (!symbol || !price) return;
-    
-    let s = symbol.toUpperCase();
-    if (s.startsWith('XBT')) s = s.replace('XBT', 'BTC');
-    s = s.replace(/[-_]/g, '');
-    s = s.replace(/SWAP$/, '');
-    s = s.replace(/USDTM?$/, ''); 
-    s = s.replace(/USD$/, '');
+// --- УТИЛИТА НОРМАЛИЗАЦИИ СИМВОЛА ---
+const normalizeSymbol = (s) => {
+    if (!s) return null;
+    let sym = s.toUpperCase();
+    if (sym.startsWith('XBT')) sym = sym.replace('XBT', 'BTC');
+    sym = sym.replace(/[-_]/g, '');
+    sym = sym.replace(/SWAP$/, '');
+    sym = sym.replace(/USDTM?$/, ''); 
+    sym = sym.replace(/USD$/, '');
+    return sym;
+};
 
-    const p = parseFloat(price);
+// --- ФУНКЦИЯ ОБНОВЛЕНИЯ ЦЕНЫ И FAIR PRICE ---
+const updateData = (rawSymbol, exchange, price, fairPrice = null) => {
+    const s = normalizeSymbol(rawSymbol);
+    if (!s) return;
 
-    if (!GLOBAL_PRICES[s]) GLOBAL_PRICES[s] = {};
-    GLOBAL_PRICES[s][exchange] = p;
+    // Обновляем Last Price
+    if (price) {
+        if (!GLOBAL_PRICES[s]) GLOBAL_PRICES[s] = {};
+        GLOBAL_PRICES[s][exchange] = parseFloat(price);
+    }
 
-    // Сохраняем Fair Price от MEXC
-    if (exchange === 'MEXC' && extraData && extraData.fairPrice) {
-        GLOBAL_PRICES[s]['MEXC_FAIR'] = parseFloat(extraData.fairPrice);
+    // Обновляем Fair Price (Mark Price)
+    if (fairPrice) {
+        if (!GLOBAL_FAIR[s]) GLOBAL_FAIR[s] = {};
+        GLOBAL_FAIR[s][exchange] = parseFloat(fairPrice);
     }
 };
 
-// --- МОДУЛЬ ИСТОРИИ (OHLC - 20 МИНУТ ДЛЯ ВСЕХ БИРЖ) ---
+// --- МОДУЛЬ ИСТОРИИ (OHLC) ---
 setInterval(() => {
     const now = new Date();
     const currentMinute = Math.floor(now.getTime() / 60000); 
@@ -95,6 +104,8 @@ const safeJson = (data) => {
 /**
  * --- GLOBAL MONITORS ---
  */
+
+// 1. MEXC GLOBAL (WS)
 const initMexcGlobal = () => {
     let ws = null;
     const connect = () => {
@@ -110,7 +121,7 @@ const initMexcGlobal = () => {
                 if (d.method === 'ping') { ws.send(JSON.stringify({ "method": "pong" })); return; }
                 if (d.channel === 'push.tickers' && d.data) {
                     const items = Array.isArray(d.data) ? d.data : [d.data];
-                    items.forEach(i => updatePrice(i.symbol, 'MEXC', i.lastPrice, i));
+                    items.forEach(i => updateData(i.symbol, 'MEXC', i.lastPrice, i.fairPrice));
                 }
             });
             ws.on('error', () => {});
@@ -120,7 +131,9 @@ const initMexcGlobal = () => {
     connect();
 };
 
+// 2. BINANCE GLOBAL (WS + REST)
 const initBinanceGlobal = () => {
+    // WS для Last Price (быстро)
     let ws = null;
     const connect = () => {
         try {
@@ -129,7 +142,7 @@ const initBinanceGlobal = () => {
             ws.on('message', (data) => {
                 const arr = safeJson(data);
                 if (Array.isArray(arr)) {
-                    arr.forEach(i => updatePrice(i.s, 'Binance', i.c));
+                    arr.forEach(i => updateData(i.s, 'Binance', i.c)); // Только Last Price
                 }
             });
             ws.on('error', () => {});
@@ -137,15 +150,135 @@ const initBinanceGlobal = () => {
         } catch (e) { setTimeout(connect, 5000); }
     };
     connect();
+
+    // REST для Mark Price (раз в 3 сек)
+    setInterval(async () => {
+        try {
+            if(!fetch) return;
+            const res = await fetch('https://fapi.binance.com/fapi/v1/premiumIndex');
+            const data = await res.json();
+            if(Array.isArray(data)) {
+                data.forEach(i => updateData(i.symbol, 'Binance', null, i.markPrice));
+            }
+        } catch(e) {}
+    }, 3000);
 };
 
-const initBybitGlobal = () => { setInterval(async () => { try { if (!fetch) return; const res = await fetch('https://api.bybit.com/v5/market/tickers?category=linear'); const d = await res.json(); if (d.result && d.result.list) d.result.list.forEach(i => updatePrice(i.symbol, 'Bybit', i.lastPrice)); } catch(e) {} }, 1500); };
-const initGateGlobal = () => { setInterval(async () => { try { if (!fetch) return; const res = await fetch('https://api.gateio.ws/api/v4/futures/usdt/tickers'); const data = await res.json(); if (Array.isArray(data)) data.forEach(i => updatePrice(i.contract, 'Gate', i.last)); } catch(e) {} }, 2000); };
-const initBitgetGlobal = () => { setInterval(async () => { try { if (!fetch) return; const res = await fetch('https://api.bitget.com/api/v2/mix/market/tickers?productType=USDT-FUTURES'); const d = await res.json(); if (d.data) d.data.forEach(i => updatePrice(i.symbol, 'Bitget', i.lastPr)); } catch(e) {} }, 2000); };
-const initOkxGlobal = () => { setInterval(async () => { try { if (!fetch) return; const res = await fetch('https://www.okx.com/api/v5/market/tickers?instType=SWAP'); const d = await res.json(); if (d.data) d.data.forEach(i => { if (i.instId.endsWith('USDT-SWAP')) updatePrice(i.instId, 'OKX', i.last); }); } catch(e) {} }, 2000); };
-const initBingxGlobal = () => { setInterval(async () => { try { if (!fetch) return; const res = await fetch('https://open-api.bingx.com/openApi/swap/v2/quote/ticker'); const d = await res.json(); if (d.data) d.data.forEach(i => updatePrice(i.symbol, 'BingX', i.lastPrice)); } catch(e) {} }, 2000); };
-const initKucoinGlobal = () => { setInterval(async () => { try { if (!fetch) return; const res = await fetch('https://api-futures.kucoin.com/api/v1/allTickers'); const d = await res.json(); if (d.data && Array.isArray(d.data)) d.data.forEach(i => updatePrice(i.symbol, 'Kucoin', i.price)); } catch(e) {} }, 2000); };
+// 3. BYBIT (REST - Last + Mark)
+const initBybitGlobal = () => {
+    setInterval(async () => {
+        try {
+            if (!fetch) return;
+            const res = await fetch('https://api.bybit.com/v5/market/tickers?category=linear');
+            const d = await res.json();
+            if (d.result && d.result.list) {
+                d.result.list.forEach(i => updateData(i.symbol, 'Bybit', i.lastPrice, i.markPrice));
+            }
+        } catch(e) {}
+    }, 1500);
+};
 
+// 4. GATE (REST - Last + Mark)
+const initGateGlobal = () => {
+    setInterval(async () => {
+        try {
+            if (!fetch) return;
+            const res = await fetch('https://api.gateio.ws/api/v4/futures/usdt/tickers');
+            const data = await res.json();
+            if (Array.isArray(data)) {
+                data.forEach(i => updateData(i.contract, 'Gate', i.last, i.mark_price));
+            }
+        } catch(e) {}
+    }, 2000);
+};
+
+// 5. BITGET (REST - Last + Mark)
+const initBitgetGlobal = () => {
+    setInterval(async () => {
+        try {
+            if (!fetch) return;
+            const res = await fetch('https://api.bitget.com/api/v2/mix/market/tickers?productType=USDT-FUTURES');
+            const d = await res.json();
+            if (d.data) {
+                d.data.forEach(i => updateData(i.symbol, 'Bitget', i.lastPr, i.markPr));
+            }
+        } catch(e) {}
+    }, 2000);
+};
+
+// 6. OKX (REST - Last + Mark отдельно)
+const initOkxGlobal = () => {
+    // Last Price
+    setInterval(async () => {
+        try {
+            if (!fetch) return;
+            const res = await fetch('https://www.okx.com/api/v5/market/tickers?instType=SWAP');
+            const d = await res.json();
+            if (d.data) {
+                d.data.forEach(i => {
+                    if (i.instId.endsWith('USDT-SWAP')) updateData(i.instId, 'OKX', i.last);
+                });
+            }
+        } catch(e) {}
+    }, 2000);
+
+    // Mark Price (отдельный запрос)
+    setInterval(async () => {
+        try {
+            if (!fetch) return;
+            const res = await fetch('https://www.okx.com/api/v5/public/mark-price?instType=SWAP');
+            const d = await res.json();
+            if (d.data) {
+                d.data.forEach(i => {
+                    if (i.instId.endsWith('USDT-SWAP')) updateData(i.instId, 'OKX', null, i.markPx);
+                });
+            }
+        } catch(e) {}
+    }, 4000); // Чуть реже
+};
+
+// 7. BINGX (REST - Last + Mark)
+const initBingxGlobal = () => {
+    setInterval(async () => {
+        try {
+            if (!fetch) return;
+            const res = await fetch('https://open-api.bingx.com/openApi/swap/v2/quote/ticker');
+            const d = await res.json();
+            if (d.data) {
+                d.data.forEach(i => updateData(i.symbol, 'BingX', i.lastPrice, i.markPrice));
+            }
+        } catch(e) {}
+    }, 2000);
+};
+
+// 8. KUCOIN (REST - Last + Mark отдельно)
+const initKucoinGlobal = () => {
+    // Last
+    setInterval(async () => {
+        try {
+            if (!fetch) return;
+            const res = await fetch('https://api-futures.kucoin.com/api/v1/allTickers');
+            const d = await res.json();
+            if (d.data && Array.isArray(d.data)) {
+                d.data.forEach(i => updateData(i.symbol, 'Kucoin', i.price));
+            }
+        } catch(e) {}
+    }, 2000);
+    
+    // Mark
+    setInterval(async () => {
+        try {
+            if (!fetch) return;
+            const res = await fetch('https://api-futures.kucoin.com/api/v1/contracts/active');
+            const d = await res.json();
+            if (d.data && Array.isArray(d.data)) {
+                d.data.forEach(i => updateData(i.symbol, 'Kucoin', null, i.markPrice));
+            }
+        } catch(e) {}
+    }, 5000);
+};
+
+// ЗАПУСК МОНИТОРОВ
 initMexcGlobal();
 initBinanceGlobal();
 initBybitGlobal();
@@ -154,6 +287,7 @@ initBitgetGlobal();
 initOkxGlobal();
 initBingxGlobal();
 initKucoinGlobal();
+
 
 // --- SERVER SETUP ---
 
@@ -236,12 +370,16 @@ app.get('/api/all', authMiddleware, async (req, res) => {
     if (!symbol) return res.json({ ok: false });
 
     const marketData = GLOBAL_PRICES[symbol] || {};
+    const fairData = GLOBAL_FAIR[symbol] || {}; // Данные по Fair Price
+    
     const mexcPrice = marketData['MEXC'] || 0;
-    const mexcFair = marketData['MEXC_FAIR'] || 0; 
 
     const prices = {};
-    EXCHANGES_ORDER.forEach(ex => {
-        prices[ex] = marketData[ex] || 0;
+    const fairPrices = {};
+
+    ALL_SOURCES.forEach(source => {
+        prices[source] = marketData[source] || 0;
+        fairPrices[source] = fairData[source] || 0;
     });
 
     const allCandles = {};
@@ -260,8 +398,8 @@ app.get('/api/all', authMiddleware, async (req, res) => {
         }
     });
 
-    // Отдаем чистый fair price, гэп считает клиент
-    res.json({ ok: true, mexc: mexcPrice, prices, allCandles, fair: mexcFair });
+    // Отдаем цены и fair цены
+    res.json({ ok: true, mexc: mexcPrice, prices, fairPrices, allCandles });
 });
 
 app.get('/', (req, res) => {
@@ -309,6 +447,14 @@ body { background: #000; font-family: monospace; font-size: 28px; color: #fff; p
     position: relative;
     margin-bottom: 5px;
 }
+#fair-price-display {
+    margin-top: 2px;
+    font-size: 14px;
+    color: #888;
+    text-align: right;
+    max-width: 480px;
+    font-family: Arial, sans-serif;
+}
 svg { width: 100%; height: 100%; display: block; }
 .candle-wick { stroke-width: 1; }
 .candle-body { stroke: none; }
@@ -337,6 +483,7 @@ svg { width: 100%; height: 100%; display: block; }
 </div>  
 
 <div id="chart-container"></div>
+<div id="fair-price-display"></div>
 
 <input id="dexLink" readonly placeholder="DEX URL" onclick="this.select(); document.execCommand('copy');" />  
 <div id="status" style="font-size: 18px; margin-top: 5px; color: #444;"></div>  
@@ -359,6 +506,7 @@ const dexLink = document.getElementById("dexLink");
 const statusEl = document.getElementById("status");  
 const urlInput = document.getElementById("urlInput");
 const chartContainer = document.getElementById("chart-container");
+const fairPriceDisplay = document.getElementById("fair-price-display");
 
 if(urlInput) {
     urlInput.addEventListener("keydown", function(event) { if (event.key === "Enter") go(); });
@@ -497,8 +645,7 @@ async function update() {
         if(!data.ok) return;  
         
         let mainPrice = data.mexc;
-        let fairPrice = data.fair || 0;
-
+        
         if (!manualSourceSelection) {
             if (mainPrice > 0) activeSource = 'MEXC';
             else {
@@ -508,20 +655,27 @@ async function update() {
             }
         }
         
-        // Цена "Активной" биржи (для расчетов GAP и Спредов)
+        // Цена активной биржи
         let activePrice = (activeSource === 'MEXC') ? mainPrice : data.prices[activeSource];
         if (!activePrice || activePrice == 0) activePrice = mainPrice;
 
-        // Расчет GAP для ГРАФИКА (относительно активной биржи)
-        let chartGap = 0;
-        if (activePrice > 0 && fairPrice > 0) {
-            chartGap = ((activePrice - fairPrice) / fairPrice) * 100;
+        // Fair Price активной биржи
+        let activeFair = (data.fairPrices && data.fairPrices[activeSource]) ? data.fairPrices[activeSource] : 0;
+
+        // Расчет GAP для ГРАФИКА
+        let chartGap = null;
+        if (activePrice > 0 && activeFair > 0) {
+            chartGap = ((activePrice - activeFair) / activeFair) * 100;
         }
 
-        // Расчет GAP для строки MEXC (всегда MEXC)
-        let mexcGap = 0;
-        if (mainPrice > 0 && fairPrice > 0) {
-            mexcGap = ((mainPrice - fairPrice) / fairPrice) * 100;
+        // --- ВЫВОД FAIR PRICE ПОД ГРАФИКОМ ---
+        if (activeFair > 0) {
+            let fpColor = (chartGap !== null && chartGap >= 0) ? '#ff0000' : '#00ff00';
+            let fpSign = (chartGap !== null && chartGap > 0) ? '+' : '';
+            let gapText = (chartGap !== null) ? \`(GAP: \${fpSign}\${chartGap.toFixed(2)}%)\` : '';
+            fairPriceDisplay.innerHTML = \`Fair: \${formatP(activeFair)} <span style="color:\${fpColor}">\${gapText}</span>\`;
+        } else {
+            fairPriceDisplay.innerHTML = '';
         }
         
         if (!dexPrice) {
@@ -546,23 +700,26 @@ async function update() {
         
         let mexcLine = dotHtml + mexcPart;
         
-        // Спред для MEXC (если активен не MEXC)
         if (activeSource !== 'MEXC' && activePrice > 0 && mainPrice > 0) {
              let diff = ((mainPrice - activePrice) / activePrice * 100).toFixed(2);
              mexcLine += ' (' + (diff > 0 ? "+" : "") + diff + '%)';
         }
 
-        // GAP (Вывод в строке MEXC - это GAP MEXC, а не активной)
-        if (mainPrice > 0 && fairPrice > 0 && Math.abs(mexcGap) > 5) {
-            let gapColor = mexcGap >= 0 ? '#ff0000' : '#00ff00';
-            let gapSign = mexcGap > 0 ? '+' : '';
-            mexcLine += \` <span style="color:\${gapColor}">(\${gapSign}\${mexcGap.toFixed(2)}%)</span>\`;
+        // GAP MEXC для строки MEXC (если есть данные)
+        let mexcFair = (data.fairPrices && data.fairPrices['MEXC']) ? data.fairPrices['MEXC'] : 0;
+        let mexcGapVal = 0;
+        if (mainPrice > 0 && mexcFair > 0) {
+            mexcGapVal = ((mainPrice - mexcFair) / mexcFair) * 100;
+            if (Math.abs(mexcGapVal) > 5) {
+                let gapColor = mexcGapVal >= 0 ? '#ff0000' : '#00ff00';
+                let gapSign = mexcGapVal > 0 ? '+' : '';
+                mexcLine += \` <span style="color:\${gapColor}">(\${gapSign}\${mexcGapVal.toFixed(2)}%)</span>\`;
+            }
         }
 
         let lines = [mexcLine];  
         
         if (dexPrice > 0) {  
-            // DEX спред считаем от activePrice
             let diff = ((dexPrice - activePrice) / activePrice * 100).toFixed(2);  
             lines.push('<span class="dex-row">◇ DEX     : ' + formatP(dexPrice) + ' (' + (diff > 0 ? "+" : "") + diff + '%)</span>');  
         }  
