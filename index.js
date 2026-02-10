@@ -31,14 +31,15 @@ let MEXC_CONFIG_CACHE = null;
 const HISTORY_OHLC = {}; 
 const CURRENT_CANDLES = {};
 
-// --- СТАРЫЙ НАДЕЖНЫЙ ПАРСЕР (ИЗ ПЕРВОЙ ВЕРСИИ) ---
-const normalizeSymbol = (symbol) => {
-    if (!symbol) return null;
-    return symbol.toUpperCase()
+// --- ЕДИНАЯ ФУНКЦИЯ НОРМАЛИЗАЦИИ (ИЗ ТВОЕЙ РАБОЧЕЙ ВЕРСИИ) ---
+// Используется и при записи, и при чтении
+const normalizeSymbol = (s) => {
+    if (!s) return null;
+    return s.toUpperCase()
         .replace(/[-_]/g, '')     
         .replace('USDT', '')      
         .replace('SWAP', '')      
-        .replace('M', ''); 
+        .replace('M', '');        
 };
 
 // --- ФУНКЦИЯ ОБНОВЛЕНИЯ ДАННЫХ ---
@@ -52,11 +53,15 @@ const updateData = (rawSymbol, exchange, price, fairPrice = null) => {
         GLOBAL_PRICES[s][exchange] = parseFloat(price);
     }
 
-    // Обновляем Fair Price (Mark Price)
+    // Обновляем Fair Price
     if (fairPrice && parseFloat(fairPrice) > 0) {
         if (!GLOBAL_FAIR[s]) GLOBAL_FAIR[s] = {};
         GLOBAL_FAIR[s][exchange] = parseFloat(fairPrice);
     }
+};
+
+const safeJson = (data) => {
+    try { return JSON.parse(data); } catch (e) { return null; }
 };
 
 // --- МОДУЛЬ ИСТОРИИ (OHLC) ---
@@ -99,15 +104,11 @@ setInterval(() => {
     });
 }, 1000);
 
-const safeJson = (data) => {
-    try { return JSON.parse(data); } catch (e) { return null; }
-};
-
 /**
  * --- MONITORS (СТАРЫЕ НАДЕЖНЫЕ ВЕРСИИ) ---
  */
 
-// 1. MEXC GLOBAL
+// 1. MEXC GLOBAL (WS)
 const initMexcGlobal = () => {
     let ws = null;
     const connect = () => {
@@ -133,7 +134,7 @@ const initMexcGlobal = () => {
     connect();
 };
 
-// 2. BINANCE GLOBAL
+// 2. BINANCE GLOBAL (WS + REST)
 const initBinanceGlobal = () => {
     let ws = null;
     const connect = () => {
@@ -142,17 +143,14 @@ const initBinanceGlobal = () => {
             ws.on('open', () => console.log('[Binance] Connected'));
             ws.on('message', (data) => {
                 const arr = safeJson(data);
-                if (Array.isArray(arr)) {
-                    arr.forEach(i => updateData(i.s, 'Binance', i.c));
-                }
+                if (Array.isArray(arr)) arr.forEach(i => updateData(i.s, 'Binance', i.c));
             });
             ws.on('error', () => {});
             ws.on('close', () => setTimeout(connect, 3000));
         } catch (e) { setTimeout(connect, 5000); }
     };
     connect();
-    
-    // Доп запрос для Mark Price
+
     setInterval(async () => {
         try {
             if(!fetch) return;
@@ -212,14 +210,9 @@ const initOkxGlobal = () => {
             if (!fetch) return;
             const res = await fetch('https://www.okx.com/api/v5/market/tickers?instType=SWAP');
             const d = await res.json();
-            if (d.data) {
-                d.data.forEach(i => {
-                    if (i.instId.endsWith('USDT-SWAP')) updateData(i.instId, 'OKX', i.last);
-                });
-            }
+            if (d.data) d.data.forEach(i => { if (i.instId.endsWith('USDT-SWAP')) updateData(i.instId, 'OKX', i.last); });
         } catch(e) {}
     }, 2000);
-    // Mark Price
     setInterval(async () => {
         try {
             if (!fetch) return;
@@ -260,7 +253,6 @@ const initKucoinGlobal = () => {
             }
         } catch(e) {}
     }, 2000);
-    // Mark
     setInterval(async () => {
         try {
             if (!fetch) return;
@@ -313,7 +305,8 @@ async function updateMexcConfigCache() {
 }
 setInterval(updateMexcConfigCache, 60000);
 
-// --- API ---
+// --- API ROUTES ---
+
 app.get('/api/resolve', authMiddleware, async (req, res) => {
     const symbol = (req.query.symbol || '').toUpperCase();
     let data = MEXC_CONFIG_CACHE;
@@ -341,9 +334,8 @@ app.get('/api/resolve', authMiddleware, async (req, res) => {
 });
 
 app.get('/api/all', authMiddleware, async (req, res) => {
-    // ВАЖНО: Используем ту же нормализацию, что и при записи данных!
-    let symbol = (req.query.symbol || '').toUpperCase();
-    if(symbol.endsWith('USDT')) symbol = symbol.replace('USDT', '');
+    // ВАЖНО: Используем ту же функцию нормализации, что и при записи данных!
+    let symbol = normalizeSymbol(req.query.symbol || '');
     
     if (!symbol) return res.json({ ok: false });
 
@@ -390,7 +382,6 @@ app.get('/', (req, res) => {
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body { background: #000; font-family: monospace; font-size: 28px; color: #fff; padding: 10px; overflow: hidden; }
-/* Strict monospace */
 #output { white-space: pre; line-height: 1.1; min-height: 280px; position: relative; font-family: monospace; }
 .control-row { display: flex; gap: 5px; margin-top: 0; flex-wrap: wrap; }
 #symbolInput { font-family: monospace; font-size: 28px; width: 100%; max-width: 280px; background: #000; color: #fff; border: 1px solid #444; }
@@ -495,7 +486,8 @@ function setSource(source) {
 function formatP(p) { return (p && p != 0) ? parseFloat(p).toString() : "0"; }  
 
 function renderChart(candles, gap, sourceName) {
-    if (!candles || candles.length < 2) {
+    // ВАЖНО: Разрешаем рисовать даже 1 свечу
+    if (!candles || candles.length === 0) {
         chartContainer.innerHTML = '';
         return;
     }
@@ -504,12 +496,21 @@ function renderChart(candles, gap, sourceName) {
         if(c.l < minPrice) minPrice = c.l;
         if(c.h > maxPrice) maxPrice = c.h;
     });
+    // Защита от нулевого диапазона
     if (minPrice === Infinity) return;
 
-    let volatility = ((maxPrice - minPrice) / minPrice * 100).toFixed(2);
-    const range = maxPrice - minPrice;
-    const safeRange = range === 0 ? maxPrice * 0.01 : range;
-    const padding = safeRange * 0.1; 
+    let volatility = 0;
+    if(minPrice > 0) volatility = ((maxPrice - minPrice) / minPrice * 100).toFixed(2);
+    
+    let range = maxPrice - minPrice;
+    if (range === 0) {
+        // Если цена не двигалась, создаем искусственный диапазон, чтобы не делить на 0
+        range = maxPrice * 0.001; 
+        minPrice = maxPrice - (range/2);
+        maxPrice = maxPrice + (range/2);
+    }
+    
+    const padding = range * 0.1; 
     const plotMin = minPrice - padding;
     const plotMax = maxPrice + padding;
     const plotRange = plotMax - plotMin;
@@ -539,13 +540,20 @@ function renderChart(candles, gap, sourceName) {
         const arrowColor = isGreen ? '#000000' : '#ffffff';
 
         svgHtml += \`<line x1="\${xCenter}" y1="\${yHigh}" x2="\${xCenter}" y2="\${yLow}" class="candle-wick \${colorClass}" />\`;
+        
+        // Высота тела минимум 0.2, чтобы видно было доджи
+        const rawRectH = Math.abs(yClose - yOpen);
+        const rectH = rawRectH < 0.2 ? 0.2 : rawRectH;
+        
         const rectY = Math.min(yOpen, yClose);
-        const rectH = Math.abs(yClose - yOpen) || 0.4; 
         const rectX = xCenter - (bodyWidth / 2);
         svgHtml += \`<rect x="\${rectX}" y="\${rectY}" width="\${bodyWidth}" height="\${rectH}" class="candle-body \${colorClass}" />\`;
 
-        if (c.h === maxPrice) svgHtml += \`<text x="\${xCenter}" y="\${arrowY}" fill="\${arrowColor}" text-anchor="middle" class="chart-text arrow-label">↑</text>\`;
-        if (c.l === minPrice) svgHtml += \`<text x="\${xCenter}" y="\${arrowY}" fill="\${arrowColor}" text-anchor="middle" class="chart-text arrow-label">↓</text>\`;
+        // Стрелки (только если > 2 свечей, чтобы не мелькало на одной)
+        if (candles.length > 2) {
+            if (c.h === maxPrice) svgHtml += \`<text x="\${xCenter}" y="\${yHigh - 2}" fill="\${arrowColor}" text-anchor="middle" class="chart-text arrow-label">↑</text>\`;
+            if (c.l === minPrice) svgHtml += \`<text x="\${xCenter}" y="\${yLow + 8}" fill="\${arrowColor}" text-anchor="middle" class="chart-text arrow-label">↓</text>\`;
+        }
     });
     svgHtml += '</svg>';
     chartContainer.innerHTML = svgHtml;
@@ -579,25 +587,24 @@ async function update() {
         const data = await res.json();  
         if(!data.ok) return;  
         
-        let activePrice = data.prices[activeSource];
+        let mainPrice = data.prices[activeSource];
         
         if (!manualSourceSelection) {
-            if (!activePrice || activePrice == 0) {
+            if (!mainPrice || mainPrice == 0) {
                 if(data.prices['MEXC'] > 0) activeSource = 'MEXC';
                 else {
                     for (let ex of allSources) { if (data.prices[ex] > 0) { activeSource = ex; break; } }
                 }
-                activePrice = data.prices[activeSource];
+                mainPrice = data.prices[activeSource];
             }
         }
-        if(!activePrice) activePrice = 0;
+        if(!mainPrice) mainPrice = 0;
 
-        // FAIR PRICE & GAP (Specific to active source)
         let activeFair = (data.fairPrices && data.fairPrices[activeSource]) ? data.fairPrices[activeSource] : data.average;
         
         let chartGap = null;
-        if (activePrice > 0 && activeFair > 0) {
-            chartGap = ((activePrice - activeFair) / activeFair) * 100;
+        if (mainPrice > 0 && activeFair > 0) {
+            chartGap = ((mainPrice - activeFair) / activeFair) * 100;
         }
 
         if (activeFair > 0) {
@@ -609,30 +616,26 @@ async function update() {
             fairPriceDisplay.innerHTML = '';
         }
         
-        if (!dexPrice) document.title = symbol + ': ' + formatP(activePrice);
+        if (!dexPrice) document.title = symbol + ': ' + formatP(mainPrice);
 
-        // --- RENDER LINES (Строгое форматирование с <br>) ---
         let lines = [];
         
-        // 1. DEX Line
         let dotColorClass = depositOpen ? '' : 'closed';  
         let dotSymbol = blink ? '<span class="'+dotColorClass+'">●</span>' : '○';
         let dotHtml = '<span style="display:inline-block; width:15px; text-align:center; font-family:Arial, sans-serif; line-height:1;">' + dotSymbol + '</span>&nbsp;';
         
         let dexDiffHtml = '';
-        if (dexPrice > 0 && activePrice > 0) {
-            let diff = ((dexPrice - activePrice) / activePrice * 100).toFixed(2);
+        if (dexPrice > 0 && mainPrice > 0) {
+            let diff = ((dexPrice - mainPrice) / mainPrice * 100).toFixed(2);
             dexDiffHtml = ' (' + (diff > 0 ? "+" : "") + diff + '%)';
         }
         lines.push(dotHtml + symbol + ' DEX: ' + formatP(dexPrice) + '<span class="dex-row">' + dexDiffHtml + '</span>');
 
-        // 2. CEX List
-        // Находим биржу с МАКС спредом для желтого цвета
         let bestEx = null, maxSp = 0;
         allSources.forEach(ex => {
             let p = data.prices[ex];
-            if (p > 0 && activePrice > 0) {
-                let sp = Math.abs((p - activePrice) / activePrice * 100);
+            if (p > 0 && mainPrice > 0) {
+                let sp = Math.abs((p - mainPrice) / mainPrice * 100);
                 if (sp > maxSp) { maxSp = sp; bestEx = ex; }
             }
         });
@@ -641,35 +644,29 @@ async function update() {
             let p = data.prices[ex];
             if (p > 0) {
                 let isActive = (ex === activeSource);
-                // Желтый цвет только если Макс Спред
                 let cls = (ex === bestEx) ? 'class="best"' : ''; 
                 
                 let mark = isActive ? '◆' : '◇';
                 
-                // Фон: Активный = Темно-серый
                 let rowBg = isActive ? 'background-color:#333;' : '';
                 
-                // Имя: Фиксированная ширина
-                let namePadded = ex.padEnd(8, ' '); // 8 символов выравнивание
+                let namePadded = ex.padEnd(8, ' '); 
                 let nameHtml = '<span class="exchange-link" onclick="setSource(\\''+ex+'\\')">' + namePadded + '</span>';
                 
                 let tailHtml = '';
                 if (isActive) {
-                    // GAP if > 5% on active line (instead of 0.00% spread)
                     if(chartGap !== null && Math.abs(chartGap) > 5) {
                         let gColor = chartGap >= 0 ? '#ff0000' : '#00ff00';
                         let gSign = chartGap > 0 ? '+' : '';
                         tailHtml = \` <span style="color:\${gColor}">(\${gSign}\${chartGap.toFixed(2)}%)</span>\`;
                     }
                 } else {
-                    // Spread relative to active
-                    if (activePrice > 0) {
-                        let diff = ((p - activePrice) / activePrice * 100).toFixed(2);
+                    if (mainPrice > 0) {
+                        let diff = ((p - mainPrice) / mainPrice * 100).toFixed(2);
                         tailHtml = ' (' + (diff > 0 ? "+" : "") + diff + '%)';
                     }
                 }
 
-                // Оборачиваем в span с фоном для выделения активной строки целиком, но внутри PRE
                 lines.push('<span style="' + rowBg + '"><span ' + cls + '>' + mark + ' ' + nameHtml + ': ' + formatP(p) + tailHtml + '</span></span>');
             }
         });
@@ -731,4 +728,4 @@ if (urlParams.get('symbol')) start();
 });
 
 app.listen(CONFIG.PORT, () => console.log(`🚀 Server running on port ${CONFIG.PORT}`));
-    
+                                                                                
