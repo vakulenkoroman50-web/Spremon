@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
 const WebSocket = require('ws');
+const mongoose = require('mongoose'); // Подключаем библиотеку для БД
 
 /**
  * КОНФИГУРАЦИЯ
@@ -9,6 +10,8 @@ const WebSocket = require('ws');
 const CONFIG = {
     PORT: process.env.PORT || 3000,
     SECRET_TOKEN: process.env.SECRET_TOKEN || '',
+    // Вставь сюда свою строку подключения (замени <password> на пароль)
+    MONGO_URI: process.env.MONGO_URI || 'mongodb+srv://admin:<password>@cluster0.....mongodb.net/?retryWrites=true&w=majority', 
     MEXC: {
         KEY: process.env.MEXC_API_KEY || '',
         SECRET: process.env.MEXC_API_SECRET || '',
@@ -22,15 +25,36 @@ const ALL_SOURCES = ["MEXC", ...EXCHANGES_ORDER];
 const TIMEFRAMES = ['1m', '15m', '1h'];
 
 /**
+ * --- MONGODB SETUP ---
+ */
+// Подключение
+mongoose.connect(CONFIG.MONGO_URI)
+    .then(() => console.log('✅ MongoDB Connected'))
+    .catch(err => console.error('❌ MongoDB Connection Error:', err));
+
+// Схема свечи
+const CandleSchema = new mongoose.Schema({
+    symbol: { type: String, required: true, index: true },
+    exchange: { type: String, required: true, index: true },
+    timeframe: { type: String, required: true },
+    o: Number, h: Number, l: Number, c: Number,
+    time: { type: Date, default: Date.now, index: true } // Время закрытия свечи
+});
+
+// Авто-удаление старых записей через 3 дня (259200 секунд), чтобы не забить Free Tier
+CandleSchema.index({ time: 1 }, { expireAfterSeconds: 259200 });
+
+const CandleModel = mongoose.model('Candle', CandleSchema);
+
+/**
  * GLOBAL DATA CACHE
  */
 const GLOBAL_PRICES = {}; 
 const GLOBAL_FAIR = {};   
 let MEXC_CONFIG_CACHE = null;
 
-// Структура: HISTORY_OHLC[symbol][exchange][timeframe] = [candle, ...]
+// Хранилище свечей (В оперативной памяти)
 const HISTORY_OHLC = {}; 
-// Структура: CURRENT_CANDLES[symbol][exchange][timeframe] = { o, h, l, c, lastPeriod }
 const CURRENT_CANDLES = {};
 
 // --- ЕДИНАЯ ФУНКЦИЯ НОРМАЛИЗАЦИИ ---
@@ -63,12 +87,37 @@ const safeJson = (data) => {
     try { return JSON.parse(data); } catch (e) { return null; }
 };
 
-// --- МОДУЛЬ ИСТОРИИ (MULTI-TIMEFRAME) ---
+// --- ЗАГРУЗКА ИСТОРИИ ИЗ БД ПРИ СТАРТЕ ---
+async function loadHistoryFromDB() {
+    console.log('🔄 Loading history from DB...');
+    try {
+        // Берем последние 5000 записей (этого хватит восстановить графики для активных пар)
+        const docs = await CandleModel.find().sort({ time: -1 }).limit(5000);
+        
+        // Разворачиваем, чтобы добавлять в хронологическом порядке
+        docs.reverse().forEach(doc => {
+            const { symbol, exchange, timeframe } = doc;
+            
+            if (!HISTORY_OHLC[symbol]) HISTORY_OHLC[symbol] = {};
+            if (!HISTORY_OHLC[symbol][exchange]) HISTORY_OHLC[symbol][exchange] = {};
+            if (!HISTORY_OHLC[symbol][exchange][timeframe]) HISTORY_OHLC[symbol][exchange][timeframe] = [];
+            
+            const arr = HISTORY_OHLC[symbol][exchange][timeframe];
+            arr.push({ o: doc.o, h: doc.h, l: doc.l, c: doc.c });
+            
+            if (arr.length > 25) arr.shift();
+        });
+        console.log(`✅ History loaded: ${docs.length} candles restored.`);
+    } catch (e) {
+        console.error('⚠️ Failed to load history:', e);
+    }
+}
+
+// --- МОДУЛЬ ИСТОРИИ (OHLC + SAVE TO DB) ---
 setInterval(() => {
     const now = new Date();
     const timeMs = now.getTime();
 
-    // Рассчитываем текущие периоды для каждого ТФ
     const periods = {
         '1m': Math.floor(timeMs / 60000),
         '15m': Math.floor(timeMs / (15 * 60000)),
@@ -82,27 +131,37 @@ setInterval(() => {
             const price = prices[source];
             if (!price) return; 
 
-            // Инициализация структур
+            // Инициализация
             if (!CURRENT_CANDLES[symbol]) CURRENT_CANDLES[symbol] = {};
             if (!CURRENT_CANDLES[symbol][source]) CURRENT_CANDLES[symbol][source] = {};
             
             if (!HISTORY_OHLC[symbol]) HISTORY_OHLC[symbol] = {};
             if (!HISTORY_OHLC[symbol][source]) HISTORY_OHLC[symbol][source] = {};
 
-            // Обработка каждого таймфрейма отдельно
             TIMEFRAMES.forEach(tf => {
                 const currentPeriod = periods[tf];
                 let currentCandle = CURRENT_CANDLES[symbol][source][tf];
 
-                // Если свечи нет или наступил новый период
+                // Если период сменился
                 if (!currentCandle || currentCandle.lastPeriod !== currentPeriod) {
-                    // Сохраняем старую (если была)
+                    // 1. Сохраняем закрытую свечу в память и в БД
                     if (currentCandle) {
+                        // RAM
                         if (!HISTORY_OHLC[symbol][source][tf]) HISTORY_OHLC[symbol][source][tf] = [];
                         HISTORY_OHLC[symbol][source][tf].push({ ...currentCandle });
                         if (HISTORY_OHLC[symbol][source][tf].length > 25) HISTORY_OHLC[symbol][source][tf].shift();
+
+                        // DB (Fire and forget - не ждем)
+                        CandleModel.create({
+                            symbol: symbol,
+                            exchange: source,
+                            timeframe: tf,
+                            o: currentCandle.o, h: currentCandle.h, l: currentCandle.l, c: currentCandle.c,
+                            time: new Date()
+                        }).catch(e => console.error('DB Save Error', e.message));
                     }
-                    // Создаем новую
+
+                    // 2. Создаем новую свечу
                     CURRENT_CANDLES[symbol][source][tf] = {
                         o: price, h: price, l: price, c: price,
                         lastPeriod: currentPeriod
@@ -119,7 +178,7 @@ setInterval(() => {
 }, 1000);
 
 /**
- * --- MONITORS ---
+ * --- MONITORS (СТАБИЛЬНЫЕ) ---
  */
 const initMexcGlobal = () => {
     let ws = null;
@@ -127,7 +186,7 @@ const initMexcGlobal = () => {
         try {
             ws = new WebSocket('wss://contract.mexc.com/edge');
             ws.on('open', () => {
-                console.log('[MEXC] Connected');
+                console.log('[MEXC] WS Connected');
                 ws.send(JSON.stringify({ "method": "sub.tickers", "param": {} }));
             });
             ws.on('message', (data) => {
@@ -151,7 +210,7 @@ const initBinanceGlobal = () => {
     const connect = () => {
         try {
             ws = new WebSocket('wss://fstream.binance.com/ws/!ticker@arr'); 
-            ws.on('open', () => console.log('[Binance] Connected'));
+            ws.on('open', () => console.log('[Binance] WS Connected'));
             ws.on('message', (data) => {
                 const arr = safeJson(data);
                 if (Array.isArray(arr)) arr.forEach(i => updateData(i.s, 'Binance', i.c));
@@ -230,14 +289,28 @@ const initOkxGlobal = () => {
 };
 
 const initBingxGlobal = () => {
+    // Last Price
     setInterval(async () => {
         try {
             if (!fetch) return;
             const res = await fetch('https://open-api.bingx.com/openApi/swap/v2/quote/ticker');
             const d = await res.json();
-            if (d.data) d.data.forEach(i => updateData(i.symbol, 'BingX', i.lastPrice));
+            if (d.data) {
+                d.data.forEach(i => updateData(i.symbol, 'BingX', i.lastPrice));
+            }
         } catch(e) {}
     }, 2000);
+    // Mark Price (Через premiumIndex)
+    setInterval(async () => {
+        try {
+            if (!fetch) return;
+            const res = await fetch('https://open-api.bingx.com/openApi/swap/v2/quote/premiumIndex');
+            const d = await res.json();
+            if (d.data) {
+                d.data.forEach(i => updateData(i.symbol, 'BingX', null, i.markPrice));
+            }
+        } catch(e) {}
+    }, 4000);
 };
 
 const initKucoinGlobal = () => {
@@ -246,7 +319,9 @@ const initKucoinGlobal = () => {
             if (!fetch) return;
             const res = await fetch('https://api-futures.kucoin.com/api/v1/allTickers');
             const d = await res.json();
-            if (d.data && Array.isArray(d.data)) d.data.forEach(i => updateData(i.symbol, 'Kucoin', i.price));
+            if (d.data && Array.isArray(d.data)) {
+                d.data.forEach(i => updateData(i.symbol, 'Kucoin', i.price));
+            }
         } catch(e) {}
     }, 2000);
     setInterval(async () => {
@@ -273,6 +348,8 @@ let fetch;
 (async () => {
     fetch = (await import('node-fetch')).default;
     updateMexcConfigCache();
+    // Запускаем восстановление истории
+    loadHistoryFromDB();
 })();
 
 const authMiddleware = (req, res, next) => {
@@ -334,7 +411,6 @@ app.get('/api/all', authMiddleware, async (req, res) => {
 
     const marketData = GLOBAL_PRICES[symbol] || {};
     const fairData = GLOBAL_FAIR[symbol] || {};
-    
     const mexcPrice = marketData['MEXC'] || 0;
 
     const prices = {};
@@ -350,7 +426,6 @@ app.get('/api/all', authMiddleware, async (req, res) => {
 
     const globalAverage = count > 0 ? sum / count : 0;
 
-    // Сбор свечей для всех ТФ
     const allCandles = {};
     ALL_SOURCES.forEach(source => {
         allCandles[source] = {};
@@ -383,7 +458,6 @@ app.get('/', (req, res) => {
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body { background: #000; font-family: monospace; font-size: 28px; color: #fff; padding: 10px; overflow: hidden; }
-/* Strict monospace */
 #output { white-space: pre; line-height: 1.1; min-height: 280px; position: relative; font-family: monospace; }
 .control-row { display: flex; gap: 5px; margin-top: 0; flex-wrap: wrap; }
 #symbolInput { font-family: monospace; font-size: 28px; width: 100%; max-width: 280px; background: #000; color: #fff; border: 1px solid #444; }
@@ -398,11 +472,9 @@ body { background: #000; font-family: monospace; font-size: 28px; color: #fff; p
 #urlInput { width: 46%; padding: 10px; font-size: 36px; background-color: #222; color: #fff; border: 1px solid #444; outline: none; font-family: Arial, sans-serif; }
 #goBtn { padding: 10px 20px; font-size: 36px; cursor: pointer; background-color: #333; color: #fff; border: 1px solid #555; font-family: Arial, sans-serif; }
 #goBtn:hover { background-color: #888; }
-
 .exchange-link { cursor: pointer; text-decoration: none; color: inherit; }
 .exchange-link:hover { text-decoration: underline; }
 .exchange-active { background-color: #333; } 
-
 #chart-container {
     margin-top: 10px; width: 100%; max-width: 480px; height: 300px; 
     border: 1px solid #333; background: #050505; position: relative; margin-bottom: 5px; cursor: pointer;
@@ -418,7 +490,6 @@ svg { width: 100%; height: 100%; display: block; }
 .chart-text { font-family: Arial, sans-serif; font-size: 8px; }
 .corner-label { fill: #ffff00; font-size: 8px; font-weight: bold; }
 .vol-label { fill: #fff; font-size: 8px; font-weight: bold; }
-.tf-label { fill: #ccc; font-size: 8px; font-weight: bold; }
 .arrow-label { font-size: 8px; font-weight: bold; }
 .gap-label { font-size: 8px; font-weight: bold; }
 .watermark { font-size: 30px; font-family: Arial, sans-serif; fill: #333; font-weight: bold; opacity: 0.6; }
@@ -531,8 +602,6 @@ function renderChart(candles, gap, sourceName) {
     svgHtml += \`<text x="50" y="55" text-anchor="middle" dominant-baseline="middle" class="watermark">\${sourceName}</text>\`;
     svgHtml += \`<text x="0.5" y="7" class="chart-text corner-label">\${formatP(maxPrice)}</text>\`;
     svgHtml += \`<text x="0.5" y="99" class="chart-text corner-label">\${formatP(minPrice)}</text>\`;
-    
-    // Timeframe and Volatility label
     svgHtml += \`<text x="99" y="7" text-anchor="end" class="chart-text vol-label">\${activeTimeframe} | \${volatility}%</text>\`;
 
     if (gap !== undefined && gap !== null && !isNaN(gap)) {
@@ -560,7 +629,7 @@ function renderChart(candles, gap, sourceName) {
         const rectX = xCenter - (bodyWidth / 2);
         svgHtml += \`<rect x="\${rectX}" y="\${rectY}" width="\${bodyWidth}" height="\${rectH}" class="candle-body \${colorClass}" />\`;
 
-        // ARROWS INSIDE CANDLE ZONE
+        // STRELKI
         if (c.h === maxPrice) svgHtml += \`<text x="\${xCenter}" y="\${yHigh + 8}" fill="\${arrowColor}" text-anchor="middle" class="chart-text arrow-label">↑</text>\`;
         if (c.l === minPrice) svgHtml += \`<text x="\${xCenter}" y="\${yLow - 2}" fill="\${arrowColor}" text-anchor="middle" class="chart-text arrow-label">↓</text>\`;
     });
@@ -609,7 +678,7 @@ async function update() {
         }
         if(!mainPrice) mainPrice = 0;
 
-        let activeFair = (data.fairPrices && data.fairPrices[activeSource]) ? data.fairPrices[activeSource] : data.average;
+        let activeFair = (data.fairPrices && data.fairPrices[activeSource]) ? data.fairPrices[activeSource] : 0;
         
         let chartGap = null;
         if (mainPrice > 0 && activeFair > 0) {
@@ -740,4 +809,4 @@ if (urlParams.get('symbol')) start();
 });
 
 app.listen(CONFIG.PORT, () => console.log(`🚀 Server running on port ${CONFIG.PORT}`));
-                                                       
+                                
