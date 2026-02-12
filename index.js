@@ -2,7 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
 const WebSocket = require('ws');
-const mongoose = require('mongoose'); // Подключаем библиотеку для БД
+const mongoose = require('mongoose');
 
 /**
  * КОНФИГУРАЦИЯ
@@ -10,14 +10,15 @@ const mongoose = require('mongoose'); // Подключаем библиотек
 const CONFIG = {
     PORT: process.env.PORT || 3000,
     SECRET_TOKEN: process.env.SECRET_TOKEN || '',
-    // Вставь сюда свою строку подключения (замени <password> на пароль)
-    MONGO_URI: process.env.MONGO_URI || 'mongodb+srv://admin:<password>@cluster0.....mongodb.net/?retryWrites=true&w=majority', 
+    MONGO_URI: process.env.MONGO_URI || '', 
     MEXC: {
         KEY: process.env.MEXC_API_KEY || '',
         SECRET: process.env.MEXC_API_SECRET || '',
         BASE_URL: 'https://api.mexc.com',
         FUTURES_URL: 'https://contract.mexc.com'
-    }
+    },
+    // Интервал бэкапа в минутах (можно поставить 60, но 30 безопаснее)
+    BACKUP_INTERVAL_MIN: 60 
 };
 
 const EXCHANGES_ORDER = ["Binance", "Bybit", "Gate", "Bitget", "BingX", "OKX", "Kucoin"];
@@ -25,58 +26,48 @@ const ALL_SOURCES = ["MEXC", ...EXCHANGES_ORDER];
 const TIMEFRAMES = ['1m', '15m', '1h'];
 
 /**
- * --- MONGODB SETUP ---
+ * --- MONGODB (BACKUP SYSTEM) ---
  */
-// Подключение
-mongoose.connect(CONFIG.MONGO_URI)
-    .then(() => console.log('✅ MongoDB Connected'))
-    .catch(err => console.error('❌ MongoDB Connection Error:', err));
+if (CONFIG.MONGO_URI) {
+    mongoose.connect(CONFIG.MONGO_URI)
+        .then(() => console.log('✅ MongoDB Connected'))
+        .catch(err => console.error('❌ MongoDB Error:', err));
+}
 
-// Схема свечи
-const CandleSchema = new mongoose.Schema({
-    symbol: { type: String, required: true, index: true },
-    exchange: { type: String, required: true, index: true },
-    timeframe: { type: String, required: true },
-    o: Number, h: Number, l: Number, c: Number,
-    time: { type: Date, default: Date.now, index: true } // Время закрытия свечи
+// Схема для хранения "слепка" истории
+// _id будет составным: "SYMBOL_EXCHANGE" (например, "BTC_Binance")
+const BackupSchema = new mongoose.Schema({
+    _id: String, 
+    data: Object, // Здесь лежит весь объект с таймфреймами: { '1m': [...], '1h': [...] }
+    updatedAt: { type: Date, default: Date.now }
 });
 
-// Авто-удаление старых записей через 3 дня (259200 секунд), чтобы не забить Free Tier
-CandleSchema.index({ time: 1 }, { expireAfterSeconds: 259200 });
-
-const CandleModel = mongoose.model('Candle', CandleSchema);
+const BackupModel = mongoose.model('Backup', BackupSchema);
 
 /**
- * GLOBAL DATA CACHE
+ * GLOBAL DATA
  */
 const GLOBAL_PRICES = {}; 
 const GLOBAL_FAIR = {};   
 let MEXC_CONFIG_CACHE = null;
 
-// Хранилище свечей (В оперативной памяти)
+// Главное хранилище (в RAM)
 const HISTORY_OHLC = {}; 
 const CURRENT_CANDLES = {};
 
-// --- ЕДИНАЯ ФУНКЦИЯ НОРМАЛИЗАЦИИ ---
+// --- УТИЛИТЫ ---
 const normalizeSymbol = (s) => {
     if (!s) return null;
-    return s.toUpperCase()
-        .replace(/[-_]/g, '')     
-        .replace('USDT', '')      
-        .replace('SWAP', '')      
-        .replace('M', '');        
+    return s.toUpperCase().replace(/[-_]/g, '').replace('USDT', '').replace('SWAP', '').replace('M', '');        
 };
 
-// --- ФУНКЦИЯ ОБНОВЛЕНИЯ ДАННЫХ ---
 const updateData = (rawSymbol, exchange, price, fairPrice = null) => {
     const s = normalizeSymbol(rawSymbol);
     if (!s) return;
-
     if (price && parseFloat(price) > 0) {
         if (!GLOBAL_PRICES[s]) GLOBAL_PRICES[s] = {};
         GLOBAL_PRICES[s][exchange] = parseFloat(price);
     }
-
     if (fairPrice && parseFloat(fairPrice) > 0) {
         if (!GLOBAL_FAIR[s]) GLOBAL_FAIR[s] = {};
         GLOBAL_FAIR[s][exchange] = parseFloat(fairPrice);
@@ -87,33 +78,88 @@ const safeJson = (data) => {
     try { return JSON.parse(data); } catch (e) { return null; }
 };
 
-// --- ЗАГРУЗКА ИСТОРИИ ИЗ БД ПРИ СТАРТЕ ---
-async function loadHistoryFromDB() {
-    console.log('🔄 Loading history from DB...');
+/**
+ * --- ЛОГИКА БЭКАПА (Backup System) ---
+ */
+
+// 1. ВОССТАНОВЛЕНИЕ ПРИ СТАРТЕ
+async function restoreHistory() {
+    if (!CONFIG.MONGO_URI) return;
+    console.log('🔄 Restoring history from DB...');
+    const startTime = Date.now();
+    
     try {
-        // Берем последние 5000 записей (этого хватит восстановить графики для активных пар)
-        const docs = await CandleModel.find().sort({ time: -1 }).limit(5000);
-        
-        // Разворачиваем, чтобы добавлять в хронологическом порядке
-        docs.reverse().forEach(doc => {
-            const { symbol, exchange, timeframe } = doc;
-            
-            if (!HISTORY_OHLC[symbol]) HISTORY_OHLC[symbol] = {};
-            if (!HISTORY_OHLC[symbol][exchange]) HISTORY_OHLC[symbol][exchange] = {};
-            if (!HISTORY_OHLC[symbol][exchange][timeframe]) HISTORY_OHLC[symbol][exchange][timeframe] = [];
-            
-            const arr = HISTORY_OHLC[symbol][exchange][timeframe];
-            arr.push({ o: doc.o, h: doc.h, l: doc.l, c: doc.c });
-            
-            if (arr.length > 25) arr.shift();
-        });
-        console.log(`✅ History loaded: ${docs.length} candles restored.`);
+        // Используем курсор для экономии памяти при загрузке
+        const cursor = BackupModel.find().cursor();
+        let count = 0;
+
+        for (let doc = await cursor.next(); doc != null; doc = await cursor.next()) {
+            const [symbol, exchange] = doc._id.split('_');
+            if (symbol && exchange && doc.data) {
+                if (!HISTORY_OHLC[symbol]) HISTORY_OHLC[symbol] = {};
+                HISTORY_OHLC[symbol][exchange] = doc.data;
+                count++;
+            }
+        }
+        console.log(`✅ History restored in ${((Date.now() - startTime)/1000).toFixed(2)}s. Loaded ${count} pairs.`);
     } catch (e) {
-        console.error('⚠️ Failed to load history:', e);
+        console.error('❌ Restore failed:', e);
     }
 }
 
-// --- МОДУЛЬ ИСТОРИИ (OHLC + SAVE TO DB) ---
+// 2. СОХРАНЕНИЕ (БЭКАП)
+async function performBackup() {
+    if (!CONFIG.MONGO_URI) return;
+    console.log('💾 Starting scheduled backup...');
+    
+    // Собираем список всех ключей для сохранения
+    const tasks = [];
+    Object.keys(HISTORY_OHLC).forEach(symbol => {
+        Object.keys(HISTORY_OHLC[symbol]).forEach(exchange => {
+            const candles = HISTORY_OHLC[symbol][exchange];
+            // Пропускаем пустые
+            if (Object.keys(candles).length === 0) return;
+            
+            tasks.push({
+                symbol: symbol,
+                exchange: exchange,
+                data: candles
+            });
+        });
+    });
+
+    if (tasks.length === 0) return console.log('⚠️ Nothing to backup.');
+
+    // Разбиваем на пачки по 100 штук, чтобы не забить CPU и канал
+    const CHUNK_SIZE = 100; 
+    let savedCount = 0;
+
+    for (let i = 0; i < tasks.length; i += CHUNK_SIZE) {
+        const chunk = tasks.slice(i, i + CHUNK_SIZE);
+        
+        const bulkOps = chunk.map(item => ({
+            updateOne: {
+                filter: { _id: `${item.symbol}_${item.exchange}` },
+                update: { $set: { data: item.data, updatedAt: new Date() } },
+                upsert: true
+            }
+        }));
+
+        try {
+            await BackupModel.bulkWrite(bulkOps);
+            savedCount += chunk.length;
+        } catch (e) {
+            console.error('Backup chunk error:', e.message);
+        }
+
+        // Небольшая пауза, чтобы разгрузить Event Loop (дать серверу ответить на запросы)
+        await new Promise(resolve => setTimeout(resolve, 50));
+    }
+
+    console.log(`✅ Backup complete. Saved ${savedCount} pairs.`);
+}
+
+// --- CORE LOOP (Только RAM, быстро) ---
 setInterval(() => {
     const now = new Date();
     const timeMs = now.getTime();
@@ -126,7 +172,6 @@ setInterval(() => {
 
     Object.keys(GLOBAL_PRICES).forEach(symbol => {
         const prices = GLOBAL_PRICES[symbol];
-        
         ALL_SOURCES.forEach(source => {
             const price = prices[source];
             if (!price) return; 
@@ -142,32 +187,22 @@ setInterval(() => {
                 const currentPeriod = periods[tf];
                 let currentCandle = CURRENT_CANDLES[symbol][source][tf];
 
-                // Если период сменился
+                // Смена периода
                 if (!currentCandle || currentCandle.lastPeriod !== currentPeriod) {
-                    // 1. Сохраняем закрытую свечу в память и в БД
+                    // Сохраняем в RAM
                     if (currentCandle) {
-                        // RAM
                         if (!HISTORY_OHLC[symbol][source][tf]) HISTORY_OHLC[symbol][source][tf] = [];
                         HISTORY_OHLC[symbol][source][tf].push({ ...currentCandle });
                         if (HISTORY_OHLC[symbol][source][tf].length > 25) HISTORY_OHLC[symbol][source][tf].shift();
-
-                        // DB (Fire and forget - не ждем)
-                        CandleModel.create({
-                            symbol: symbol,
-                            exchange: source,
-                            timeframe: tf,
-                            o: currentCandle.o, h: currentCandle.h, l: currentCandle.l, c: currentCandle.c,
-                            time: new Date()
-                        }).catch(e => console.error('DB Save Error', e.message));
+                        // В БД НЕ ПИШЕМ! (Ждем часового бэкапа)
                     }
-
-                    // 2. Создаем новую свечу
+                    // Новая свеча
                     CURRENT_CANDLES[symbol][source][tf] = {
                         o: price, h: price, l: price, c: price,
                         lastPeriod: currentPeriod
                     };
                 } else {
-                    // Обновляем текущую
+                    // Обновление
                     if (price > currentCandle.h) currentCandle.h = price;
                     if (price < currentCandle.l) currentCandle.l = price;
                     currentCandle.c = price; 
@@ -178,7 +213,7 @@ setInterval(() => {
 }, 1000);
 
 /**
- * --- MONITORS (СТАБИЛЬНЫЕ) ---
+ * --- MONITORS ---
  */
 const initMexcGlobal = () => {
     let ws = null;
@@ -186,7 +221,7 @@ const initMexcGlobal = () => {
         try {
             ws = new WebSocket('wss://contract.mexc.com/edge');
             ws.on('open', () => {
-                console.log('[MEXC] WS Connected');
+                console.log('[MEXC] Connected');
                 ws.send(JSON.stringify({ "method": "sub.tickers", "param": {} }));
             });
             ws.on('message', (data) => {
@@ -210,7 +245,7 @@ const initBinanceGlobal = () => {
     const connect = () => {
         try {
             ws = new WebSocket('wss://fstream.binance.com/ws/!ticker@arr'); 
-            ws.on('open', () => console.log('[Binance] WS Connected'));
+            ws.on('open', () => console.log('[Binance] Connected'));
             ws.on('message', (data) => {
                 const arr = safeJson(data);
                 if (Array.isArray(arr)) arr.forEach(i => updateData(i.s, 'Binance', i.c));
@@ -236,9 +271,7 @@ const initBybitGlobal = () => {
             if (!fetch) return;
             const res = await fetch('https://api.bybit.com/v5/market/tickers?category=linear');
             const d = await res.json();
-            if (d.result && d.result.list) {
-                d.result.list.forEach(i => updateData(i.symbol, 'Bybit', i.lastPrice, i.markPrice));
-            }
+            if (d.result && d.result.list) d.result.list.forEach(i => updateData(i.symbol, 'Bybit', i.lastPrice, i.markPrice));
         } catch(e) {}
     }, 1500);
 };
@@ -249,9 +282,7 @@ const initGateGlobal = () => {
             if (!fetch) return;
             const res = await fetch('https://api.gateio.ws/api/v4/futures/usdt/tickers');
             const data = await res.json();
-            if (Array.isArray(data)) {
-                data.forEach(i => updateData(i.contract, 'Gate', i.last, i.mark_price));
-            }
+            if (Array.isArray(data)) data.forEach(i => updateData(i.contract, 'Gate', i.last, i.mark_price));
         } catch(e) {}
     }, 2000);
 };
@@ -262,9 +293,7 @@ const initBitgetGlobal = () => {
             if (!fetch) return;
             const res = await fetch('https://api.bitget.com/api/v2/mix/market/tickers?productType=USDT-FUTURES');
             const d = await res.json();
-            if (d.data) {
-                d.data.forEach(i => updateData(i.symbol, 'Bitget', i.lastPr, i.markPrice));
-            }
+            if (d.data) d.data.forEach(i => updateData(i.symbol, 'Bitget', i.lastPr, i.markPrice));
         } catch(e) {}
     }, 2000);
 };
@@ -289,26 +318,20 @@ const initOkxGlobal = () => {
 };
 
 const initBingxGlobal = () => {
-    // Last Price
     setInterval(async () => {
         try {
             if (!fetch) return;
             const res = await fetch('https://open-api.bingx.com/openApi/swap/v2/quote/ticker');
             const d = await res.json();
-            if (d.data) {
-                d.data.forEach(i => updateData(i.symbol, 'BingX', i.lastPrice));
-            }
+            if (d.data) d.data.forEach(i => updateData(i.symbol, 'BingX', i.lastPrice));
         } catch(e) {}
     }, 2000);
-    // Mark Price (Через premiumIndex)
     setInterval(async () => {
         try {
             if (!fetch) return;
             const res = await fetch('https://open-api.bingx.com/openApi/swap/v2/quote/premiumIndex');
             const d = await res.json();
-            if (d.data) {
-                d.data.forEach(i => updateData(i.symbol, 'BingX', null, i.markPrice));
-            }
+            if (d.data) d.data.forEach(i => updateData(i.symbol, 'BingX', null, i.markPrice));
         } catch(e) {}
     }, 4000);
 };
@@ -319,9 +342,7 @@ const initKucoinGlobal = () => {
             if (!fetch) return;
             const res = await fetch('https://api-futures.kucoin.com/api/v1/allTickers');
             const d = await res.json();
-            if (d.data && Array.isArray(d.data)) {
-                d.data.forEach(i => updateData(i.symbol, 'Kucoin', i.price));
-            }
+            if (d.data && Array.isArray(d.data)) d.data.forEach(i => updateData(i.symbol, 'Kucoin', i.price));
         } catch(e) {}
     }, 2000);
     setInterval(async () => {
@@ -348,8 +369,10 @@ let fetch;
 (async () => {
     fetch = (await import('node-fetch')).default;
     updateMexcConfigCache();
-    // Запускаем восстановление истории
-    loadHistoryFromDB();
+    // 1. Сначала восстанавливаем историю
+    await restoreHistory();
+    // 2. Запускаем планировщик бэкапов (раз в час)
+    setInterval(performBackup, CONFIG.BACKUP_INTERVAL_MIN * 60 * 1000);
 })();
 
 const authMiddleware = (req, res, next) => {
@@ -629,7 +652,7 @@ function renderChart(candles, gap, sourceName) {
         const rectX = xCenter - (bodyWidth / 2);
         svgHtml += \`<rect x="\${rectX}" y="\${rectY}" width="\${bodyWidth}" height="\${rectH}" class="candle-body \${colorClass}" />\`;
 
-        // STRELKI
+        // СТРЕЛКИ ВНУТРИ
         if (c.h === maxPrice) svgHtml += \`<text x="\${xCenter}" y="\${yHigh + 8}" fill="\${arrowColor}" text-anchor="middle" class="chart-text arrow-label">↑</text>\`;
         if (c.l === minPrice) svgHtml += \`<text x="\${xCenter}" y="\${yLow - 2}" fill="\${arrowColor}" text-anchor="middle" class="chart-text arrow-label">↓</text>\`;
     });
@@ -809,4 +832,4 @@ if (urlParams.get('symbol')) start();
 });
 
 app.listen(CONFIG.PORT, () => console.log(`🚀 Server running on port ${CONFIG.PORT}`));
-                                
+        
