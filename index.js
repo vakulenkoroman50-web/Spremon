@@ -372,7 +372,7 @@ let fetch;
     // 1. Сначала восстанавливаем историю
     await restoreHistory();
     // 2. Запускаем планировщик бэкапов (раз в час)
-    setInterval(performBackup, CONFIG.BACKUP_INTERVAL_MIN * 60 * 1000);
+    setInterval(performBackup, CONFIG.BACKUP_INTERVAL_MIN * 30 * 1000);
 })();
 
 const authMiddleware = (req, res, next) => {
