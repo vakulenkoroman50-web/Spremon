@@ -11,13 +11,20 @@ const CONFIG = {
     PORT: process.env.PORT || 3000,
     SECRET_TOKEN: process.env.SECRET_TOKEN || '',
     MONGO_URI: process.env.MONGO_URI || '', 
+    // --- CEX API ---
     MEXC: {
         KEY: process.env.MEXC_API_KEY || '',
         SECRET: process.env.MEXC_API_SECRET || '',
         BASE_URL: 'https://api.mexc.com',
         FUTURES_URL: 'https://contract.mexc.com'
     },
-    // Интервал бэкапа в минутах (можно поставить 60, но 30 безопаснее)
+    // --- OKX WEB3 API (DEX) ---
+    OKX: {
+        KEY: process.env.OKX_API_KEY || '',           // ВСТАВЬ СЮДА
+        SECRET: process.env.OKX_API_SECRET || '',     // ВСТАВЬ СЮДА
+        PASSPHRASE: process.env.OKX_PASSPHRASE || '', // ВСТАВЬ СЮДА
+        BASE_URL: 'https://web3.okx.com'
+    },
     BACKUP_INTERVAL_MIN: 60 
 };
 
@@ -25,8 +32,24 @@ const EXCHANGES_ORDER = ["Binance", "Bybit", "Gate", "Bitget", "BingX", "OKX", "
 const ALL_SOURCES = ["MEXC", ...EXCHANGES_ORDER];
 const TIMEFRAMES = ['1m', '15m', '1h'];
 
+// Маппинг сетей: DexScreener ID -> OKX Chain Index
+const CHAIN_MAP = {
+    "ethereum": "1",
+    "bsc": "56",
+    "polygon": "137",
+    "arbitrum": "42161",
+    "optimism": "10",
+    "avalanche": "43114",
+    "tron": "195",
+    "solana": "501",
+    "base": "8453",
+    "fantom": "250",
+    "cronos": "25",
+    "linea": "59144"
+};
+
 /**
- * --- MONGODB (BACKUP SYSTEM) ---
+ * --- MONGODB ---
  */
 if (CONFIG.MONGO_URI) {
     mongoose.connect(CONFIG.MONGO_URI)
@@ -34,14 +57,21 @@ if (CONFIG.MONGO_URI) {
         .catch(err => console.error('❌ MongoDB Error:', err));
 }
 
-// Схема для хранения "слепка" истории
-// _id будет составным: "SYMBOL_EXCHANGE" (например, "BTC_Binance")
+const CandleSchema = new mongoose.Schema({
+    symbol: { type: String, required: true, index: true },
+    exchange: { type: String, required: true, index: true },
+    timeframe: { type: String, required: true },
+    o: Number, h: Number, l: Number, c: Number,
+    time: { type: Date, default: Date.now, index: true }
+});
+CandleSchema.index({ time: 1 }, { expireAfterSeconds: 259200 });
+const CandleModel = mongoose.model('Candle', CandleSchema);
+
 const BackupSchema = new mongoose.Schema({
     _id: String, 
-    data: Object, // Здесь лежит весь объект с таймфреймами: { '1m': [...], '1h': [...] }
+    data: Object, 
     updatedAt: { type: Date, default: Date.now }
 });
-
 const BackupModel = mongoose.model('Backup', BackupSchema);
 
 /**
@@ -51,7 +81,17 @@ const GLOBAL_PRICES = {};
 const GLOBAL_FAIR = {};   
 let MEXC_CONFIG_CACHE = null;
 
-// Главное хранилище (в RAM)
+// Текущая цель для мониторинга DEX (только одна активная пара)
+let DEX_TARGET = {
+    symbol: null,
+    chainIndex: null, // ID для OKX
+    contract: null,   // Адрес токена
+    pairAddress: null, // Адрес пары (для DexScreener fallback)
+    chainIdStr: null, // Строковый ID (для DexScreener)
+    price: 0,
+    source: 'OFF' // 'OKX' или 'DS'
+};
+
 const HISTORY_OHLC = {}; 
 const CURRENT_CANDLES = {};
 
@@ -79,64 +119,118 @@ const safeJson = (data) => {
 };
 
 /**
- * --- ЛОГИКА БЭКАПА (Backup System) ---
+ * --- OKX WEB3 API LOGIC ---
  */
+const getOkxHeaders = (method, path, body = '') => {
+    const timestamp = new Date().toISOString().replace(/\.\d+Z$/, 'Z'); // Format: 2023-01-01T12:00:00Z
+    const msg = timestamp + method + path + body;
+    const sign = crypto.createHmac('sha256', CONFIG.OKX.SECRET).update(msg).digest('base64');
+    
+    return {
+        "Content-Type": "application/json",
+        "OK-ACCESS-KEY": CONFIG.OKX.KEY,
+        "OK-ACCESS-PASSPHRASE": CONFIG.OKX.PASSPHRASE,
+        "OK-ACCESS-TIMESTAMP": timestamp,
+        "OK-ACCESS-SIGN": sign
+    };
+};
 
-// 1. ВОССТАНОВЛЕНИЕ ПРИ СТАРТЕ
+const fetchOkxPrice = async (chainIndex, contract) => {
+    if (!CONFIG.OKX.KEY) return null;
+    try {
+        const path = "/api/v6/dex/market/price";
+        const bodyObj = [{
+            "chainIndex": String(chainIndex),
+            "tokenContractAddress": contract
+        }];
+        const body = JSON.stringify(bodyObj); // Важно: без пробелов, если API строг, но стандартный stringify ок
+        // В питоне separators=(",", ":") убирает пробелы. Node.js JSON.stringify делает так же по умолчанию без аргументов форматирования.
+
+        const res = await fetch(CONFIG.OKX.BASE_URL + path, {
+            method: 'POST',
+            headers: getOkxHeaders('POST', path, body),
+            body: body,
+            timeout: 2000
+        });
+        
+        const json = await res.json();
+        if (json.code === "0" && json.data && json.data[0]) {
+            return parseFloat(json.data[0].price);
+        }
+    } catch (e) { 
+        // console.error('OKX Dex Error:', e.message); 
+    }
+    return null;
+};
+
+// --- DEX MONITOR LOOP ---
+// Запускается часто (раз в 1 сек), чтобы DEX цена была "живой"
+setInterval(async () => {
+    if (!DEX_TARGET.contract) return;
+
+    let price = null;
+
+    // 1. Пытаемся через OKX Web3 (Если есть Chain Index)
+    if (DEX_TARGET.chainIndex) {
+        price = await fetchOkxPrice(DEX_TARGET.chainIndex, DEX_TARGET.contract);
+        if (price) {
+            DEX_TARGET.price = price;
+            DEX_TARGET.source = 'OKX';
+            return; // Успех, выходим
+        }
+    }
+
+    // 2. Fallback: DexScreener (Если OKX не дал цену или нет ключей)
+    // Делаем запрос реже, чтобы не банили (раз в 3 секунды)
+    const now = Date.now();
+    if (!DEX_TARGET.lastDsRequest || (now - DEX_TARGET.lastDsRequest > 3000)) {
+        try {
+            DEX_TARGET.lastDsRequest = now;
+            const url = `https://api.dexscreener.com/latest/dex/pairs/${DEX_TARGET.chainIdStr}/${DEX_TARGET.pairAddress}`;
+            const res = await fetch(url);
+            const data = await res.json();
+            if (data.pair) {
+                DEX_TARGET.price = parseFloat(data.pair.priceUsd);
+                DEX_TARGET.source = 'DS';
+            }
+        } catch (e) {}
+    }
+}, 1000); // 1 секунда интервал
+
+
+/**
+ * --- BACKUP SYSTEM ---
+ */
 async function restoreHistory() {
     if (!CONFIG.MONGO_URI) return;
-    console.log('🔄 Restoring history from DB...');
-    const startTime = Date.now();
-    
+    console.log('🔄 Restoring history...');
     try {
-        // Используем курсор для экономии памяти при загрузке
         const cursor = BackupModel.find().cursor();
-        let count = 0;
-
         for (let doc = await cursor.next(); doc != null; doc = await cursor.next()) {
             const [symbol, exchange] = doc._id.split('_');
             if (symbol && exchange && doc.data) {
                 if (!HISTORY_OHLC[symbol]) HISTORY_OHLC[symbol] = {};
                 HISTORY_OHLC[symbol][exchange] = doc.data;
-                count++;
             }
         }
-        console.log(`✅ History restored in ${((Date.now() - startTime)/1000).toFixed(2)}s. Loaded ${count} pairs.`);
-    } catch (e) {
-        console.error('❌ Restore failed:', e);
-    }
+        console.log('✅ History restored.');
+    } catch (e) { console.error('❌ Restore failed:', e); }
 }
 
-// 2. СОХРАНЕНИЕ (БЭКАП)
 async function performBackup() {
     if (!CONFIG.MONGO_URI) return;
-    console.log('💾 Starting scheduled backup...');
-    
-    // Собираем список всех ключей для сохранения
+    console.log('💾 Backup started...');
     const tasks = [];
     Object.keys(HISTORY_OHLC).forEach(symbol => {
         Object.keys(HISTORY_OHLC[symbol]).forEach(exchange => {
             const candles = HISTORY_OHLC[symbol][exchange];
-            // Пропускаем пустые
             if (Object.keys(candles).length === 0) return;
-            
-            tasks.push({
-                symbol: symbol,
-                exchange: exchange,
-                data: candles
-            });
+            tasks.push({ symbol, exchange, data: candles });
         });
     });
-
-    if (tasks.length === 0) return console.log('⚠️ Nothing to backup.');
-
-    // Разбиваем на пачки по 100 штук, чтобы не забить CPU и канал
     const CHUNK_SIZE = 100; 
-    let savedCount = 0;
-
     for (let i = 0; i < tasks.length; i += CHUNK_SIZE) {
         const chunk = tasks.slice(i, i + CHUNK_SIZE);
-        
         const bulkOps = chunk.map(item => ({
             updateOne: {
                 filter: { _id: `${item.symbol}_${item.exchange}` },
@@ -144,26 +238,18 @@ async function performBackup() {
                 upsert: true
             }
         }));
-
-        try {
-            await BackupModel.bulkWrite(bulkOps);
-            savedCount += chunk.length;
-        } catch (e) {
-            console.error('Backup chunk error:', e.message);
-        }
-
-        // Небольшая пауза, чтобы разгрузить Event Loop (дать серверу ответить на запросы)
-        await new Promise(resolve => setTimeout(resolve, 50));
+        try { await BackupModel.bulkWrite(bulkOps); } catch(e) {}
+        await new Promise(r => setTimeout(r, 50));
     }
-
-    console.log(`✅ Backup complete. Saved ${savedCount} pairs.`);
+    console.log('✅ Backup done.');
 }
 
-// --- CORE LOOP (Только RAM, быстро) ---
+/**
+ * --- CORE LOOP ---
+ */
 setInterval(() => {
     const now = new Date();
     const timeMs = now.getTime();
-
     const periods = {
         '1m': Math.floor(timeMs / 60000),
         '15m': Math.floor(timeMs / (15 * 60000)),
@@ -176,7 +262,6 @@ setInterval(() => {
             const price = prices[source];
             if (!price) return; 
 
-            // Инициализация
             if (!CURRENT_CANDLES[symbol]) CURRENT_CANDLES[symbol] = {};
             if (!CURRENT_CANDLES[symbol][source]) CURRENT_CANDLES[symbol][source] = {};
             
@@ -187,22 +272,17 @@ setInterval(() => {
                 const currentPeriod = periods[tf];
                 let currentCandle = CURRENT_CANDLES[symbol][source][tf];
 
-                // Смена периода
                 if (!currentCandle || currentCandle.lastPeriod !== currentPeriod) {
-                    // Сохраняем в RAM
                     if (currentCandle) {
                         if (!HISTORY_OHLC[symbol][source][tf]) HISTORY_OHLC[symbol][source][tf] = [];
                         HISTORY_OHLC[symbol][source][tf].push({ ...currentCandle });
                         if (HISTORY_OHLC[symbol][source][tf].length > 25) HISTORY_OHLC[symbol][source][tf].shift();
-                        // В БД НЕ ПИШЕМ! (Ждем часового бэкапа)
                     }
-                    // Новая свеча
                     CURRENT_CANDLES[symbol][source][tf] = {
                         o: price, h: price, l: price, c: price,
                         lastPeriod: currentPeriod
                     };
                 } else {
-                    // Обновление
                     if (price > currentCandle.h) currentCandle.h = price;
                     if (price < currentCandle.l) currentCandle.l = price;
                     currentCandle.c = price; 
@@ -221,7 +301,7 @@ const initMexcGlobal = () => {
         try {
             ws = new WebSocket('wss://contract.mexc.com/edge');
             ws.on('open', () => {
-                console.log('[MEXC] Connected');
+                console.log('[MEXC] WS Connected');
                 ws.send(JSON.stringify({ "method": "sub.tickers", "param": {} }));
             });
             ws.on('message', (data) => {
@@ -245,7 +325,7 @@ const initBinanceGlobal = () => {
     const connect = () => {
         try {
             ws = new WebSocket('wss://fstream.binance.com/ws/!ticker@arr'); 
-            ws.on('open', () => console.log('[Binance] Connected'));
+            ws.on('open', () => console.log('[Binance] WS Connected'));
             ws.on('message', (data) => {
                 const arr = safeJson(data);
                 if (Array.isArray(arr)) arr.forEach(i => updateData(i.s, 'Binance', i.c));
@@ -369,10 +449,8 @@ let fetch;
 (async () => {
     fetch = (await import('node-fetch')).default;
     updateMexcConfigCache();
-    // 1. Сначала восстанавливаем историю
     await restoreHistory();
-    // 2. Запускаем планировщик бэкапов (раз в час)
-    setInterval(performBackup, CONFIG.BACKUP_INTERVAL_MIN * 30 * 1000);
+    setInterval(performBackup, CONFIG.BACKUP_INTERVAL_MIN * 60 * 1000);
 })();
 
 const authMiddleware = (req, res, next) => {
@@ -412,6 +490,8 @@ app.get('/api/resolve', authMiddleware, async (req, res) => {
     const depositOpen = tokenData.networkList.some(net => net.depositEnable);
     let bestPair = null;
     const contracts = tokenData.networkList.filter(n => n.contract).map(n => n.contract);
+    
+    // Ищем на DexScreener, чтобы получить Адрес Токена и Сеть
     await Promise.all(contracts.map(async (contract) => {
         try {
             const dsRes = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${contract}`);
@@ -425,6 +505,18 @@ app.get('/api/resolve', authMiddleware, async (req, res) => {
             }
         } catch (e) {}
     }));
+
+    if (bestPair) {
+        // ОБНОВЛЯЕМ ЦЕЛЬ ДЛЯ DEX МОНИТОРА
+        DEX_TARGET.symbol = symbol;
+        DEX_TARGET.contract = bestPair.baseToken.address; // Адрес токена для OKX
+        DEX_TARGET.pairAddress = bestPair.pairAddress;    // Адрес пары для Fallback DS
+        DEX_TARGET.chainIdStr = bestPair.chainId;         // 'solana', 'ethereum'
+        DEX_TARGET.chainIndex = CHAIN_MAP[bestPair.chainId] || null; // '501', '1'
+        DEX_TARGET.price = parseFloat(bestPair.priceUsd); // Начальная цена
+        DEX_TARGET.source = 'DS (Init)';
+    }
+
     res.json({ ok: true, chain: bestPair?.chainId, addr: bestPair?.pairAddress, url: bestPair?.url, depositOpen });
 });
 
@@ -438,16 +530,11 @@ app.get('/api/all', authMiddleware, async (req, res) => {
 
     const prices = {};
     const fairPrices = {};
-    let sum = 0; let count = 0;
-
+    
     ALL_SOURCES.forEach(source => {
-        let p = marketData[source] || 0;
-        prices[source] = p;
+        prices[source] = marketData[source] || 0;
         fairPrices[source] = fairData[source] || 0;
-        if (p > 0) { sum += p; count++; }
     });
-
-    const globalAverage = count > 0 ? sum / count : 0;
 
     const allCandles = {};
     ALL_SOURCES.forEach(source => {
@@ -465,7 +552,19 @@ app.get('/api/all', authMiddleware, async (req, res) => {
         });
     });
 
-    res.json({ ok: true, mexc: mexcPrice, prices, fairPrices, allCandles, average: globalAverage });
+    // Отдаем текущую DEX цену, которую намайнил фоновый процесс
+    const dexPrice = (DEX_TARGET.symbol === symbol) ? DEX_TARGET.price : 0;
+    const dexSource = (DEX_TARGET.symbol === symbol) ? DEX_TARGET.source : '';
+
+    res.json({ 
+        ok: true, 
+        mexc: mexcPrice, 
+        prices, 
+        fairPrices, 
+        allCandles, 
+        dexPrice, 
+        dexSource 
+    });
 });
 
 app.get('/', (req, res) => {
@@ -652,7 +751,6 @@ function renderChart(candles, gap, sourceName) {
         const rectX = xCenter - (bodyWidth / 2);
         svgHtml += \`<rect x="\${rectX}" y="\${rectY}" width="\${bodyWidth}" height="\${rectH}" class="candle-body \${colorClass}" />\`;
 
-        // СТРЕЛКИ ВНУТРИ
         if (c.h === maxPrice) svgHtml += \`<text x="\${xCenter}" y="\${yHigh + 8}" fill="\${arrowColor}" text-anchor="middle" class="chart-text arrow-label">↑</text>\`;
         if (c.l === minPrice) svgHtml += \`<text x="\${xCenter}" y="\${yLow - 2}" fill="\${arrowColor}" text-anchor="middle" class="chart-text arrow-label">↓</text>\`;
     });
@@ -662,25 +760,9 @@ function renderChart(candles, gap, sourceName) {
 
 async function update() {  
     if (!symbol) return;  
-    let dexPrice = 0;  
-    if (chain && addr) {  
-        try {  
-            const r = await fetch('https://api.dexscreener.com/latest/dex/pairs/' + chain + '/' + addr);  
-            const d = await r.json();  
-            if (d.pair) {  
-                dexPrice = parseFloat(d.pair.priceUsd);  
-                let pStr = d.pair.priceUsd;
-                let sStr = symbol;
-                const maxLen = 18; 
-                if ((sStr.length + pStr.length + 2) > maxLen) {
-                    let spaceForName = maxLen - pStr.length - 2; if(spaceForName < 3) spaceForName = 3;
-                    sStr = sStr.substring(0, spaceForName);
-                }
-                document.title = sStr + ': ' + pStr;
-                dexLink.value = d.pair.url;  
-            }  
-        } catch(e) {}  
-    }  
+    
+    // ПРИМЕЧАНИЕ: Раньше мы фетчили DexScreener тут. Теперь цена приходит из /api/all
+    
     blink = !blink;  
     try {  
         const res = await fetch('/api/all?symbol=' + encodeURIComponent(symbol) + '&token=' + token);  
@@ -689,6 +771,7 @@ async function update() {
         if(!data.ok) return;  
         
         let mainPrice = data.prices[activeSource];
+        let dexPrice = data.dexPrice || 0; // Получаем DEX цену с сервера
         
         if (!manualSourceSelection) {
             if (!mainPrice || mainPrice == 0) {
@@ -718,6 +801,7 @@ async function update() {
         }
         
         if (!dexPrice) document.title = symbol + ': ' + formatP(mainPrice);
+        else document.title = symbol + ': ' + formatP(dexPrice);
 
         let lines = [];
         
@@ -730,7 +814,10 @@ async function update() {
             let diff = ((dexPrice - mainPrice) / mainPrice * 100).toFixed(2);
             dexDiffHtml = ' (' + (diff > 0 ? "+" : "") + diff + '%)';
         }
-        lines.push(dotHtml + symbol + ' DEX: ' + formatP(dexPrice) + '<span class="dex-row">' + dexDiffHtml + '</span>');
+        
+        // Индикатор источника DEX: OKX (молния) или DS (обычный)
+        let dexSourceInd = (data.dexSource === 'OKX') ? '⚡' : '';
+        lines.push(dotHtml + symbol + ' DEX ' + dexSourceInd + ': ' + formatP(dexPrice) + '<span class="dex-row">' + dexDiffHtml + '</span>');
 
         let bestEx = null, maxSp = 0;
         allSources.forEach(ex => {
@@ -748,7 +835,6 @@ async function update() {
                 let cls = (ex === bestEx) ? 'class="best"' : ''; 
                 
                 let mark = isActive ? '◆' : '◇';
-                
                 let rowBg = isActive ? 'background-color:#333;' : '';
                 
                 let namePadded = ex.padEnd(8, ' '); 
@@ -803,6 +889,8 @@ async function start() {
     if (val.includes("dexscreener.com")) {  
         try {  
             const parts = val.split('/'); chain = parts[parts.length - 2]; addr = parts[parts.length - 1].split('?')[0];  
+            // Мы больше не фетчим DEX тут, это делает сервер.
+            // Но мы можем получить инфу о токене, чтобы обновить UI поля.
             fetch('https://api.dexscreener.com/latest/dex/pairs/' + chain + '/' + addr).then(r => r.json()).then(dsData => {
                      if (dsData.pair) {  
                         symbol = dsData.pair.baseToken.symbol.toUpperCase(); input.value = symbol; dexLink.value = dsData.pair.url;  
