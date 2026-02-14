@@ -17,6 +17,7 @@ const CONFIG = {
         BASE_URL: 'https://api.mexc.com',
         FUTURES_URL: 'https://contract.mexc.com'
     },
+    // ДАННЫЕ ИЗ ТВОЕГО PYTHON СКРИПТА
     OKX: {
         KEY: process.env.OKX_API_KEY || '',
         SECRET: process.env.OKX_API_SECRET || '',
@@ -24,20 +25,51 @@ const CONFIG = {
         BASE_URL: 'https://web3.okx.com'
     },
     BACKUP_INTERVAL_MIN: 60,
-    // Настройка скорости опроса DEX (мс)
-    // Ставим 1200мс, чтобы гарантированно не пробить лимит 1 RPS
-    DEX_POLL_INTERVAL: 1200 
+    DEX_POLL_INTERVAL: 1200 // 1.2 сек между запросами (чтобы не пробить лимит 1 RPS)
 };
 
 const EXCHANGES_ORDER = ["Binance", "Bybit", "Gate", "Bitget", "BingX", "OKX", "Kucoin"];
 const ALL_SOURCES = ["MEXC", ...EXCHANGES_ORDER];
 const TIMEFRAMES = ['1m', '15m', '1h'];
 
-const CHAIN_MAP = {
-    "ethereum": "1", "bsc": "56", "polygon": "137", "arbitrum": "42161",
-    "optimism": "10", "avalanche": "43114", "tron": "195", "solana": "501",
-    "base": "8453", "fantom": "250", "cronos": "25", "linea": "59144",
-    "sui": "10000"
+// Маппинг сетей (MEXC Name -> OKX ID + Slug)
+// Важно: названия сетей должны совпадать с тем, что отдает MEXC в /config/getall
+const NETWORK_MAP = {
+    // SOLANA
+    "SOL":          { okxId: "501", dsSlug: "solana" },
+    "Solana":       { okxId: "501", dsSlug: "solana" },
+    
+    // ETHEREUM
+    "ERC20":        { okxId: "1", dsSlug: "ethereum" },
+    "ETH":          { okxId: "1", dsSlug: "ethereum" },
+    
+    // BSC
+    "BEP20(BSC)":   { okxId: "56", dsSlug: "bsc" },
+    "BSC":          { okxId: "56", dsSlug: "bsc" },
+    "BNB Smart Chain(BEP20)": { okxId: "56", dsSlug: "bsc" },
+
+    // ARBITRUM
+    "Arbitrum One": { okxId: "42161", dsSlug: "arbitrum" },
+    "ARB":          { okxId: "42161", dsSlug: "arbitrum" },
+    "Arbitrum":     { okxId: "42161", dsSlug: "arbitrum" },
+    
+    // POLYGON
+    "MATIC":        { okxId: "137", dsSlug: "polygon" },
+    "Polygon":      { okxId: "137", dsSlug: "polygon" },
+    
+    // AVALANCHE
+    "AVAX_C":       { okxId: "43114", dsSlug: "avalanche" },
+    "Avalanche C-Chain": { okxId: "43114", dsSlug: "avalanche" },
+    
+    // OPTIMISM
+    "OP":           { okxId: "10", dsSlug: "optimism" },
+    "Optimism":     { okxId: "10", dsSlug: "optimism" },
+    
+    // BASE
+    "Base":         { okxId: "8453", dsSlug: "base" },
+    
+    // SUI
+    "SUI":          { okxId: "10000", dsSlug: "sui" }
 };
 
 /**
@@ -73,8 +105,6 @@ let MEXC_CONFIG_CACHE = null;
 
 // КАРТОТЕКА DEX
 const DEX_CACHE = {};
-
-// АКТИВНОСТЬ: Храним время последнего доступа к символу
 const ACTIVE_SYMBOLS = {};
 
 const HISTORY_OHLC = {}; 
@@ -104,12 +134,18 @@ const safeJson = (data) => {
 };
 
 /**
- * --- GLOBAL DEX SCHEDULER (ОЧЕРЕДЬ ЗАПРОСОВ) ---
+ * --- OKX WEB3 API LOGIC (STRICT PYTHON CLONE) ---
  */
 const getOkxHeaders = (method, path, body = '') => {
+    // 1. Time: ISO format with milliseconds, exactly like Python
     const timestamp = new Date().toISOString(); 
+    
+    // 2. Sign: timestamp + method + path + body
     const msg = timestamp + method + path + body;
+    
+    // 3. HMAC SHA256 + Base64
     const sign = crypto.createHmac('sha256', CONFIG.OKX.SECRET).update(msg).digest('base64');
+    
     return {
         "Content-Type": "application/json",
         "OK-ACCESS-KEY": CONFIG.OKX.KEY,
@@ -122,111 +158,80 @@ const getOkxHeaders = (method, path, body = '') => {
 const processDexQueue = async () => {
     try {
         const now = Date.now();
-        
-        // 1. Находим всех активных кандидатов (кто был открыт за последние 5 минут)
+        // Берем активные символы
         const candidates = Object.keys(DEX_CACHE).filter(symbol => {
             const lastView = ACTIVE_SYMBOLS[symbol] || 0;
-            return (now - lastView < 300000); // Активен 5 минут
+            return (now - lastView < 300000); 
         });
 
         if (candidates.length === 0) {
-            // Если никого нет, спим и пробуем снова
             setTimeout(processDexQueue, 1000);
             return;
         }
 
-        // 2. Сортируем: кто дольше всех не обновлялся - тот первый
+        // Round Robin: сортируем по времени последнего обновления
         candidates.sort((a, b) => {
             const timeA = DEX_CACHE[a].lastUpdate || 0;
             const timeB = DEX_CACHE[b].lastUpdate || 0;
-            return timeA - timeB; // По возрастанию (самый старый первый)
+            return timeA - timeB; 
         });
 
         const targetSymbol = candidates[0];
         const entry = DEX_CACHE[targetSymbol];
 
-        // 3. Выполняем запрос для победителя
-        if (entry && entry.meta) {
-            // console.log(`[DEX QUEUE] Updating ${targetSymbol}...`);
-            entry.lastUpdate = now; // Обновляем время сразу
+        // ВЫПОЛНЯЕМ ЗАПРОС К OKX
+        if (entry && entry.meta && entry.meta.okxId) {
+            entry.lastUpdate = now;
 
-            let priceFound = null;
-            let sourceFound = 'DEX';
+            try {
+                const path = "/api/v6/dex/market/price";
+                // JSON.stringify без пробелов (аналог separators=(",", ":"))
+                const body = JSON.stringify([{ 
+                    "chainIndex": String(entry.meta.okxId), 
+                    "tokenContractAddress": entry.meta.contract 
+                }]);
+                
+                // console.log(`[OKX REQ] ${targetSymbol} -> Chain: ${entry.meta.okxId}, Contract: ${entry.meta.contract}`);
 
-            // --- OKX Web3 ---
-            if (CONFIG.OKX.KEY && entry.meta.chainIndex && entry.meta.contract) {
-                try {
-                    const path = "/api/v6/dex/market/price";
-                    const body = JSON.stringify([{ 
-                        "chainIndex": String(entry.meta.chainIndex), 
-                        "tokenContractAddress": entry.meta.contract 
-                    }]);
-                    
-                    const res = await fetch(CONFIG.OKX.BASE_URL + path, {
-                        method: 'POST',
-                        headers: getOkxHeaders('POST', path, body),
-                        body: body,
-                        timeout: 2000 
-                    });
-                    
-                    if (res.status === 429) {
-                        console.log(`[OKX 429] Rate Limit Hit for ${targetSymbol}`);
-                    } else {
-                        const json = await res.json();
-                        if (json.code === "0" && json.data && json.data[0]) {
-                            const p = parseFloat(json.data[0].price);
-                            if (p > 0) {
-                                priceFound = p;
-                                sourceFound = 'OKX WEB3';
-                            }
-                        }
-                    }
-                } catch (e) {
-                    console.error(`[OKX Error] ${e.message}`);
-                }
-            }
-
-            // --- DexScreener Fallback (Только если OKX не дал цену) ---
-            if (!priceFound && entry.meta.contract) {
-                try {
-                    // Используем API токенов, а не пар (более надежно)
-                    const url = `https://api.dexscreener.com/latest/dex/tokens/${entry.meta.contract}`;
-                    const res = await fetch(url);
-                    const data = await res.json();
-                    
-                    if (data.pairs && data.pairs.length > 0) {
-                        // Берем пару с наибольшей ликвидностью
-                        // DexScreener обычно сортирует их сам, берем первую
-                        const p = parseFloat(data.pairs[0].priceUsd);
+                const res = await fetch(CONFIG.OKX.BASE_URL + path, {
+                    method: 'POST',
+                    headers: getOkxHeaders('POST', path, body),
+                    body: body,
+                    timeout: 5000 
+                });
+                
+                if (res.status === 200) {
+                    const json = await res.json();
+                    if (json.code === "0" && json.data && json.data[0]) {
+                        const p = parseFloat(json.data[0].price);
                         if (p > 0) {
-                            priceFound = p;
-                            sourceFound = 'DEX';
+                            entry.price = p;
+                            entry.source = 'OKX WEB3';
+                            // console.log(`[OKX SUCCESS] ${targetSymbol}: ${p}`);
                         }
+                    } else {
+                        // console.log(`[OKX FAIL] Code: ${json.code}, Msg: ${json.msg}`);
                     }
-                } catch (e) {}
-            }
-
-            // Сохраняем результат
-            if (priceFound) {
-                entry.price = priceFound;
-                entry.source = sourceFound;
+                } else {
+                    console.log(`[OKX HTTP ERROR] Status: ${res.status}`);
+                }
+            } catch (e) {
+                console.error(`[OKX NET ERROR] ${e.message}`);
             }
         }
 
-    } catch (e) {
-        console.error("Queue Error:", e);
-    }
+    } catch (e) { console.error("Queue Error:", e); }
 
-    // 4. Планируем следующий запуск через 1.2 сек (Strict Rate Limit)
+    // Ждем интервал перед следующим запросом
     setTimeout(processDexQueue, CONFIG.DEX_POLL_INTERVAL);
 };
 
-// Запускаем планировщик
+// Запуск воркера
 processDexQueue();
 
 
 /**
- * --- INTERNAL RESOLVE ---
+ * --- INTERNAL RESOLVE (ONLY MEXC CONFIG) ---
  */
 const resolveTokenInternal = async (symbol) => {
     let data = MEXC_CONFIG_CACHE;
@@ -235,69 +240,55 @@ const resolveTokenInternal = async (symbol) => {
     }
     if (!data || !Array.isArray(data)) return { ok: false };
 
-    // Собираем кандидатов
-    const contracts = new Set();
+    let bestMatch = null;
     let depositOpen = true;
 
-    data.forEach(token => {
+    // Ищем токен
+    for (const token of data) {
         if (token.coin === symbol || (token.name && token.name.toUpperCase() === symbol)) {
             if (token.networkList) {
-                token.networkList.forEach(net => {
-                    if (net.contract && !net.contract.includes(' ')) {
-                        contracts.add(net.contract);
+                for (const net of token.networkList) {
+                    // Проверяем, поддерживается ли сеть нашим маппингом
+                    const networkName = net.network || net.netWork;
+                    const mapData = NETWORK_MAP[networkName];
+                    
+                    if (mapData && net.contract && !net.contract.includes(' ')) {
+                        // Нашли подходящий контракт!
+                        bestMatch = {
+                            contract: net.contract,
+                            okxId: mapData.okxId,
+                            dsSlug: mapData.dsSlug
+                        };
+                        if (token.coin === symbol) depositOpen = net.depositEnable;
+                        break; 
                     }
-                    if (token.coin === symbol) depositOpen = net.depositEnable; 
-                });
+                }
             }
         }
-    });
+        if (bestMatch) break;
+    }
 
-    let bestPair = null;
-    let maxVolume = -1;
-
-    // Резолвим через DexScreener (это безопасно делать пачкой, лимиты там мягче)
-    if (contracts.size > 0) {
-        const contractList = Array.from(contracts);
-        const chunk = contractList.slice(0, 30).join(','); 
+    if (bestMatch) {
+        // Формируем ссылку DexScreener вручную
+        const url = `https://dexscreener.com/${bestMatch.dsSlug}/${bestMatch.contract}`;
         
-        try {
-            const dsRes = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${chunk}`);
-            const dsData = await dsRes.json();
-            
-            if (dsData.pairs) {
-                dsData.pairs.forEach(pair => {
-                    const vol = parseFloat(pair.volume?.h24 || 0);
-                    if (vol > maxVolume) {
-                        maxVolume = vol;
-                        bestPair = pair;
-                    }
-                });
-            }
-        } catch (e) {}
+        // Создаем запись в кэше
+        if (!DEX_CACHE[symbol]) {
+            DEX_CACHE[symbol] = {
+                price: 0,
+                source: 'WAIT',
+                lastUpdate: 0, // 0 заставит воркер обновить цену немедленно
+                meta: bestMatch
+            };
+        } else {
+            // Если запись была (но пустая), обновляем метаданные
+            DEX_CACHE[symbol].meta = bestMatch;
+        }
+        
+        return { ok: true, url, depositOpen };
     }
-
-    let resolvedUrl = '';
     
-    if (bestPair) {
-        // Формируем ссылку на ТОКЕН
-        resolvedUrl = `https://dexscreener.com/${bestPair.chainId}/${bestPair.baseToken.address}`;
-
-        const okxChain = CHAIN_MAP[bestPair.chainId] || null;
-
-        DEX_CACHE[symbol] = {
-            price: parseFloat(bestPair.priceUsd),
-            source: 'DEX', // Временное значение пока не обновит OKX
-            lastUpdate: 0, // 0 = требует обновления немедленно
-            meta: {
-                contract: bestPair.baseToken.address, 
-                pairAddress: bestPair.pairAddress,    
-                chainIdStr: bestPair.chainId,
-                chainIndex: okxChain
-            }
-        };
-    }
-
-    return { ok: true, chain: bestPair?.chainId, addr: bestPair?.pairAddress, url: resolvedUrl, depositOpen };
+    return { ok: false };
 };
 
 /**
@@ -362,14 +353,10 @@ setInterval(() => {
         const prices = GLOBAL_PRICES[symbol];
         const isActive = ACTIVE_SYMBOLS[symbol] && (timeMs - ACTIVE_SYMBOLS[symbol] < 300000);
 
-        // Самовосстановление кэша DEX
+        // Если символ активен, но его нет в DEX_CACHE - пытаемся найти
         if (isActive && !DEX_CACHE[symbol]) {
-             // Ставим заглушку чтобы не долбить resolve
-             DEX_CACHE[symbol] = { price: 0, source: 'LOAD', lastUpdate: Date.now() + 10000 }; 
-             resolveTokenInternal(symbol).then(res => {
-                 // Сбрасываем таймер, чтобы планировщик подхватил его
-                 if(DEX_CACHE[symbol]) DEX_CACHE[symbol].lastUpdate = 0;
-             });
+             DEX_CACHE[symbol] = { price: 0, source: 'LOAD', lastUpdate: Date.now() + 10000 }; // Заглушка
+             resolveTokenInternal(symbol);
         }
 
         ALL_SOURCES.forEach(source => {
@@ -391,6 +378,7 @@ setInterval(() => {
                         if (!HISTORY_OHLC[symbol][source][tf]) HISTORY_OHLC[symbol][source][tf] = [];
                         HISTORY_OHLC[symbol][source][tf].push({ ...currentCandle });
                         if (HISTORY_OHLC[symbol][source][tf].length > 25) HISTORY_OHLC[symbol][source][tf].shift();
+                        
                         if (isActive && CONFIG.MONGO_URI) {
                             CandleModel.create({
                                 symbol: symbol, exchange: source, timeframe: tf,
@@ -977,17 +965,8 @@ async function start() {
     if(timer) clearInterval(timer);  
     output.innerHTML = "Поиск...";  
     
-    if (val.includes("dexscreener.com")) {  
-        try {  
-            const parts = val.split('/'); chain = parts[parts.length - 2]; addr = parts[parts.length - 1].split('?')[0];  
-            fetch('https://api.dexscreener.com/latest/dex/pairs/' + chain + '/' + addr).then(r => r.json()).then(dsData => {
-                     if (dsData.pair) {  
-                        symbol = dsData.pair.baseToken.symbol.toUpperCase(); input.value = symbol; dexLink.value = dsData.pair.url;  
-                    } 
-                });
-        } catch(e) { output.innerHTML = "Ошибка ссылки!"; return; }  
-    } else { symbol = val.toUpperCase(); }  
-
+    // Удален локальный DexScreener fetch - всё делает сервер!
+    
     const url = new URL(window.location); url.searchParams.set('symbol', symbol); window.history.replaceState({}, '', url);  
     update(); timer = setInterval(update, 1000);  
 
@@ -1009,4 +988,4 @@ if (urlParams.get('symbol')) start();
 });
 
 app.listen(CONFIG.PORT, () => console.log(`🚀 Server running on port ${CONFIG.PORT}`));
-                                                     
+    
