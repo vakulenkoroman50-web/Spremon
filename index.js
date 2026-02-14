@@ -70,7 +70,7 @@ const GLOBAL_PRICES = {};
 const GLOBAL_FAIR = {};   
 let MEXC_CONFIG_CACHE = null;
 
-// Текущая цель для мониторинга DEX
+// DEX TARGET (Global State)
 let DEX_TARGET = {
     symbol: null,
     chainIndex: null, 
@@ -78,17 +78,15 @@ let DEX_TARGET = {
     pairAddress: null, 
     chainIdStr: null, 
     price: 0,
-    source: 'OFF', // 'OKX' или 'DEX'
+    source: 'OFF', // 'OKX' or 'DEX'
     lastDsRequest: 0
 };
 
-// Трекер активности
 const ACTIVE_SYMBOLS = {};
-
 const HISTORY_OHLC = {}; 
 const CURRENT_CANDLES = {};
 
-// --- УТИЛИТЫ ---
+// --- UTILS ---
 const normalizeSymbol = (s) => {
     if (!s) return null;
     return s.toUpperCase().replace(/[-_]/g, '').replace('USDT', '').replace('SWAP', '').replace('M', '');        
@@ -136,7 +134,7 @@ const fetchOkxPrice = async (chainIndex, contract) => {
             method: 'POST',
             headers: getOkxHeaders('POST', path, body),
             body: body,
-            timeout: 2000
+            timeout: 3000 // Ждем до 3 сек, чтобы не висеть вечно
         });
         const json = await res.json();
         if (json.code === "0" && json.data && json.data[0]) {
@@ -146,35 +144,53 @@ const fetchOkxPrice = async (chainIndex, contract) => {
     return null;
 };
 
-// --- DEX MONITOR LOOP ---
-setInterval(async () => {
-    if (!DEX_TARGET.contract) return;
+// --- STABLE DEX MONITOR (RECURSIVE LOOP) ---
+// Используем рекурсию вместо setInterval, чтобы запросы не накладывались друг на друга
+const runDexMonitor = async () => {
+    // Если цели нет, спим 1 сек и чекаем снова
+    if (!DEX_TARGET.contract) {
+        setTimeout(runDexMonitor, 1000);
+        return;
+    }
 
-    // 1. OKX Web3 (Приоритет)
+    let okxSuccess = false;
+
+    // 1. Попытка OKX
     if (DEX_TARGET.chainIndex) {
         const price = await fetchOkxPrice(DEX_TARGET.chainIndex, DEX_TARGET.contract);
         if (price) {
             DEX_TARGET.price = price;
-            DEX_TARGET.source = 'OKX';
-            return; 
+            DEX_TARGET.source = 'OKX'; // Стабильно ставим OKX
+            okxSuccess = true;
         }
     }
 
-    // 2. DexScreener Fallback (Раз в 3 сек)
-    const now = Date.now();
-    if (!DEX_TARGET.lastDsRequest || (now - DEX_TARGET.lastDsRequest > 3000)) {
-        try {
-            DEX_TARGET.lastDsRequest = now;
-            const url = `https://api.dexscreener.com/latest/dex/pairs/${DEX_TARGET.chainIdStr}/${DEX_TARGET.pairAddress}`;
-            const res = await fetch(url);
-            const data = await res.json();
-            if (data.pair) {
-                DEX_TARGET.price = parseFloat(data.pair.priceUsd);
-                DEX_TARGET.source = 'DEX';
-            }
-        } catch (e) {}
+    // 2. Fallback DexScreener (Только если OKX не сработал или недоступен)
+    if (!okxSuccess) {
+        const now = Date.now();
+        // DS дергаем реже (раз в 3 сек), чтобы не спамить
+        if (!DEX_TARGET.lastDsRequest || (now - DEX_TARGET.lastDsRequest > 3000)) {
+            try {
+                DEX_TARGET.lastDsRequest = now;
+                const url = `https://api.dexscreener.com/latest/dex/pairs/${DEX_TARGET.chainIdStr}/${DEX_TARGET.pairAddress}`;
+                const res = await fetch(url);
+                const data = await res.json();
+                if (data.pair) {
+                    DEX_TARGET.price = parseFloat(data.pair.priceUsd);
+                    DEX_TARGET.source = 'DEX'; // Стабильно ставим DEX
+                }
+            } catch (e) {}
+        }
+        // Если OKX не сработал, и DS тоже молчит - оставляем старую цену (чтобы не моргало 0)
     }
-}, 1000);
+
+    // Запускаем следующий цикл только после завершения текущего
+    setTimeout(runDexMonitor, 1000);
+};
+
+// Запуск монитора DEX
+runDexMonitor();
+
 
 /**
  * --- BACKUP SYSTEM ---
@@ -236,7 +252,6 @@ setInterval(() => {
 
     Object.keys(GLOBAL_PRICES).forEach(symbol => {
         const prices = GLOBAL_PRICES[symbol];
-        // Проверка активности (5 мин)
         const isActive = ACTIVE_SYMBOLS[symbol] && (timeMs - ACTIVE_SYMBOLS[symbol] < 300000);
 
         ALL_SOURCES.forEach(source => {
@@ -489,14 +504,13 @@ app.get('/api/resolve', authMiddleware, async (req, res) => {
     }));
 
     if (bestPair) {
-        // Устанавливаем цель для фонового монитора
         DEX_TARGET.symbol = symbol;
         DEX_TARGET.contract = bestPair.baseToken.address;
         DEX_TARGET.pairAddress = bestPair.pairAddress;
         DEX_TARGET.chainIdStr = bestPair.chainId;
         DEX_TARGET.chainIndex = CHAIN_MAP[bestPair.chainId] || null;
         DEX_TARGET.price = parseFloat(bestPair.priceUsd);
-        DEX_TARGET.source = 'DEX'; // Start with standard label
+        DEX_TARGET.source = 'DEX'; 
     }
 
     res.json({ ok: true, chain: bestPair?.chainId, addr: bestPair?.pairAddress, url: bestPair?.url, depositOpen });
@@ -506,7 +520,6 @@ app.get('/api/all', authMiddleware, async (req, res) => {
     let symbol = normalizeSymbol(req.query.symbol || '');
     if (!symbol) return res.json({ ok: false });
 
-    // Активируем запись в БД
     ACTIVE_SYMBOLS[symbol] = Date.now();
 
     const marketData = GLOBAL_PRICES[symbol] || {};
@@ -537,7 +550,6 @@ app.get('/api/all', authMiddleware, async (req, res) => {
         });
     });
 
-    // Данные от фонового DEX монитора
     const dexPrice = (DEX_TARGET.symbol === symbol) ? DEX_TARGET.price : 0;
     const dexSource = (DEX_TARGET.symbol === symbol) ? DEX_TARGET.source : '';
 
@@ -679,13 +691,10 @@ function formatDexPrice(p) {
     let val = parseFloat(p);
     if (val >= 1) return val.toFixed(4);
     
-    // Для < 1: находим первые 4 значащих цифры
-    // Пример: 0.00001234
+    // Форматирование для мелких цен: 0.00001234
     let str = val.toFixed(20).replace(/0+$/, '');
-    // Мат. способ: считаем нули
     let zeros = -Math.floor(Math.log10(val) + 1);
-    if(zeros < 0) zeros = 0; // На всякий случай
-    // Показываем нули + 4 цифры
+    if(zeros < 0) zeros = 0;
     return val.toFixed(Math.max(4, zeros + 4));
 }
 
@@ -751,7 +760,6 @@ function renderChart(candles, gap, sourceName) {
         const rectX = xCenter - (bodyWidth / 2);
         svgHtml += \`<rect x="\${rectX}" y="\${rectY}" width="\${bodyWidth}" height="\${rectH}" class="candle-body \${colorClass}" />\`;
 
-        // ARROWS
         if (c.h === maxPrice) svgHtml += \`<text x="\${xCenter}" y="\${yHigh + 8}" fill="\${arrowColor}" text-anchor="middle" class="chart-text arrow-label">↑</text>\`;
         if (c.l === minPrice) svgHtml += \`<text x="\${xCenter}" y="\${yLow - 2}" fill="\${arrowColor}" text-anchor="middle" class="chart-text arrow-label">↓</text>\`;
     });
@@ -762,7 +770,7 @@ function renderChart(candles, gap, sourceName) {
 async function update() {  
     if (!symbol) return;  
     
-    // NOTE: Dex fetch is now handled by server in /api/all
+    // ПРИМЕЧАНИЕ: Dex fetch теперь на сервере (/api/all)
     
     blink = !blink;  
     try {  
@@ -801,6 +809,7 @@ async function update() {
             fairPriceDisplay.innerHTML = '';
         }
         
+        // ФОРМАТИРОВАНИЕ DEX ЦЕНЫ
         let dexLabel = (data.dexSource === 'OKX') ? 'OKX WEB3' : 'DEX';
         let dexPriceStr = formatDexPrice(dexPrice);
 
@@ -920,4 +929,4 @@ if (urlParams.get('symbol')) start();
 });
 
 app.listen(CONFIG.PORT, () => console.log(`🚀 Server running on port ${CONFIG.PORT}`));
-                    
+                
