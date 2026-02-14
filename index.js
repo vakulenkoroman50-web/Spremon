@@ -30,12 +30,11 @@ const EXCHANGES_ORDER = ["Binance", "Bybit", "Gate", "Bitget", "BingX", "OKX", "
 const ALL_SOURCES = ["MEXC", ...EXCHANGES_ORDER];
 const TIMEFRAMES = ['1m', '15m', '1h'];
 
-// Маппинг сетей: DexScreener ID -> OKX Chain Index
 const CHAIN_MAP = {
     "ethereum": "1", "bsc": "56", "polygon": "137", "arbitrum": "42161",
     "optimism": "10", "avalanche": "43114", "tron": "195", "solana": "501",
     "base": "8453", "fantom": "250", "cronos": "25", "linea": "59144",
-    "sui": "10000" // Иногда бывает полезно
+    "sui": "10000"
 };
 
 /**
@@ -69,8 +68,7 @@ const GLOBAL_PRICES = {};
 const GLOBAL_FAIR = {};   
 let MEXC_CONFIG_CACHE = null;
 
-// КАРТОТЕКА DEX (Кэш для каждого токена)
-// DEX_CACHE[symbol] = { price, source, isFetching, meta: { ... } }
+// КАРТОТЕКА DEX (Кэш)
 const DEX_CACHE = {};
 
 const ACTIVE_SYMBOLS = {};
@@ -120,25 +118,24 @@ const updateDexPriceForSymbol = async (symbol) => {
     const entry = DEX_CACHE[symbol];
     if (!entry || !entry.meta) return;
 
-    // --- ЗАЩИТА ОТ МИГАНИЯ (RACE CONDITION) ---
-    // Если запрос уже идет, не запускаем новый
     if (entry.isFetching) return;
     
-    // Лимит частоты: 1 раз в сек
+    // Частота: 1 сек
     const now = Date.now();
     if (now - (entry.lastUpdate || 0) < 1000) return; 
 
-    entry.isFetching = true; // Блокируем
+    entry.isFetching = true;
     entry.lastUpdate = now;
 
     let priceFound = null;
     let sourceFound = 'DEX';
 
     try {
-        // 1. OKX Web3 (Нужен адрес токена - contract)
+        // 1. OKX Web3
         if (CONFIG.OKX.KEY && entry.meta.chainIndex && entry.meta.contract) {
             try {
                 const path = "/api/v6/dex/market/price";
+                // Важно: OKX Web3 API требует JSON без лишних пробелов, но стандартный stringify ок
                 const body = JSON.stringify([{ 
                     "chainIndex": String(entry.meta.chainIndex), 
                     "tokenContractAddress": entry.meta.contract 
@@ -148,41 +145,42 @@ const updateDexPriceForSymbol = async (symbol) => {
                     method: 'POST',
                     headers: getOkxHeaders('POST', path, body),
                     body: body,
-                    timeout: 2000 // Тайм-аут 2 сек
+                    timeout: 2000 
                 });
                 const json = await res.json();
                 if (json.code === "0" && json.data && json.data[0]) {
                     const p = parseFloat(json.data[0].price);
                     if (p > 0) {
                         priceFound = p;
-                        sourceFound = 'OKX';
+                        sourceFound = 'OKX WEB3';
                     }
                 }
             } catch (e) {}
         }
 
-        // 2. DexScreener Fallback (Нужен адрес пары - pairAddress)
-        // Запускаем только если OKX не дал цену
+        // 2. DexScreener Fallback (Если OKX не дал цену)
         if (!priceFound && entry.meta.chainIdStr && entry.meta.pairAddress) {
             try {
                 const url = `https://api.dexscreener.com/latest/dex/pairs/${entry.meta.chainIdStr}/${entry.meta.pairAddress}`;
                 const res = await fetch(url);
                 const data = await res.json();
-                if (data.pair) {
-                    priceFound = parseFloat(data.pair.priceUsd);
+                
+                // --- ИСПРАВЛЕНИЕ ОШИБКИ: data.pairs (массив), а не data.pair ---
+                if (data.pairs && data.pairs[0]) {
+                    priceFound = parseFloat(data.pairs[0].priceUsd);
                     sourceFound = 'DEX';
                 }
             } catch (e) {}
         }
 
-        // Обновляем данные только если нашли цену (чтобы не сбрасывать в 0 при ошибке сети)
+        // Обновляем только если нашли цену. Если оба API упали - храним старую цену (чтобы не мигало 0)
         if (priceFound) {
             entry.price = priceFound;
             entry.source = sourceFound;
         }
 
     } finally {
-        entry.isFetching = false; // Разблокируем
+        entry.isFetching = false;
     }
 };
 
@@ -248,7 +246,6 @@ setInterval(() => {
         const prices = GLOBAL_PRICES[symbol];
         const isActive = ACTIVE_SYMBOLS[symbol] && (timeMs - ACTIVE_SYMBOLS[symbol] < 300000);
 
-        // Обновляем DEX цену для активных символов (с защитой от гонки)
         if (isActive && DEX_CACHE[symbol]) {
             updateDexPriceForSymbol(symbol);
         }
@@ -269,11 +266,9 @@ setInterval(() => {
 
                 if (!currentCandle || currentCandle.lastPeriod !== currentPeriod) {
                     if (currentCandle) {
-                        // RAM
                         if (!HISTORY_OHLC[symbol][source][tf]) HISTORY_OHLC[symbol][source][tf] = [];
                         HISTORY_OHLC[symbol][source][tf].push({ ...currentCandle });
                         if (HISTORY_OHLC[symbol][source][tf].length > 25) HISTORY_OHLC[symbol][source][tf].shift();
-                        // DB (Lazy save)
                         if (isActive && CONFIG.MONGO_URI) {
                             CandleModel.create({
                                 symbol: symbol, exchange: source, timeframe: tf,
@@ -493,12 +488,10 @@ app.get('/api/resolve', authMiddleware, async (req, res) => {
     
     if (!data || !Array.isArray(data)) return res.json({ ok: false });
 
-    // Ищем ВСЕ контракты (совпадение по Тикеру или Имени)
     const contracts = new Set();
     let depositOpen = true;
 
     data.forEach(token => {
-        // Умное сравнение: SOLTOMATO == soltomato
         if (token.coin === symbol || (token.name && token.name.toUpperCase() === symbol)) {
             if (token.networkList) {
                 token.networkList.forEach(net => {
@@ -516,7 +509,6 @@ app.get('/api/resolve', authMiddleware, async (req, res) => {
 
     if (contracts.size > 0) {
         const contractList = Array.from(contracts);
-        // Запрашиваем DexScreener (пачка до 30 штук)
         const chunk = contractList.slice(0, 30).join(','); 
         
         try {
@@ -538,8 +530,7 @@ app.get('/api/resolve', authMiddleware, async (req, res) => {
     let resolvedUrl = '';
     
     if (bestPair) {
-        // !!! ФОРМИРУЕМ ПРАВИЛЬНУЮ ССЫЛКУ (НА ТОКЕН, А НЕ НА ПУЛ) !!!
-        // Формат: https://dexscreener.com/[chainId]/[tokenAddress]
+        // Формируем ссылку на токен
         resolvedUrl = `https://dexscreener.com/${bestPair.chainId}/${bestPair.baseToken.address}`;
 
         DEX_CACHE[symbol] = {
@@ -548,8 +539,8 @@ app.get('/api/resolve', authMiddleware, async (req, res) => {
             isFetching: false,
             lastUpdate: 0,
             meta: {
-                contract: bestPair.baseToken.address, // Токен (для OKX)
-                pairAddress: bestPair.pairAddress,    // Пул (для DS fallback)
+                contract: bestPair.baseToken.address, 
+                pairAddress: bestPair.pairAddress,    
                 chainIdStr: bestPair.chainId,
                 chainIndex: CHAIN_MAP[bestPair.chainId] || null
             }
@@ -737,6 +728,9 @@ function formatDexPrice(p) {
     if (!p || p == 0) return "0";
     let val = parseFloat(p);
     if (val >= 1) return val.toFixed(4);
+    
+    // Форматирование для мелких цен: 0.00001234
+    let str = val.toFixed(20).replace(/0+$/, '');
     let zeros = -Math.floor(Math.log10(val) + 1);
     if(zeros < 0) zeros = 0;
     return val.toFixed(Math.max(4, zeros + 4));
@@ -804,6 +798,7 @@ function renderChart(candles, gap, sourceName) {
         const rectX = xCenter - (bodyWidth / 2);
         svgHtml += \`<rect x="\${rectX}" y="\${rectY}" width="\${bodyWidth}" height="\${rectH}" class="candle-body \${colorClass}" />\`;
 
+        // СТРЕЛКИ ВНУТРИ
         if (c.h === maxPrice) svgHtml += \`<text x="\${xCenter}" y="\${yHigh + 8}" fill="\${arrowColor}" text-anchor="middle" class="chart-text arrow-label">↑</text>\`;
         if (c.l === minPrice) svgHtml += \`<text x="\${xCenter}" y="\${yLow - 2}" fill="\${arrowColor}" text-anchor="middle" class="chart-text arrow-label">↓</text>\`;
     });
@@ -851,7 +846,7 @@ async function update() {
             fairPriceDisplay.innerHTML = '';
         }
         
-        let dexLabel = (data.dexSource === 'OKX') ? 'OKX WEB3' : 'DEX';
+        let dexLabel = (data.dexSource === 'OKX WEB3') ? 'OKX WEB3' : 'DEX';
         let dexPriceStr = formatDexPrice(dexPrice);
 
         if (!dexPrice) document.title = symbol + ': ' + formatP(mainPrice);
@@ -970,4 +965,4 @@ if (urlParams.get('symbol')) start();
 });
 
 app.listen(CONFIG.PORT, () => console.log(`🚀 Server running on port ${CONFIG.PORT}`));
-        
+                
