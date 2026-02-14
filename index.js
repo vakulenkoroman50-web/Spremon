@@ -102,7 +102,9 @@ const safeJson = (data) => {
  * --- OKX & DEX LOGIC ---
  */
 const getOkxHeaders = (method, path, body = '') => {
-    const timestamp = new Date().toISOString().replace(/\.\d+Z$/, 'Z'); 
+    // ВАЖНО: Используем ISO формат с миллисекундами, как в Python скрипте
+    // Было: .replace(/\.\d+Z$/, 'Z') -> Убрал это
+    const timestamp = new Date().toISOString(); 
     const msg = timestamp + method + path + body;
     const sign = crypto.createHmac('sha256', CONFIG.OKX.SECRET).update(msg).digest('base64');
     return {
@@ -120,9 +122,9 @@ const updateDexPriceForSymbol = async (symbol) => {
 
     if (entry.isFetching) return;
     
-    // Частота: 1 сек
     const now = Date.now();
-    if (now - (entry.lastUpdate || 0) < 1000) return; 
+    // Обновляем раз в 2 секунды, чтобы не спамить и не ловить бан
+    if (now - (entry.lastUpdate || 0) < 2000) return; 
 
     entry.isFetching = true;
     entry.lastUpdate = now;
@@ -135,7 +137,6 @@ const updateDexPriceForSymbol = async (symbol) => {
         if (CONFIG.OKX.KEY && entry.meta.chainIndex && entry.meta.contract) {
             try {
                 const path = "/api/v6/dex/market/price";
-                // Важно: OKX Web3 API требует JSON без лишних пробелов, но стандартный stringify ок
                 const body = JSON.stringify([{ 
                     "chainIndex": String(entry.meta.chainIndex), 
                     "tokenContractAddress": entry.meta.contract 
@@ -148,35 +149,55 @@ const updateDexPriceForSymbol = async (symbol) => {
                     timeout: 2000 
                 });
                 const json = await res.json();
+                
                 if (json.code === "0" && json.data && json.data[0]) {
                     const p = parseFloat(json.data[0].price);
                     if (p > 0) {
                         priceFound = p;
                         sourceFound = 'OKX WEB3';
                     }
+                } else {
+                    // Логируем ошибку, если это не просто "не найдено"
+                    if(json.code !== "50102") { // 50102 usually means token not found/not supported
+                         // console.log(`[OKX Fail] ${symbol}: Code ${json.code} - ${json.msg}`);
+                    }
                 }
-            } catch (e) {}
+            } catch (e) {
+                // console.log(`[OKX Net Error] ${symbol}: ${e.message}`);
+            }
         }
 
-        // 2. DexScreener Fallback (Если OKX не дал цену)
-        if (!priceFound && entry.meta.chainIdStr && entry.meta.pairAddress) {
+        // 2. DexScreener Fallback (ПО АДРЕСУ ТОКЕНА, А НЕ ПАРЫ)
+        // Это надежнее, так как DS сам найдет лучшую пару
+        if (!priceFound && entry.meta.contract) {
             try {
-                const url = `https://api.dexscreener.com/latest/dex/pairs/${entry.meta.chainIdStr}/${entry.meta.pairAddress}`;
+                const url = `https://api.dexscreener.com/latest/dex/tokens/${entry.meta.contract}`;
                 const res = await fetch(url);
                 const data = await res.json();
                 
-                // --- ИСПРАВЛЕНИЕ ОШИБКИ: data.pairs (массив), а не data.pair ---
-                if (data.pairs && data.pairs[0]) {
-                    priceFound = parseFloat(data.pairs[0].priceUsd);
-                    sourceFound = 'DEX';
+                if (data.pairs && data.pairs.length > 0) {
+                    // Берем пару с наибольшей ликвидностью/объемом
+                    // Обычно DS отдает лучшую первой, но можно проверить
+                    const best = data.pairs[0];
+                    const p = parseFloat(best.priceUsd);
+                    if (p > 0) {
+                        priceFound = p;
+                        sourceFound = 'DEX';
+                    }
                 }
-            } catch (e) {}
+            } catch (e) {
+                console.log(`[DS Error] ${symbol}: ${e.message}`);
+            }
         }
 
-        // Обновляем только если нашли цену. Если оба API упали - храним старую цену (чтобы не мигало 0)
+        // Обновляем ТОЛЬКО если нашли цену. 
+        // Если не нашли - оставляем старую (чтобы не мигало 0)
         if (priceFound) {
             entry.price = priceFound;
             entry.source = sourceFound;
+        } else {
+            // Если ничего не нашли, можно вывести лог для отладки
+            // console.log(`[No Price] ${symbol} - contract: ${entry.meta.contract}`);
         }
 
     } finally {
@@ -530,7 +551,6 @@ app.get('/api/resolve', authMiddleware, async (req, res) => {
     let resolvedUrl = '';
     
     if (bestPair) {
-        // Формируем ссылку на токен
         resolvedUrl = `https://dexscreener.com/${bestPair.chainId}/${bestPair.baseToken.address}`;
 
         DEX_CACHE[symbol] = {
@@ -728,9 +748,6 @@ function formatDexPrice(p) {
     if (!p || p == 0) return "0";
     let val = parseFloat(p);
     if (val >= 1) return val.toFixed(4);
-    
-    // Форматирование для мелких цен: 0.00001234
-    let str = val.toFixed(20).replace(/0+$/, '');
     let zeros = -Math.floor(Math.log10(val) + 1);
     if(zeros < 0) zeros = 0;
     return val.toFixed(Math.max(4, zeros + 4));
@@ -965,4 +982,4 @@ if (urlParams.get('symbol')) start();
 });
 
 app.listen(CONFIG.PORT, () => console.log(`🚀 Server running on port ${CONFIG.PORT}`));
-                
+                        
