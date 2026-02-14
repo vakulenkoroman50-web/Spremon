@@ -11,14 +11,12 @@ const CONFIG = {
     PORT: process.env.PORT || 3000,
     SECRET_TOKEN: process.env.SECRET_TOKEN || '',
     MONGO_URI: process.env.MONGO_URI || '', 
-    // --- CEX API ---
     MEXC: {
         KEY: process.env.MEXC_API_KEY || '',
         SECRET: process.env.MEXC_API_SECRET || '',
         BASE_URL: 'https://api.mexc.com',
         FUTURES_URL: 'https://contract.mexc.com'
     },
-    // --- OKX WEB3 API ---
     OKX: {
         KEY: process.env.OKX_API_KEY || '',
         SECRET: process.env.OKX_API_SECRET || '',
@@ -67,16 +65,10 @@ const BackupModel = mongoose.model('Backup', BackupSchema);
  */
 const GLOBAL_PRICES = {}; 
 const GLOBAL_FAIR = {};   
-let MEXC_CONFIG_CACHE = null;
+let MEXC_CONFIG_CACHE = []; // Массив конфига
 
-// !!! НОВАЯ СТРУКТУРА ДЛЯ DEX !!!
-// Храним метаданные и цены для КАЖДОГО символа отдельно
-// DEX_CACHE[symbol] = { 
-//    price: 123.45, 
-//    source: 'OKX', 
-//    lastUpdate: 1700000000, 
-//    meta: { chainIndex, contract, pairAddress, chainIdStr } 
-// }
+// КАРТОТЕКА DEX (Кэш для каждого токена)
+// DEX_CACHE[symbol] = { price, source, meta: { contract, pairAddress, ... } }
 const DEX_CACHE = {};
 
 const ACTIVE_SYMBOLS = {};
@@ -107,7 +99,7 @@ const safeJson = (data) => {
 };
 
 /**
- * --- OKX & DEX LOGIC (ISOLATED) ---
+ * --- OKX & DEX LOGIC ---
  */
 const getOkxHeaders = (method, path, body = '') => {
     const timestamp = new Date().toISOString().replace(/\.\d+Z$/, 'Z'); 
@@ -122,20 +114,19 @@ const getOkxHeaders = (method, path, body = '') => {
     };
 };
 
-// Функция обновления цены для КОНКРЕТНОГО символа
 const updateDexPriceForSymbol = async (symbol) => {
     const entry = DEX_CACHE[symbol];
     if (!entry || !entry.meta) return;
 
-    // Ограничиваем частоту запросов (не чаще раза в 1 сек для одного символа)
+    // Лимит частоты: 1 раз в сек для символа
     const now = Date.now();
     if (now - entry.lastUpdate < 1000) return; 
-    entry.lastUpdate = now; // Сразу ставим метку, чтобы не спамить
+    entry.lastUpdate = now;
 
     let priceFound = null;
-    let sourceFound = 'DEX'; // Default fallback
+    let sourceFound = 'DEX';
 
-    // 1. Попытка OKX Web3
+    // 1. OKX Web3 (Нужен адрес токена - contract)
     if (CONFIG.OKX.KEY && entry.meta.chainIndex && entry.meta.contract) {
         try {
             const path = "/api/v6/dex/market/price";
@@ -148,7 +139,7 @@ const updateDexPriceForSymbol = async (symbol) => {
                 method: 'POST',
                 headers: getOkxHeaders('POST', path, body),
                 body: body,
-                timeout: 1500 // Быстрый тайм-аут
+                timeout: 1500
             });
             const json = await res.json();
             if (json.code === "0" && json.data && json.data[0]) {
@@ -161,7 +152,7 @@ const updateDexPriceForSymbol = async (symbol) => {
         } catch (e) {}
     }
 
-    // 2. Fallback DexScreener (Если OKX не дал цену)
+    // 2. DexScreener Fallback (Нужен адрес пары - pairAddress)
     if (!priceFound && entry.meta.chainIdStr && entry.meta.pairAddress) {
         try {
             const url = `https://api.dexscreener.com/latest/dex/pairs/${entry.meta.chainIdStr}/${entry.meta.pairAddress}`;
@@ -174,7 +165,6 @@ const updateDexPriceForSymbol = async (symbol) => {
         } catch (e) {}
     }
 
-    // Обновляем кэш, если нашли цену
     if (priceFound) {
         entry.price = priceFound;
         entry.source = sourceFound;
@@ -228,7 +218,7 @@ async function performBackup() {
 }
 
 /**
- * --- CORE LOOP (PRICE AGGREGATION) ---
+ * --- CORE LOOP ---
  */
 setInterval(() => {
     const now = new Date();
@@ -243,9 +233,8 @@ setInterval(() => {
         const prices = GLOBAL_PRICES[symbol];
         const isActive = ACTIVE_SYMBOLS[symbol] && (timeMs - ACTIVE_SYMBOLS[symbol] < 300000);
 
-        // Фоновое обновление DEX цены, если символ активен
+        // Обновляем DEX цену для активных символов
         if (isActive && DEX_CACHE[symbol]) {
-            // Запускаем обновление (без await, чтобы не блокировать цикл)
             updateDexPriceForSymbol(symbol);
         }
 
@@ -293,7 +282,7 @@ setInterval(() => {
 }, 1000);
 
 /**
- * --- MONITORS ---
+ * --- MONITORS (WEB SOCKETS & POLLERS) ---
  */
 const initMexcGlobal = () => {
     let ws = null;
@@ -479,41 +468,73 @@ async function updateMexcConfigCache() {
 }
 setInterval(updateMexcConfigCache, 60000);
 
-// --- API ---
+// --- API: RESOLVE TOKEN (NEW IMPROVED LOGIC) ---
 app.get('/api/resolve', authMiddleware, async (req, res) => {
     const symbol = (req.query.symbol || '').toUpperCase();
-    let data = MEXC_CONFIG_CACHE;
-    if (!data) data = await mexcPrivateRequest("/api/v3/capital/config/getall");
-    if (!data || !Array.isArray(data)) return res.json({ ok: false });
-    const tokenData = data.find(t => t.coin === symbol);
-    if (!tokenData?.networkList) return res.json({ ok: false });
-    const depositOpen = tokenData.networkList.some(net => net.depositEnable);
-    let bestPair = null;
-    const contracts = tokenData.networkList.filter(n => n.contract).map(n => n.contract);
     
-    await Promise.all(contracts.map(async (contract) => {
+    // 1. Берем конфиг (из кэша или загружаем)
+    let data = MEXC_CONFIG_CACHE;
+    if (!data || data.length === 0) {
+        data = await mexcPrivateRequest("/api/v3/capital/config/getall");
+    }
+    
+    if (!data || !Array.isArray(data)) return res.json({ ok: false });
+
+    // 2. Ищем ВСЕ контракты для этого тикера (по Name или Coin)
+    const contracts = new Set();
+    data.forEach(token => {
+        if (token.coin === symbol || token.name === symbol) {
+            if (token.networkList) {
+                token.networkList.forEach(net => {
+                    // Исключаем пустые и с пробелами
+                    if (net.contract && !net.contract.includes(' ')) {
+                        contracts.add(net.contract);
+                    }
+                });
+            }
+        }
+    });
+
+    // 3. Если контракты есть, запрашиваем DexScreener (пачкой до 30 шт)
+    let bestPair = null;
+    let maxVolume = -1;
+
+    if (contracts.size > 0) {
+        const contractList = Array.from(contracts);
+        const chunk = contractList.slice(0, 30).join(','); // Берем первые 30
+        
         try {
-            const dsRes = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${contract}`);
+            const dsRes = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${chunk}`);
             const dsData = await dsRes.json();
+            
             if (dsData.pairs) {
                 dsData.pairs.forEach(pair => {
-                    if (!bestPair || (parseFloat(pair.volume?.h24 || 0) > parseFloat(bestPair.volume?.h24 || 0))) {
+                    const vol = parseFloat(pair.volume?.h24 || 0);
+                    if (vol > maxVolume) {
+                        maxVolume = vol;
                         bestPair = pair;
                     }
                 });
             }
-        } catch (e) {}
-    }));
+        } catch (e) { console.error('DS Resolve Error', e); }
+    }
+
+    let depositOpen = true; // Default
+    // Находим deposit status для первого попавшегося совпадения (упрощенно)
+    const exactMatch = data.find(t => t.coin === symbol);
+    if(exactMatch && exactMatch.networkList) {
+        depositOpen = exactMatch.networkList.some(n => n.depositEnable);
+    }
 
     if (bestPair) {
-        // Создаем запись в картотеке для этого символа
+        // !!! СОЗДАЕМ ЛИЧНУЮ КАРТОЧКУ ДЛЯ ЭТОГО СИМВОЛА !!!
         DEX_CACHE[symbol] = {
             price: parseFloat(bestPair.priceUsd),
-            source: 'DEX', // Init value
+            source: 'DEX', // Начальный источник
             lastUpdate: 0,
             meta: {
-                contract: bestPair.baseToken.address,
-                pairAddress: bestPair.pairAddress,
+                contract: bestPair.baseToken.address, // ВАЖНО: Адрес Токена для OKX
+                pairAddress: bestPair.pairAddress,    // ВАЖНО: Адрес Пары для DexScreener
                 chainIdStr: bestPair.chainId,
                 chainIndex: CHAIN_MAP[bestPair.chainId] || null
             }
@@ -527,6 +548,7 @@ app.get('/api/all', authMiddleware, async (req, res) => {
     let symbol = normalizeSymbol(req.query.symbol || '');
     if (!symbol) return res.json({ ok: false });
 
+    // Активируем запись в БД
     ACTIVE_SYMBOLS[symbol] = Date.now();
 
     const marketData = GLOBAL_PRICES[symbol] || {};
@@ -557,7 +579,7 @@ app.get('/api/all', authMiddleware, async (req, res) => {
         });
     });
 
-    // Берем данные из личной карточки символа
+    // Берем DEX данные конкретно для этого символа
     let dexPrice = 0;
     let dexSource = '';
     if (DEX_CACHE[symbol]) {
@@ -769,6 +791,7 @@ function renderChart(candles, gap, sourceName) {
         const rectX = xCenter - (bodyWidth / 2);
         svgHtml += \`<rect x="\${rectX}" y="\${rectY}" width="\${bodyWidth}" height="\${rectH}" class="candle-body \${colorClass}" />\`;
 
+        // ARROWS INSIDE
         if (c.h === maxPrice) svgHtml += \`<text x="\${xCenter}" y="\${yHigh + 8}" fill="\${arrowColor}" text-anchor="middle" class="chart-text arrow-label">↑</text>\`;
         if (c.l === minPrice) svgHtml += \`<text x="\${xCenter}" y="\${yLow - 2}" fill="\${arrowColor}" text-anchor="middle" class="chart-text arrow-label">↓</text>\`;
     });
@@ -816,7 +839,6 @@ async function update() {
             fairPriceDisplay.innerHTML = '';
         }
         
-        // ФОРМАТИРОВАНИЕ DEX ЦЕНЫ
         let dexLabel = (data.dexSource === 'OKX') ? 'OKX WEB3' : 'DEX';
         let dexPriceStr = formatDexPrice(dexPrice);
 
@@ -936,4 +958,4 @@ if (urlParams.get('symbol')) start();
 });
 
 app.listen(CONFIG.PORT, () => console.log(`🚀 Server running on port ${CONFIG.PORT}`));
-                
+        
