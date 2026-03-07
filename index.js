@@ -516,6 +516,9 @@ svg { width: 100%; height: 100%; display: block; }
 .arrow-label { font-size: 8px; font-weight: bold; }
 .gap-label { font-size: 8px; font-weight: bold; }
 .watermark { font-size: 30px; font-family: Arial, sans-serif; fill: #333; font-weight: bold; opacity: 0.6; }
+.inspect-line { stroke: #ffd700; stroke-width: 0.5; stroke-dasharray: 1.5 1; }
+.inspect-tooltip { fill: rgba(0, 0, 0, 0.92); stroke: #666; stroke-width: 0.2; }
+.inspect-tooltip-text { font-family: Arial, sans-serif; font-size: 3.8px; fill: #fff; }
 </style>
 </head>
 <body>
@@ -526,7 +529,7 @@ svg { width: 100%; height: 100%; display: block; }
     </div>
 </div>
 <div class="control-row">  
-    <input id="symbolInput" value="${initialSymbol}" placeholder="TICKER OR LINK" autocomplete="off" onfocus="this.select()" />  
+    <input id="symbolInput" value="\${initialSymbol}" placeholder="TICKER OR LINK" autocomplete="off" onfocus="this.select()" />  
     <button id="startBtn">СТАРТ</button>  
     <button id="mexcBtn">MEXC</button>
 </div>  
@@ -549,6 +552,12 @@ let urlEx = urlParams.get('ex');
 let activeSource = 'MEXC'; 
 let activeTimeframe = '1m';
 const timeframes = ['1m', '15m', '1h'];
+
+let inspectMode = false;
+let inspectCandleIndex = -1;
+let longTapTimer = null;
+let suppressNextTap = false;
+let latestCandleCount = 0;
 
 if (urlEx) {
     let normalized = urlEx.trim().toLowerCase();
@@ -584,19 +593,56 @@ function setSource(source) {
 }
 
 function switchTimeframe() {
+    if (suppressNextTap) {
+        suppressNextTap = false;
+        return;
+    }
+
     let idx = timeframes.indexOf(activeTimeframe);
     idx = (idx + 1) % timeframes.length;
     activeTimeframe = timeframes[idx];
+    inspectMode = false;
+    inspectCandleIndex = -1;
     update();
 }
 
 function formatP(p) { return (p && p != 0) ? parseFloat(p).toString() : "0"; }  
+
+function timeframeToMs(tf) {
+    if (tf === '1m') return 60 * 1000;
+    if (tf === '15m') return 15 * 60 * 1000;
+    if (tf === '1h') return 60 * 60 * 1000;
+    return 60 * 1000;
+}
+
+function formatCandleTime(candle) {
+    if (!candle || candle.lastPeriod === undefined || candle.lastPeriod === null) return '--:--';
+    const periodStartMs = Number(candle.lastPeriod) * timeframeToMs(activeTimeframe);
+    if (!Number.isFinite(periodStartMs)) return '--:--';
+
+    const dt = new Date(periodStartMs);
+    const hh = String(dt.getHours()).padStart(2, '0');
+    const mm = String(dt.getMinutes()).padStart(2, '0');
+    return hh + ':' + mm;
+}
+
+function getCandleIndexByTouch(clientX, totalCandles) {
+    const rect = chartContainer.getBoundingClientRect();
+    if (!rect.width || totalCandles <= 0) return 0;
+
+    const xPercent = ((clientX - rect.left) / rect.width) * 100;
+    const candleWidth = 100 / 20;
+    const bodyWidth = candleWidth - 1.5;
+    const rawIndex = Math.round((xPercent - (bodyWidth / 2)) / candleWidth);
+    return Math.max(0, Math.min(totalCandles - 1, rawIndex));
+}
 
 function renderChart(candles, gap, sourceName) {
     if (!candles || candles.length === 0) {
         chartContainer.innerHTML = '';
         return;
     }
+    latestCandleCount = candles.length;
     let minPrice = Infinity, maxPrice = -Infinity;
     candles.forEach(c => {
         if(c.l < minPrice) minPrice = c.l;
@@ -622,15 +668,15 @@ function renderChart(candles, gap, sourceName) {
     const bodyWidth = candleWidth - 1.5;
 
     let svgHtml = '<svg viewBox="0 0 100 100" preserveAspectRatio="none">';
-    svgHtml += \`<text x="50" y="55" text-anchor="middle" dominant-baseline="middle" class="watermark">\${sourceName}</text>\`;
-    svgHtml += \`<text x="0.5" y="7" class="chart-text corner-label">\${formatP(maxPrice)}</text>\`;
-    svgHtml += \`<text x="0.5" y="99" class="chart-text corner-label">\${formatP(minPrice)}</text>\`;
-    svgHtml += \`<text x="99" y="7" text-anchor="end" class="chart-text vol-label">\${activeTimeframe} | \${volatility}%</text>\`;
+    svgHtml += \\\`<text x="50" y="55" text-anchor="middle" dominant-baseline="middle" class="watermark">\${sourceName}</text>\\\`;
+    svgHtml += \\\`<text x="0.5" y="7" class="chart-text corner-label">\${formatP(maxPrice)}</text>\\\`;
+    svgHtml += \\\`<text x="0.5" y="99" class="chart-text corner-label">\${formatP(minPrice)}</text>\\\`;
+    svgHtml += \\\`<text x="99" y="7" text-anchor="end" class="chart-text vol-label">\${activeTimeframe} | \${volatility}%</text>\\\`;
 
     if (gap !== undefined && gap !== null && !isNaN(gap)) {
         let gapColor = gap >= 0 ? '#ff0000' : '#00ff00';
         let gapSign = gap > 0 ? '+' : '';
-        svgHtml += \`<text x="99" y="99" text-anchor="end" fill="\${gapColor}" class="chart-text gap-label">GAP: \${gapSign}\${gap.toFixed(2)}%</text>\`;
+        svgHtml += \\\`<text x="99" y="99" text-anchor="end" fill="\${gapColor}" class="chart-text gap-label">GAP: \${gapSign}\${gap.toFixed(2)}%</text>\\\`;
     }
 
     candles.forEach((c, index) => {
@@ -643,22 +689,86 @@ function renderChart(candles, gap, sourceName) {
         const colorClass = isGreen ? 'green' : 'red';
         const arrowColor = isGreen ? '#000000' : '#ffffff';
 
-        svgHtml += \`<line x1="\${xCenter}" y1="\${yHigh}" x2="\${xCenter}" y2="\${yLow}" class="candle-wick \${colorClass}" />\`;
+        svgHtml += \\\`<line x1="\${xCenter}" y1="\${yHigh}" x2="\${xCenter}" y2="\${yLow}" class="candle-wick \${colorClass}" />\\\`;
         
         const rawRectH = Math.abs(yClose - yOpen);
         const rectH = rawRectH < 0.2 ? 0.2 : rawRectH;
         
         const rectY = Math.min(yOpen, yClose);
         const rectX = xCenter - (bodyWidth / 2);
-        svgHtml += \`<rect x="\${rectX}" y="\${rectY}" width="\${bodyWidth}" height="\${rectH}" class="candle-body \${colorClass}" />\`;
+        svgHtml += \\\`<rect x="\${rectX}" y="\${rectY}" width="\${bodyWidth}" height="\${rectH}" class="candle-body \${colorClass}" />\\\`;
 
         // СТРЕЛКИ ВНУТРИ
-        if (c.h === maxPrice) svgHtml += \`<text x="\${xCenter}" y="\${yHigh + 8}" fill="\${arrowColor}" text-anchor="middle" class="chart-text arrow-label">↑</text>\`;
-        if (c.l === minPrice) svgHtml += \`<text x="\${xCenter}" y="\${yLow - 2}" fill="\${arrowColor}" text-anchor="middle" class="chart-text arrow-label">↓</text>\`;
+        if (c.h === maxPrice) svgHtml += \\\`<text x="\${xCenter}" y="\${yHigh + 8}" fill="\${arrowColor}" text-anchor="middle" class="chart-text arrow-label">↑</text>\\\`;
+        if (c.l === minPrice) svgHtml += \\\`<text x="\${xCenter}" y="\${yLow - 2}" fill="\${arrowColor}" text-anchor="middle" class="chart-text arrow-label">↓</text>\\\`;
     });
+
+    if (inspectMode) {
+        const safeIndex = Math.max(0, Math.min(candles.length - 1, inspectCandleIndex < 0 ? candles.length - 1 : inspectCandleIndex));
+        inspectCandleIndex = safeIndex;
+        const selected = candles[safeIndex];
+        const xCenter = (safeIndex * candleWidth) + (bodyWidth / 2);
+        const highText = 'H: ' + formatP(selected.h);
+        const lowText = 'L: ' + formatP(selected.l);
+        const timeText = formatCandleTime(selected);
+
+        svgHtml += \\\`<line x1="\${xCenter}" y1="0" x2="\${xCenter}" y2="100" class="inspect-line" />\\\`;
+
+        const tooltipWidth = 26;
+        const tooltipHeight = 12;
+        const tooltipX = Math.max(0.8, Math.min(100 - tooltipWidth - 0.8, xCenter + 1));
+        const tooltipY = 8;
+
+        svgHtml += \\\`<rect x="\${tooltipX}" y="\${tooltipY}" width="\${tooltipWidth}" height="\${tooltipHeight}" rx="1.2" ry="1.2" class="inspect-tooltip" />\\\`;
+        svgHtml += \\\`<text x="\${tooltipX + 1.6}" y="\${tooltipY + 3.8}" class="inspect-tooltip-text">\${highText}</text>\\\`;
+        svgHtml += \\\`<text x="\${tooltipX + 1.6}" y="\${tooltipY + 7.4}" class="inspect-tooltip-text">\${lowText}</text>\\\`;
+        svgHtml += \\\`<text x="\${tooltipX + 1.6}" y="\${tooltipY + 10.9}" class="inspect-tooltip-text">T: \${timeText}</text>\\\`;
+    }
+
     svgHtml += '</svg>';
     chartContainer.innerHTML = svgHtml;
 }
+
+chartContainer.addEventListener('touchstart', function(e) {
+    if (!e.touches || e.touches.length !== 1) return;
+
+    const touch = e.touches[0];
+    const target = e.target;
+    const onWatermark = target && target.classList && target.classList.contains('watermark');
+
+    if (inspectMode) {
+        inspectCandleIndex = getCandleIndexByTouch(touch.clientX, latestCandleCount || 20);
+        suppressNextTap = true;
+        update();
+        return;
+    }
+
+    if (!onWatermark) return;
+
+    clearTimeout(longTapTimer);
+    longTapTimer = setTimeout(function() {
+        inspectMode = true;
+        inspectCandleIndex = getCandleIndexByTouch(touch.clientX, latestCandleCount || 20);
+        suppressNextTap = true;
+        update();
+    }, 550);
+});
+
+chartContainer.addEventListener('touchmove', function(e) {
+    if (!inspectMode || !e.touches || e.touches.length !== 1) return;
+    e.preventDefault();
+    inspectCandleIndex = getCandleIndexByTouch(e.touches[0].clientX, latestCandleCount || 20);
+    suppressNextTap = true;
+    update();
+}, { passive: false });
+
+chartContainer.addEventListener('touchend', function() {
+    clearTimeout(longTapTimer);
+});
+
+chartContainer.addEventListener('touchcancel', function() {
+    clearTimeout(longTapTimer);
+});
 
 async function update() {  
     if (!symbol) return;  
@@ -832,4 +942,4 @@ if (urlParams.get('symbol')) start();
 });
 
 app.listen(CONFIG.PORT, () => console.log(`🚀 Server running on port ${CONFIG.PORT}`));
-        
+                                   
