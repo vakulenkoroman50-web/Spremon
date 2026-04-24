@@ -18,9 +18,7 @@ const CONFIG = {
         FUTURES_URL: 'https://contract.mexc.com'
     },
     // Интервал бэкапа в минутах (можно поставить 60, но 30 безопаснее)
-    BACKUP_INTERVAL_MIN: 60,
-    // Интервал автоматического перезапуска сервера (в часах)
-    AUTO_RESTART_HOURS: 48
+    BACKUP_INTERVAL_MIN: 60 
 };
 
 const EXCHANGES_ORDER = ["Binance", "Bybit", "Gate", "Bitget", "BingX", "OKX", "Kucoin"];
@@ -373,15 +371,8 @@ let fetch;
     updateMexcConfigCache();
     // 1. Сначала восстанавливаем историю
     await restoreHistory();
-    // 2. Запускаем планировщик бэкапов
-    setInterval(performBackup, CONFIG.BACKUP_INTERVAL_MIN * 60 * 1000);
-
-    // 3. Авто-рестарт для сброса зомби-соединений
-    setTimeout(async () => {
-        console.log(`[SYSTEM] Performing scheduled restart (every ${CONFIG.AUTO_RESTART_HOURS} hours) to clear zombie connections...`);
-        await performBackup();
-        process.exit(1); 
-    }, CONFIG.AUTO_RESTART_HOURS * 60 * 60 * 1000);
+    // 2. Запускаем планировщик бэкапов (раз в час)
+    setInterval(performBackup, CONFIG.BACKUP_INTERVAL_MIN * 30 * 1000);
 })();
 
 const authMiddleware = (req, res, next) => {
@@ -411,15 +402,6 @@ async function updateMexcConfigCache() {
 setInterval(updateMexcConfigCache, 60000);
 
 // --- API ---
-
-// Эндпоинт для ручного рестарта
-app.post('/api/restart', authMiddleware, async (req, res) => {
-    console.log('[SYSTEM] Manual restart triggered via UI.');
-    res.json({ ok: true, msg: "Restarting server..." });
-    await performBackup();
-    setTimeout(() => process.exit(1), 500); 
-});
-
 app.get('/api/resolve', authMiddleware, async (req, res) => {
     const symbol = (req.query.symbol || '').toUpperCase();
     let data = MEXC_CONFIG_CACHE;
@@ -534,8 +516,6 @@ svg { width: 100%; height: 100%; display: block; }
 .arrow-label { font-size: 8px; font-weight: bold; }
 .gap-label { font-size: 8px; font-weight: bold; }
 .watermark { font-size: 30px; font-family: Arial, sans-serif; fill: #333; font-weight: bold; opacity: 0.6; }
-#restartBtn { margin-top: 15px; font-family: monospace; font-size: 16px; background: #500; color: #fff; border: 1px solid #f00; cursor: pointer; padding: 10px; width: 100%; max-width: 480px; display: block; }
-#restartBtn:hover { background: #700; }
 </style>
 </head>
 <body>
@@ -554,7 +534,6 @@ svg { width: 100%; height: 100%; display: block; }
 <div id="fair-price-display"></div>
 <input id="dexLink" readonly placeholder="DEX URL" onclick="this.select(); document.execCommand('copy');" />  
 <div id="status" style="font-size: 18px; margin-top: 5px; color: #444;"></div>  
-<button id="restartBtn">RESTART SERVER</button>
 
 <script>  
 const allSources = ["MEXC", "Binance", "Bybit", "Gate", "Bitget", "BingX", "OKX", "Kucoin"];
@@ -586,7 +565,6 @@ const statusEl = document.getElementById("status");
 const urlInput = document.getElementById("urlInput");
 const chartContainer = document.getElementById("chart-container");
 const fairPriceDisplay = document.getElementById("fair-price-display");
-const restartBtn = document.getElementById("restartBtn");
 
 if(urlInput) {
     urlInput.addEventListener("keydown", function(event) { if (event.key === "Enter") go(); });
@@ -809,19 +787,6 @@ async function update() {
 
     } catch(e) {}  
 }  
-
-restartBtn.onclick = async () => {
-    if (!confirm("Точно перезагрузить сервер? Это очистит зависшие соединения.")) return;
-    try {
-        clearInterval(timer);
-        output.innerHTML = "Перезагрузка сервера...<br>Пожалуйста, подождите пару секунд.";
-        await fetch('/api/restart?token=' + token, { method: 'POST' });
-        setTimeout(() => window.location.reload(), 3000);
-    } catch(e) {
-        alert("Ошибка отправки команды рестарта.");
-    }
-};
-
 async function start() {  
     let val = input.value.trim();  
     if(!val) return;  
@@ -863,3 +828,8 @@ if (urlParams.get('symbol')) start();
 </script>  
 </body>  
 </html>  
+    `); 
+});
+
+app.listen(CONFIG.PORT, () => console.log(`🚀 Server running on port ${CONFIG.PORT}`));
+        
