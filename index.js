@@ -18,7 +18,9 @@ const CONFIG = {
         FUTURES_URL: 'https://contract.mexc.com'
     },
     // Интервал бэкапа в минутах (можно поставить 60, но 30 безопаснее)
-    BACKUP_INTERVAL_MIN: 60 
+    BACKUP_INTERVAL_MIN: 60,
+    // Автоматический перезапуск сервера через указанное количество часов
+    AUTO_RESTART_HOURS: 24
 };
 
 const EXCHANGES_ORDER = ["Binance", "Bybit", "Gate", "Bitget", "BingX", "OKX", "Kucoin"];
@@ -373,6 +375,11 @@ let fetch;
     await restoreHistory();
     // 2. Запускаем планировщик бэкапов (раз в час)
     setInterval(performBackup, CONFIG.BACKUP_INTERVAL_MIN * 30 * 1000);
+    // 3. Плановый автоматический перезапуск через AUTO_RESTART_HOURS
+    setTimeout(() => {
+        console.log(`🔄 Scheduled auto-restart triggered (${CONFIG.AUTO_RESTART_HOURS}h). Exiting process...`);
+        process.exit(0);
+    }, CONFIG.AUTO_RESTART_HOURS * 60 * 60 * 1000);
 })();
 
 const authMiddleware = (req, res, next) => {
@@ -468,6 +475,13 @@ app.get('/api/all', authMiddleware, async (req, res) => {
     res.json({ ok: true, mexc: mexcPrice, prices, fairPrices, allCandles, average: globalAverage });
 });
 
+// Ручной перезапуск сервера
+app.get('/restart', authMiddleware, (req, res) => {
+    res.json({ ok: true, msg: 'Restarting server...' });
+    console.log('🔄 Manual restart requested via API. Exiting process...');
+    setTimeout(() => process.exit(0), 100); // даём время отправить ответ
+});
+
 app.get('/', (req, res) => {
     if (req.query.token !== CONFIG.SECRET_TOKEN) return res.status(403).send("Доступ запрещён!");
     const initialSymbol = (req.query.symbol || '').toUpperCase();
@@ -533,6 +547,7 @@ svg { width: 100%; height: 100%; display: block; }
 <div id="chart-container" onclick="switchTimeframe()"></div>
 <div id="fair-price-display"></div>
 <input id="dexLink" readonly placeholder="DEX URL" onclick="this.select(); document.execCommand('copy');" />  
+<button id="restartBtn" style="font-family:monospace;font-size:16px;background:#400;color:#f88;border:1px solid #600;cursor:pointer;margin-top:5px;">RESTART</button>
 <div id="status" style="font-size: 18px; margin-top: 5px; color: #444;"></div>  
 
 <script>  
@@ -824,6 +839,22 @@ async function start() {
 document.getElementById("startBtn").onclick = start;  
 document.getElementById("mexcBtn").onclick = function() { let val = input.value.trim().toUpperCase(); if(val) window.location.href = "mxcappscheme://kline?extra_page_name=其他&trade_pair=" + val + "_USDT&contract=1"; };
 input.addEventListener("keypress", (e) => { if(e.key === "Enter") { input.blur(); start(); } });  
+
+// Кнопка ручного перезапуска
+document.getElementById('restartBtn').onclick = async function() {
+    if (!confirm('Перезапустить сервер?')) return;
+    try {
+        const res = await fetch('/restart?token=' + token);
+        const data = await res.json();
+        if (data.ok) {
+            output.innerHTML = 'Сервер перезапускается...';
+            setTimeout(() => location.reload(), 3000);
+        }
+    } catch(e) {
+        alert('Ошибка перезапуска');
+    }
+};
+
 if (urlParams.get('symbol')) start();  
 </script>  
 </body>  
@@ -832,4 +863,3 @@ if (urlParams.get('symbol')) start();
 });
 
 app.listen(CONFIG.PORT, () => console.log(`🚀 Server running on port ${CONFIG.PORT}`));
-        
