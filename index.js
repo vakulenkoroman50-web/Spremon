@@ -20,7 +20,7 @@ const CONFIG = {
     // Интервал бэкапа в минутах (можно поставить 60, но 30 безопаснее)
     BACKUP_INTERVAL_MIN: 60,
     // Автоматический перезапуск сервера через указанное количество часов
-    AUTO_RESTART_HOURS: 24
+    AUTO_RESTART_HOURS: 48
 };
 
 const EXCHANGES_ORDER = ["Binance", "Bybit", "Gate", "Bitget", "BingX", "OKX", "Kucoin"];
